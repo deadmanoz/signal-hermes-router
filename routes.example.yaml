@@ -1,0 +1,15 @@
+routes:
+  - platform: "signal"
+    group_id: "SIGNAL_GROUP_ID_BASE64_EXAMPLE"
+    friendly_name: "example-signal-group"
+    profile: "example-hermes-profile"
+    session_policy: "persistent_route"
+    state: "shadow"
+    route_context:
+      purpose: "Synthetic public example route."
+      route_alias: "example"
+    permissions:
+      - tool: "read_file"
+        arguments:
+          path:
+            prefix: "/private/deployment/read-only/"

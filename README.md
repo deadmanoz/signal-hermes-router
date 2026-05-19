@@ -1,0 +1,99 @@
+# signal-hermes-router
+
+`signal-hermes-router` is a transport router. It owns one Signal account, consumes Signal group events from upstream `signal-cli`, maps each Signal group to an independent Hermes profile over ACP, and sends Hermes's replies back to Signal.
+
+It exists because the built-in Hermes Signal gateway is profile-scoped. Hermes can allowlist multiple Signal groups for one configured Signal account, but those groups all feed the same profile. Running several independent Hermes profiles behind one Signal number is not a native gateway configuration: each profile runs its own gateway process, and Hermes's Signal adapter takes a `signal-phone` scoped lock on the configured account so two profile gateways cannot share that Signal identity at the same time.
+
+The router sits upstream of Hermes and dispatches each group to its own profile, preserving the one-number, many-agents shape (the same arrangement OpenClaw provided via its own gateway) without modifying Hermes gateway internals.
+
+Hermes profiles own behaviour, skills, app access, and media interpretation. The router is the message-bus glue — nothing more.
+
+```
+                                               ┌─→  hermes -p A acp
+signal-cli  ──events──→  signal-hermes-router ─┼─→  hermes -p B acp
+                ↑                              └─→  hermes -p C acp
+                └────────────── replies ────────────────┘
+```
+
+This public tree is intentionally generic. Keep real Signal group IDs, phone numbers, hostnames, profile-private identifiers, route context, state DBs, secrets, and audit checklists in a private deployment repo.
+
+Media today flows inbound only — Signal attachments are normalised, stored on disk, and forwarded to Hermes as ACP content blocks, but replies back to Signal are text-only. A narrow router-owned outbound media contract (so a profile-side plugin — TTS audio, a generated image or chart, and so on — can hand the router a validated local attachment reference to deliver alongside the reply) is planned future work. Route delivery, chunking, retries, and audit logging will stay with the router; profiles won't call Signal directly.
+
+## Why a router
+
+The upstream evidence for the design constraint is:
+
+- Hermes profiles are gateway-scoped: the profile docs say "Each profile runs its own gateway as a separate process", and the token-lock section lists Signal among the protected platforms ([Hermes profiles docs](https://hermes-agent.nousresearch.com/docs/user-guide/profiles/)).
+- The Signal gateway is configured around one account, plus group allowlisting, not group-to-profile routing ([Hermes Signal docs](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/signal/)).
+- The Signal adapter source requires one configured account and acquires a `signal-phone` lock for it; the same adapter subscribes to `signal-cli` events using that account ([signal.py](https://raw.githubusercontent.com/NousResearch/hermes-agent/main/gateway/platforms/signal.py)).
+- Hermes scoped locks are explicitly for preventing multiple gateways from using the same external identity at once ([status.py](https://github.com/NousResearch/hermes-agent/blob/main/gateway/status.py#L578-L583)).
+- The broader "one gateway, multi-profile" shape is still an upstream design discussion rather than a shipped gateway mode ([NousResearch/hermes-agent#23735](https://github.com/NousResearch/hermes-agent/issues/23735)).
+
+The other plausible approach is to modify the Hermes gateway itself so one Signal adapter can select among many loaded profiles. That would put profile loading, profile-aware session stores, memory, skills, permissions, lifecycle, observability, and platform routing inside Hermes's gateway surface. This router chooses the narrower maintenance boundary: consume Signal once, keep routing policy here, and treat each Hermes profile as a black-box ACP subprocess.
+
+## Runtime shape
+
+- Signal transport: `signal-cli -a "$SIGNAL_ACCOUNT" daemon --http 127.0.0.1:8080 --receive-mode=on-connection`
+- Signal endpoints used at runtime: `GET /api/v1/events`, `POST /api/v1/rpc`
+- Hermes transport: one `hermes -p <profile> acp` subprocess per active profile, supervised by the router
+- ACP methods used: `initialize`, `session/new`, optional `session/resume`, `session/prompt`, plus the client-side `session/request_permission` handler. The router also registers reject-all handlers for the `fs/*` and `terminal/*` client methods (matching the zero `clientCapabilities` it advertises), so a misbehaving agent that ignores the capability negotiation gets a clear error rather than silent breakage
+
+Wire references:
+
+- signal-cli JSON-RPC: <https://github.com/AsamK/signal-cli/blob/master/man/signal-cli-jsonrpc.5.adoc>
+- Hermes ACP: <https://hermes-agent.nousresearch.com/docs/developer-guide/programmatic-integration> and <https://hermes-agent.nousresearch.com/docs/developer-guide/acp-internals/>
+- ACP v1 docs: <https://agentclientprotocol.com/> and <https://agentclientprotocol.com/protocol/schema>
+- ACP v1 source: <https://github.com/agentclientprotocol/agent-client-protocol>
+
+## Install
+
+This project uses [uv](https://docs.astral.sh/uv/) as its installer (`hatchling` is the PEP 517 build backend). Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first.
+
+The router is not yet published to PyPI. To install from source:
+
+```bash
+git clone https://github.com/deadmanoz/signal-hermes-router.git
+cd signal-hermes-router
+uv sync                  # lockfile-pinned env in .venv/
+. .venv/bin/activate
+```
+
+The `signal-hermes-router` CLI script is installed into `.venv/bin/`.
+
+Hermes is installed separately. The router does not import Hermes and does not provide a Hermes optional extra; it supervises the `hermes` CLI from the environment at runtime.
+
+For local development without Hermes:
+
+```bash
+uv sync --extra dev
+. .venv/bin/activate
+PYTHONPATH=src coverage run -m unittest discover -s tests
+ruff check .
+```
+
+The test suite uses a fake ACP subprocess, so no Hermes install is required.
+
+## Quick start
+
+```bash
+cp config.example.yaml /path/to/private/config.yaml
+cp routes.example.yaml /path/to/private/routes.yaml
+signal-cli -a "$SIGNAL_ACCOUNT" daemon --http 127.0.0.1:8080 --receive-mode=on-connection
+signal-hermes-router --config /path/to/private/config.yaml --routes /path/to/private/routes.yaml
+```
+
+## Documentation
+
+- [docs/configuration.md](docs/configuration.md) — config schema, secret resolvers, route states, session policies
+- [docs/deployment.md](docs/deployment.md) — generic code sync procedure for private deployments
+- [docs/route-context.md](docs/route-context.md) — prompt-safe context keys, nonce delimiter, escaping
+- [docs/permissions.md](docs/permissions.md) — what the static ACP permission handler is (and isn't)
+- [docs/media.md](docs/media.md) — attachment storage layout, manifests, ACP content blocks
+- [docs/hermes-gateway-tradeoffs.md](docs/hermes-gateway-tradeoffs.md) — what you give up (and gain) versus the built-in Hermes Signal gateway
+- [docs/profile-audit-checklist.md](docs/profile-audit-checklist.md) — pre-activation checklist template (use a copy in the private deployment repo)
+- [docs/releasing.md](docs/releasing.md) — versioning policy and release procedure
+
+## Project metadata
+
+- Author: deadmanoz
+- License: MIT

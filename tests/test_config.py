@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from signal_hermes_router.config import (
+    AppConfig,
+    Route,
+    RouterConfig,
+    load_app_config,
+    normalize_profile_name,
+    parse_route,
+    parse_router_config,
+    parse_routes,
+)
+from signal_hermes_router.models import RouteState, SessionPolicy
+
+
+class ConfigTests(unittest.TestCase):
+    def test_load_app_config_reads_yaml_and_router_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "config.yaml"
+            routes = root / "routes.yaml"
+            config.write_text(
+                """
+router:
+  signal:
+    base_url: "http://127.0.0.1:18080"
+  state_db: "./state/router.db"
+  max_attachment_bytes: 1234
+""",
+                encoding="utf-8",
+            )
+            routes.write_text(
+                """
+routes:
+  - platform: signal
+    group_id: GROUP
+    profile: profile-one
+    state: shadow
+""",
+                encoding="utf-8",
+            )
+
+            app = load_app_config(config, routes)
+            self.assertEqual(app.router.signal_base_url, "http://127.0.0.1:18080")
+            self.assertEqual(app.router.state_db, Path("./state/router.db"))
+            self.assertEqual(app.router.max_attachment_bytes, 1234)
+            self.assertEqual(app.routes[0].key, "signal:GROUP")
+
+    def test_app_config_find_route_returns_none_for_missing_route(self) -> None:
+        app = AppConfig(
+            router=RouterConfig(),
+            routes=(
+                Route(
+                    platform="signal",
+                    group_id="GROUP",
+                    profile="profile",
+                    session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                    state=RouteState.SHADOW,
+                ),
+            ),
+        )
+
+        self.assertIsNone(app.find_route("signal", "OTHER"))
+
+    def test_load_yaml_rejects_non_mapping_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            routes = Path(tmp) / "routes.yaml"
+            config.write_text("[1]\n", encoding="utf-8")
+            routes.write_text("routes: []\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "must contain a YAML mapping"):
+                load_app_config(config, routes)
+
+    def test_parse_router_config_reads_flat_signal_and_circuit_values(self) -> None:
+        router = parse_router_config(
+            {
+                "signal_base_url": "http://signal.example",
+                "allow_remote_signal_base_url": True,
+                "state_db": "state.db",
+                "media_root": "media",
+                "signal_attachment_root": "~/attachments",
+                "max_attachment_bytes": "42",
+                "max_signal_event_bytes": "84",
+                "max_acp_line_bytes": "1024",
+                "max_reply_chars": "2048",
+                "max_signal_message_bytes": "1500",
+                "work_root": "work",
+                "maintenance_reply": "maintenance",
+                "failure_reply": "failure",
+                "busy_notice_after_seconds": "3.5",
+                "busy_notice": "busy",
+                "acp_prompt_timeout_seconds": "450",
+                "circuit_breaker": {
+                    "failures": "7",
+                    "window_seconds": "9.5",
+                    "recovery_seconds": "12.5",
+                },
+            }
+        )
+
+        self.assertEqual(router.signal_base_url, "http://signal.example")
+        self.assertTrue(router.allow_remote_signal_base_url)
+        self.assertEqual(router.max_attachment_bytes, 42)
+        self.assertEqual(router.max_signal_event_bytes, 84)
+        self.assertEqual(router.max_acp_line_bytes, 1024)
+        self.assertEqual(router.max_reply_chars, 2048)
+        self.assertEqual(router.max_signal_message_bytes, 1500)
+        self.assertEqual(router.acp_prompt_timeout_seconds, 450.0)
+        self.assertEqual(router.circuit_breaker.failures, 7)
+        self.assertEqual(router.circuit_breaker.window_seconds, 9.5)
+        self.assertEqual(router.circuit_breaker.recovery_seconds, 12.5)
+        self.assertEqual(router.maintenance_reply, "maintenance")
+
+    def test_parse_router_config_defaults_acp_prompt_timeout_and_recovery(self) -> None:
+        router = parse_router_config({})
+        self.assertEqual(router.acp_prompt_timeout_seconds, 300.0)
+        self.assertEqual(router.circuit_breaker.recovery_seconds, 300.0)
+        self.assertEqual(router.max_signal_message_bytes, 1900)
+
+    def test_parse_router_config_warns_when_signal_message_bytes_above_threshold(self) -> None:
+        with self.assertLogs("signal_hermes_router.config", level="WARNING") as logs:
+            parse_router_config({"max_signal_message_bytes": 2500})
+        self.assertIn("max_signal_message_bytes=2500", "\n".join(logs.output))
+
+    def test_parse_router_config_rejects_signal_message_bytes_below_floor(self) -> None:
+        with self.assertRaisesRegex(ValueError, ">= 16"):
+            parse_router_config({"max_signal_message_bytes": 8})
+
+    def test_parse_router_config_rejects_non_positive_signal_message_bytes(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            parse_router_config({"max_signal_message_bytes": 0})
+
+    def test_parse_router_config_requires_loopback_signal_url_by_default(self) -> None:
+        for value in (
+            {"signal_base_url": "http://127.0.0.1:8080"},
+            {"signal": {"base_url": "http://localhost:8080"}},
+            {"signal": {"base_url": "http://[::1]:8080"}},
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(parse_router_config(value).allow_remote_signal_base_url, False)
+
+        with self.assertRaisesRegex(ValueError, "loopback"):
+            parse_router_config({"signal_base_url": "http://signal.example"})
+
+        router = parse_router_config(
+            {
+                "signal": {
+                    "base_url": "http://signal.example",
+                    "allow_remote_base_url": "true",
+                }
+            }
+        )
+        self.assertTrue(router.allow_remote_signal_base_url)
+
+    def test_load_app_config_remote_opt_in_belongs_inside_router_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            routes = root / "routes.yaml"
+            routes.write_text(
+                """
+routes:
+  - platform: signal
+    group_id: GROUP
+    profile: profile
+""",
+                encoding="utf-8",
+            )
+            config = root / "config.yaml"
+            config.write_text(
+                """
+allow_remote_signal_base_url: true
+router:
+  signal:
+    base_url: "http://signal.example"
+""",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "loopback"):
+                load_app_config(config, routes)
+
+            config.write_text(
+                """
+router:
+  allow_remote_signal_base_url: true
+  signal:
+    base_url: "http://signal.example"
+""",
+                encoding="utf-8",
+            )
+            app = load_app_config(config, routes)
+            self.assertTrue(app.router.allow_remote_signal_base_url)
+
+    def test_parse_router_config_rejects_invalid_signal_url(self) -> None:
+        for value in ("signal.example", "file:///tmp/socket"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "HTTP URL"):
+                parse_router_config({"signal_base_url": value})
+
+    def test_parse_router_config_requires_positive_limits(self) -> None:
+        for key in (
+            "max_attachment_bytes",
+            "max_signal_event_bytes",
+            "max_acp_line_bytes",
+            "max_reply_chars",
+        ):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "positive"):
+                parse_router_config({key: 0})
+
+    def test_duplicate_route_keys_are_rejected(self) -> None:
+        raw = {
+            "routes": [
+                {
+                    "platform": "signal",
+                    "group_id": "GROUP",
+                    "profile": "profile-one",
+                },
+                {
+                    "platform": "signal",
+                    "group_id": "GROUP",
+                    "profile": "profile-two",
+                },
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "duplicate route key"):
+            parse_routes(raw)
+
+    def test_parse_routes_requires_list(self) -> None:
+        with self.assertRaisesRegex(ValueError, "routes list"):
+            parse_routes({"routes": {"not": "a-list"}})
+
+    def test_parse_route_rejects_denylist_and_non_json_context(self) -> None:
+        with self.assertRaisesRegex(ValueError, "allowlist-only"):
+            parse_route(
+                {
+                    "platform": "signal",
+                    "group_id": "GROUP",
+                    "profile": "profile",
+                    "deny": [],
+                }
+            )
+
+        with self.assertRaisesRegex(ValueError, "JSON serializable"):
+            parse_route(
+                {
+                    "platform": "signal",
+                    "group_id": "GROUP",
+                    "profile": "profile",
+                    "route_context": {"bad": object()},
+                }
+            )
+
+    def test_profile_names_reject_path_shapes(self) -> None:
+        for value in (
+            None,
+            "../outside",
+            "/absolute",
+            "nested/profile",
+            r"nested\profile",
+            ".hidden",
+            "-flag",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                normalize_profile_name(value)
+
+    def test_parse_route_normalizes_profile_name(self) -> None:
+        route = parse_route(
+            {
+                "platform": "signal",
+                "group_id": "GROUP",
+                "profile": "profile-01",
+            }
+        )
+        self.assertEqual(route.profile, "profile-01")
+
+
+if __name__ == "__main__":
+    unittest.main()

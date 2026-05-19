@@ -1,0 +1,21 @@
+router:
+  signal:
+    base_url: "http://127.0.0.1:8080"
+  state_db: "./private/state/router.db"
+  media_root: "./private/media"
+  signal_attachment_root: "~/.local/share/signal-cli/attachments"
+  max_attachment_bytes: 26214400
+  max_signal_event_bytes: 52428800
+  max_acp_line_bytes: 8388608
+  max_reply_chars: 12000
+  max_signal_message_bytes: 1900
+  work_root: "./private/work"
+  maintenance_reply: "This route is temporarily under maintenance."
+  failure_reply: "I hit an internal router error handling that message."
+  busy_notice_after_seconds: 120
+  busy_notice: "Still working on this."
+  acp_prompt_timeout_seconds: 300
+  circuit_breaker:
+    failures: 3
+    window_seconds: 300
+    recovery_seconds: 300

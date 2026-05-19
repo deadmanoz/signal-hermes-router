@@ -1,0 +1,75 @@
+# signal-hermes-router
+
+Transport router that owns one Signal account and fans Signal groups out to independent Hermes profiles over ACP.
+
+## Scope discipline
+
+The router does exactly four things, and only these four. Anything outside this scope — agent behaviour, model decisions, profile-side policy, skills, media interpretation — belongs in a Hermes profile, not here.
+
+1. **Transport in** — consume Signal events from upstream `signal-cli` over HTTP/SSE, normalise, dedupe, store attachments to disk.
+2. **Route** — map a Signal group to a Hermes profile; supervise one `hermes -p <profile> acp` subprocess per active profile; call `session/new` or `session/resume` per the route's session policy.
+3. **Speak ACP** — JSON-RPC over stdio: `initialize`, `session/new`, `session/resume` (when the profile advertises it), `session/prompt`, and the *required* client-side `session/request_permission` handler. The router also registers reject-all handlers for the `fs/*` and `terminal/*` client methods (matching the zero `clientCapabilities` it advertises) so capability-ignoring agents fail loudly.
+4. **Transport out** — send the agent's reply text back to Signal via `signal-cli` JSON-RPC.
+
+If a proposed change does not fall into one of those four buckets, push back before implementing.
+
+### Common misreadings to push back on
+
+- **`permissions.py` is not a security-policy authority.** It exists *only* because ACP forces the client to answer `session/request_permission` or the agent blocks. The static allowlist is the "answer ahead of time from config, don't prompt the operator over Signal mid-turn" choice. Profile safety is owned by the Hermes profile config and the pre-activation audit checklist.
+- **The route-context preamble is routing payload, not prompt engineering.** It tells the profile which route/group this turn belongs to. The prompt-safe key allowlist (`signal_hermes_router.context.PROMPT_SAFE_CONTEXT_KEYS`) is code-controlled by design — never make it config-driven.
+- **No agent behaviour.** No tool implementations, no model prompts, no skills, no transcription/OCR/summarisation. Those belong in Hermes profiles.
+
+## Public/private boundary
+
+This tree is **intentionally generic and intended to be publishable**. It must contain no real Signal group IDs, phone numbers, hostnames, personal names, friendly group names, profile-specific route context, credential identifiers, or route-specific audit artefacts. Those live in a separate private deployment repo.
+
+The canonical config/route files in this repo are `config.example.yaml` and `routes.example.yaml` — edit these. Their non-example counterparts (`config.yaml`, `routes.yaml`) belong to the private deployment repo and must never be committed here.
+
+If you see a real-looking identifier in `config.example.yaml`, `routes.example.yaml`, `tests/`, or `tests/fixtures/`, treat it as a leak.
+
+## Architecture map
+
+```
+signal-cli daemon → signal.py (HTTP/SSE client)
+                  → events.py (normalise to NormalizedEvent)
+                  → dedupe.py (sqlite route-scoped event claims)
+                  → router.py (route-state gate → media → prompt → reply)
+                       │
+                       ├─ media.py       attachment fetch + per-route storage (write_attachment, MediaManifest)
+                       ├─ context.py     build_prompt_blocks (route-context preamble + escaped user text + media blocks)
+                       ├─ sessions.py    ProfileSupervisor (one hermes subprocess per profile) + SessionRegistry (per session-policy)
+                       │   └─ acp.py    JsonRpcStdioPeer ↔ `hermes -p <profile> acp`
+                       │       └─ permissions.py   answers session/request_permission from static config
+                       └─ outbound.py    prepare_outgoing_message + chunk_for_signal_bytes
+                            └─ signal.py     send_group (reply path)
+```
+
+Cross-cutting: `models.py` (shared dataclasses/enums: `NormalizedEvent`, `MediaManifest`, `TurnResult`, `SessionPolicy`, `RouteState`), `mime.py` (content-type normalisation + extension mapping shared by `media.py` and `context.py`), `private_fs.py` (0700/0600 perm enforcement on the router-managed roots `media_root`/`work_root` and the files written under them, including the dedupe DB), `redaction.py` (log redaction), `circuit.py` (per-route circuit breaker), `secrets.py` (`file://`/`env://`/`op://`/`systemd-credential://` resolvers), `config.py`, and `cli.py`.
+
+## Commands
+
+Tests need no Hermes — they use a fake ACP subprocess.
+
+Dependency management is [uv](https://docs.astral.sh/uv/)-first. `hatchling` remains the PEP 517 build backend; `uv` is the installer/resolver and `uv.lock` is the source of truth for the dev environment.
+
+```bash
+# create venv + install project (editable) + dev extras from uv.lock
+uv sync --extra dev
+. .venv/bin/activate
+
+# full test suite
+PYTHONPATH=src python -m unittest discover -s tests -v
+
+# single test
+PYTHONPATH=src python -m unittest tests.test_router.TestRouter.test_<name>
+```
+
+Hermes is not a Python dependency of this package. The router supervises the `hermes` CLI as a black-box subprocess at runtime. Do not `import hermes_agent` here.
+
+## Commits
+
+Conventional commits (`type(scope): description`), scope = module name (e.g. `feat(router):`, `fix(sessions):`). One logical change per commit. Never reference AI tools in messages.
+
+## Documentation
+
+User-facing operational docs live under [docs/](docs/). The [profile audit checklist](docs/profile-audit-checklist.md) must be filled out (in the *private* deployment repo) before a route moves to `active`.
