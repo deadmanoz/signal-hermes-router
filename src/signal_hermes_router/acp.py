@@ -244,7 +244,7 @@ class ACPProfile:
                 "initialize",
                 {
                     "protocolVersion": 1,
-                    "clientInfo": {"name": "signal-hermes-router", "version": "0.1.0"},
+                    "clientInfo": {"name": "signal-hermes-router", "version": "0.1.1"},
                     "clientCapabilities": {
                         "fs": {"readTextFile": False, "writeTextFile": False},
                         "terminal": False,
