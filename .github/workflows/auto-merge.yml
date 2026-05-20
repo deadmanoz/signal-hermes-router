@@ -1,0 +1,100 @@
+name: Auto Merge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: >-
+      ${{
+        github.event.pull_request.user.login == 'dependabot[bot]' ||
+        contains(github.event.pull_request.labels.*.name, 'autorelease: pending')
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      # This workflow intentionally does not check out or execute PR branch code.
+      - name: Fetch Dependabot metadata
+        id: dependabot
+        if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine eligibility
+        id: eligibility
+        env:
+          IS_RELEASE_PR: "${{ contains(github.event.pull_request.labels.*.name, 'autorelease: pending') }}"
+          IS_DEPENDABOT_PR: "${{ github.event.pull_request.user.login == 'dependabot[bot]' }}"
+          UPDATE_TYPE: "${{ steps.dependabot.outputs.update-type }}"
+        run: |
+          eligible=false
+          if [ "$IS_RELEASE_PR" = "true" ]; then
+            eligible=true
+          elif [ "$IS_DEPENDABOT_PR" = "true" ]; then
+            case "$UPDATE_TYPE" in
+              version-update:semver-patch|version-update:semver-minor)
+                eligible=true
+                ;;
+            esac
+          fi
+          echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve merge state
+        id: merge_state
+        if: ${{ steps.eligibility.outputs.eligible == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          state=""
+          for attempt in 1 2 3 4 5; do
+            state="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeStateStatus --jq .mergeStateStatus)"
+            if [ "$state" != "UNKNOWN" ]; then
+              break
+            fi
+            echo "mergeStateStatus is UNKNOWN on attempt $attempt; retrying"
+            sleep 5
+          done
+          echo "merge_state=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Update stale branch
+        id: update_branch
+        if: ${{ steps.merge_state.outputs.merge_state == 'BEHIND' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: gh pr update-branch "$PR_NUMBER" --repo "$REPO"
+
+      - name: Approve eligible PR
+        if: >-
+          ${{
+            steps.eligibility.outputs.eligible == 'true' &&
+            steps.merge_state.outputs.merge_state != 'DIRTY' &&
+            steps.update_branch.outcome != 'failure'
+          }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body "Automated approval for eligible release/dependency PR."
+
+      - name: Enable squash auto-merge
+        if: >-
+          ${{
+            steps.eligibility.outputs.eligible == 'true' &&
+            steps.merge_state.outputs.merge_state != 'DIRTY' &&
+            steps.update_branch.outcome != 'failure'
+          }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --squash --delete-branch

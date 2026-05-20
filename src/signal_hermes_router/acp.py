@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .models import TurnResult
 from .permissions import StaticPermissionPolicy
 from .private_fs import ensure_private_dir_tree
@@ -244,7 +245,7 @@ class ACPProfile:
                 "initialize",
                 {
                     "protocolVersion": 1,
-                    "clientInfo": {"name": "signal-hermes-router", "version": "0.1.1"},
+                    "clientInfo": {"name": "signal-hermes-router", "version": __version__},
                     "clientCapabilities": {
                         "fs": {"readTextFile": False, "writeTextFile": False},
                         "terminal": False,

@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from signal_hermes_router import __version__
 from signal_hermes_router import acp as acp_module
 from signal_hermes_router.acp import (
     ACPProfile,
@@ -152,6 +153,37 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(instances), 1)
             self.assertTrue(instances[0].started)
             self.assertTrue(instances[0].closed, "peer.close() must run on initialize failure")
+
+    async def test_acp_profile_initialize_advertises_package_version(self) -> None:
+        instances: list[CapturingInitPeer] = []
+
+        class CapturingInitPeer:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.initialize_params: dict[str, object] | None = None
+                self.closed = False
+                instances.append(self)
+
+            async def start(self) -> None:
+                return None
+
+            async def request(self, method: str, params: dict[str, object], **_kwargs):
+                if method != "initialize":
+                    raise AssertionError(f"unexpected method {method}")
+                self.initialize_params = params
+                return {"agentCapabilities": {}}
+
+            async def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = ACPProfile(profile="synthetic", work_root=Path(tmp))
+            with patch.object(acp_module, "JsonRpcStdioPeer", CapturingInitPeer):
+                await profile.start()
+                await profile.close()
+
+        client_info = instances[0].initialize_params["clientInfo"]  # type: ignore[index]
+        self.assertEqual(client_info, {"name": "signal-hermes-router", "version": __version__})
+        self.assertTrue(instances[0].closed)
 
     async def test_json_rpc_timeout_cleans_pending_request(self) -> None:
         peer = JsonRpcStdioPeer(

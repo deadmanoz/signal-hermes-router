@@ -9,7 +9,8 @@ updates:
       timezone: Australia/Sydney
     open-pull-requests-limit: 5
     commit-message:
-      prefix: "chore(deps)"
+      prefix: "fix(deps)"
+      prefix-development: "chore(deps-dev)"
     labels:
       - dependencies
     groups:
