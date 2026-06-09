@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.1...v0.1.2) (2026-06-09)
+
+
+### Features
+
+* **router:** shred unrouteable Signal events ([#3](https://github.com/deadmanoz/signal-hermes-router/issues/3))
+
 ## [Unreleased]
 
 ### Features
