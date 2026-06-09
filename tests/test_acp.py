@@ -498,6 +498,38 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.text, "fallback text")
         self.assertEqual(result.stop_reason, "complete")
 
+    async def test_acp_profile_prompt_keeps_streamed_text_over_result_text(self) -> None:
+        class Peer:
+            def __init__(self) -> None:
+                self.queue: asyncio.Queue[dict] = asyncio.Queue()
+
+            def subscribe_session(self, session_id: str) -> asyncio.Queue[dict]:
+                return self.queue
+
+            async def request(self, method: str, params: dict, *, timeout: float = 300.0) -> dict:
+                await self.queue.put(
+                    {
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": "session-1",
+                            "update": {
+                                "session_update": "agent_message_chunk",
+                                "content": {
+                                    "type": "text",
+                                    "text": "streamed complete final answer",
+                                },
+                            },
+                        },
+                    }
+                )
+                return {"text": "partial answer", "stopReason": "complete"}
+
+        profile = ACPProfile(profile="synthetic", work_root=Path("/tmp"), peer=Peer())  # type: ignore[arg-type]
+        result = await profile.prompt("session-1", [{"type": "text", "text": "hello"}])
+
+        self.assertEqual(result.text, "streamed complete final answer")
+        self.assertEqual(result.stop_reason, "complete")
+
     def test_collect_assistant_text_handles_nested_updates(self) -> None:
         text = _collect_assistant_text(
             [
@@ -515,6 +547,33 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         self.assertEqual(text, "hello world")
+
+    def test_collect_assistant_text_ignores_thought_chunks(self) -> None:
+        text = _collect_assistant_text(
+            [
+                {
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-1",
+                        "update": {
+                            "sessionUpdate": "agent_thought_chunk",
+                            "content": {"type": "text", "text": "private reasoning"},
+                        },
+                    },
+                },
+                {
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "session-1",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": " public answer "},
+                        },
+                    },
+                },
+            ]
+        )
+        self.assertEqual(text, "public answer")
 
     async def test_acp_profile_release_session_clears_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -57,6 +57,25 @@ def summarize_signal_event(raw: dict[str, Any]) -> str:
     return str(inspect_signal_event(raw))
 
 
+def probe_routeability(raw: dict[str, Any]) -> tuple[str | None, SignalEventSummary]:
+    """Lightweight probe: return the group_id (if any) and a content-free summary.
+
+    Does not parse message text, attachments, or sender identifiers.
+    """
+    params = unwrap_signal_event(raw)
+    envelope = params.get("envelope") if isinstance(params, dict) else None
+    if not isinstance(envelope, dict):
+        return None, SignalEventSummary(shape="unknown", message_type="none", has_group=False)
+    shape = "direct" if raw is params else "jsonrpc"
+    message_type = _message_type(envelope)
+    data_message = _data_message_from_envelope(envelope)
+    group_id = None
+    if isinstance(data_message, dict):
+        group_id = _group_id(data_message)
+    has_group = group_id is not None
+    return group_id, SignalEventSummary(shape=shape, message_type=message_type, has_group=has_group)
+
+
 def parse_signal_event(
     raw: dict[str, Any],
     platform: str = "signal",
