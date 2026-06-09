@@ -5,7 +5,7 @@
 
 ### Features
 
-* **router:** shred unrouteable Signal events ([#3](https://github.com/deadmanoz/signal-hermes-router/issues/3)) ([6c1215f](https://github.com/deadmanoz/signal-hermes-router/commit/6c1215faae96ec4645b18a360e1f40d40cf12b7f))
+* **router:** shred unrouteable Signal events ([#3](https://github.com/deadmanoz/signal-hermes-router/issues/3))
 
 ## [Unreleased]
 
