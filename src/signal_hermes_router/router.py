@@ -10,7 +10,7 @@ from .circuit import CircuitBreaker
 from .config import AppConfig, Route
 from .context import build_prompt_blocks
 from .dedupe import DedupeStore
-from .events import SignalEventSummary, inspect_signal_event, parse_signal_event
+from .events import SignalEventSummary, parse_signal_event, probe_routeability
 from .media import write_attachment
 from .models import (
     MediaManifest,
@@ -27,8 +27,6 @@ from .sessions import ProfileSupervisor, SessionRegistry
 from .signal import SignalHttpClient
 
 LOGGER = logging.getLogger(__name__)
-
-ROUTINE_NON_GROUP_MESSAGE_TYPES = frozenset({"typingMessage", "receiptMessage"})
 
 
 class SignalHermesRouter:
@@ -77,26 +75,35 @@ class SignalHermesRouter:
         self.dedupe.close()
 
     async def handle_raw_event(self, raw: dict) -> TurnResult | None:
+        group_id, summary = probe_routeability(raw)
+        if group_id is None:
+            _discard_event(summary)
+            return None
+        route = self.config.find_route("signal", group_id)
+        if route is None:
+            _discard_event(summary)
+            return None
         event = parse_signal_event(
             raw,
             max_attachment_bytes=self.config.router.max_attachment_bytes,
         )
         if event is None:
-            summary = inspect_signal_event(raw)
-            LOGGER.log(
-                _non_group_event_log_level(summary),
-                "ignoring non-group Signal event %s",
-                summary,
-            )
+            _discard_event(summary)
             return None
         return await self.handle_event(event)
 
     async def handle_event(self, event: NormalizedEvent) -> TurnResult | None:
-        self.redactor.add(event.group_id, event.sender_id, event.source_uuid)
         route = self.config.find_route(event.platform, event.group_id)
         if route is None:
-            LOGGER.info("no route for %s", self.redactor.ref("group", event.group_id))
+            _discard_event(
+                SignalEventSummary(
+                    shape="normalized",
+                    message_type="dataMessage",
+                    has_group=True,
+                )
+            )
             return None
+        self.redactor.add(event.group_id, event.sender_id, event.source_uuid)
 
         if not self.dedupe.claim(route.key, event.source_uuid, event.timestamp):
             event_ref = f"{route.key}:{event.source_uuid}:{event.timestamp}"
@@ -308,7 +315,5 @@ class SignalHermesRouter:
             await notice_task
 
 
-def _non_group_event_log_level(summary: SignalEventSummary) -> int:
-    if not summary.has_group and summary.message_type in ROUTINE_NON_GROUP_MESSAGE_TYPES:
-        return logging.DEBUG
-    return logging.INFO
+def _discard_event(summary: SignalEventSummary) -> None:
+    LOGGER.debug("discarding unrouted Signal event %s", summary)

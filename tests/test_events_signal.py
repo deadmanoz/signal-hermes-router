@@ -12,6 +12,7 @@ from signal_hermes_router import signal as signal_module
 from signal_hermes_router.events import (
     inspect_signal_event,
     parse_signal_event,
+    probe_routeability,
     summarize_signal_event,
 )
 from signal_hermes_router.signal import SignalHttpClient, _iter_sse_json
@@ -144,6 +145,83 @@ class EventTests(unittest.TestCase):
         self.assertFalse(summary.has_group)
         self.assertNotIn("synthetic-source-number", str(summary))
         self.assertNotIn("sender-uuid", str(summary))
+
+    def test_probe_routeability_returns_group_id_without_parsing_content(self) -> None:
+        raw = {
+            "jsonrpc": "2.0",
+            "method": "receive",
+            "params": {
+                "envelope": {
+                    "sourceUuid": "sender-uuid",
+                    "timestamp": 1714521600000,
+                    "dataMessage": {
+                        "message": "secret text",
+                        "groupInfo": {"groupId": "group-id"},
+                        "attachments": [{"filename": "secret.txt", "data": "c2VjcmV0"}],
+                    },
+                }
+            },
+        }
+        group_id, summary = probe_routeability(raw)
+        self.assertEqual(group_id, "group-id")
+        self.assertEqual(summary.shape, "jsonrpc")
+        self.assertEqual(summary.message_type, "dataMessage")
+        self.assertTrue(summary.has_group)
+        summary_str = str(summary)
+        self.assertNotIn("group-id", summary_str)
+        self.assertNotIn("secret", summary_str)
+        self.assertNotIn("sender-uuid", summary_str)
+
+    def test_probe_routeability_returns_sync_message_group_id(self) -> None:
+        raw = {
+            "jsonrpc": "2.0",
+            "method": "receive",
+            "params": {
+                "envelope": {
+                    "sourceUuid": "sender-uuid",
+                    "timestamp": 1714521600000,
+                    "syncMessage": {
+                        "sentMessage": {
+                            "message": "secret linked-device text",
+                            "groupInfo": {"groupId": "group-id="},
+                            "attachments": [{"filename": "secret.txt", "data": "c2VjcmV0"}],
+                        }
+                    },
+                }
+            },
+        }
+        group_id, summary = probe_routeability(raw)
+        self.assertEqual(group_id, "group-id=")
+        self.assertEqual(summary.shape, "jsonrpc")
+        self.assertEqual(summary.message_type, "syncMessage")
+        self.assertTrue(summary.has_group)
+        summary_str = str(summary)
+        self.assertNotIn("group-id=", summary_str)
+        self.assertNotIn("secret", summary_str)
+        self.assertNotIn("sender-uuid", summary_str)
+
+    def test_probe_routeability_returns_none_for_non_group_event(self) -> None:
+        raw = {
+            "envelope": {
+                "sourceUuid": "sender-uuid",
+                "timestamp": 1,
+                "dataMessage": {"message": "direct message"},
+            },
+            "account": "account",
+        }
+        group_id, summary = probe_routeability(raw)
+        self.assertIsNone(group_id)
+        self.assertEqual(summary.shape, "direct")
+        self.assertEqual(summary.message_type, "dataMessage")
+        self.assertFalse(summary.has_group)
+
+    def test_probe_routeability_returns_none_for_unknown_shape(self) -> None:
+        raw = {"not": "a signal envelope"}
+        group_id, summary = probe_routeability(raw)
+        self.assertIsNone(group_id)
+        self.assertEqual(summary.shape, "unknown")
+        self.assertEqual(summary.message_type, "none")
+        self.assertFalse(summary.has_group)
 
 
 class SignalHttpTests(unittest.IsolatedAsyncioTestCase):

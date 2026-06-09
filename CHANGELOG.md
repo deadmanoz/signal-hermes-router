@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+- Shred unrouteable Signal events before parsing, dedupe, media storage, or ACP delivery.
+
 ## [0.1.1](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.0...v0.1.1) (2026-05-20)
 
 ### Miscellaneous Chores

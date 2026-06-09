@@ -234,3 +234,17 @@ All four operational replies (`maintenance_reply`, `failure_reply`,
 `busy_notice`, and assistant replies from Hermes) flow through the same
 canary prefix and chunking pipeline as ordinary assistant text — see
 [Runtime size limits](#runtime-size-limits) above.
+
+## Inbound discard and observability
+
+The router discards unrouteable Signal events — direct messages, non-group
+events, unknown shapes, and events for group IDs with no configured route —
+without normalising message text, decoding attachments, writing media, taking
+dedupe claims, or calling ACP. Each discarded event produces exactly one
+DEBUG-level log line containing only a content-free summary (`shape`,
+`message_type`, `has_group`). No sender identifier, group ID value, message
+text, attachment filename, or attachment payload appears at DEBUG or INFO.
+
+The router avoids retaining unrouteable payloads in router-owned objects, but
+Python cannot guarantee byte-level zeroisation of transient raw JSON/string
+buffers already allocated by the HTTP/SSE layer or CPython internals.

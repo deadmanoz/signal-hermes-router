@@ -312,8 +312,9 @@ class ACPProfile:
                 timeout=self.prompt_timeout_seconds,
             )
             text = _collect_assistant_text(_drain_queue(queue))
-        if not text and "text" in result:
-            text = str(result["text"])
+        result_text = str(result.get("text") or "").strip()
+        if not text and result_text:
+            text = result_text
         return TurnResult(text=text, stop_reason=str(result.get("stopReason", "end_turn")))
 
     async def _request_permission(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -337,6 +338,12 @@ def _collect_assistant_text(notifications: list[dict[str, Any]]) -> str:
             continue
         params = notification.get("params") or {}
         update = params.get("update") or params
+        if isinstance(update, dict):
+            update_kind = update.get("session_update") or update.get("sessionUpdate")
+            if update_kind and update_kind != "agent_message_chunk":
+                continue
+            if update_kind == "agent_message_chunk" and "content" in update:
+                update = update["content"]
         _extract_text(update, chunks)
     return "".join(chunks).strip()
 

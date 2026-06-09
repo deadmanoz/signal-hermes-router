@@ -388,7 +388,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(profile.prompt_session_ids, ["session-1", "session-2"])
             self.assertEqual(profile.released_session_ids, ["session-1", "session-2"])
 
-    async def test_routine_non_group_events_log_below_info(self) -> None:
+    async def test_routine_non_group_events_are_discarded_at_debug(self) -> None:
         raw = {
             "envelope": {
                 "sourceUuid": "sender",
@@ -406,7 +406,9 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             )
             with self.assertLogs("signal_hermes_router.router", level="DEBUG") as debug_logs:
                 await router.handle_raw_event(raw)
-            self.assertIn("message_type=typingMessage", "\n".join(debug_logs.output))
+            output = "\n".join(debug_logs.output)
+            self.assertIn("discarding unrouted Signal event", output)
+            self.assertIn("message_type=typingMessage", output)
             with self.assertNoLogs("signal_hermes_router.router", level="INFO"):
                 await router.handle_raw_event(
                     {
@@ -419,7 +421,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     }
                 )
 
-    async def test_non_group_data_and_unknown_events_remain_info_visible(self) -> None:
+    async def test_non_group_data_and_unknown_events_are_discarded_at_debug(self) -> None:
         for raw, expected in (
             (
                 {
@@ -441,11 +443,14 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
                     dedupe=DedupeStore(),
                 )
-                with self.assertLogs("signal_hermes_router.router", level="INFO") as logs:
+                with self.assertLogs("signal_hermes_router.router", level="DEBUG") as logs:
                     await router.handle_raw_event(raw)
-                self.assertIn(expected, "\n".join(logs.output))
+                output = "\n".join(logs.output)
+                self.assertIn("discarding unrouted Signal event", output)
+                self.assertIn(expected, output)
+                self.assertNotIn("synthetic direct message without group", output)
 
-    async def test_non_group_info_logs_do_not_emit_private_payloads(self) -> None:
+    async def test_non_group_debug_discard_does_not_emit_private_payloads(self) -> None:
         private_payload = base64.b64encode(b"x" * 1024).decode("ascii")
         raw = {
             "envelope": {
@@ -466,12 +471,118 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
                 dedupe=DedupeStore(),
             )
-            with self.assertLogs("signal_hermes_router.router", level="INFO") as logs:
+            with self.assertLogs("signal_hermes_router.router", level="DEBUG") as logs:
                 await router.handle_raw_event(raw)
             output = "\n".join(logs.output)
+            self.assertIn("discarding unrouted Signal event", output)
             self.assertIn("message_type=dataMessage", output)
             self.assertIsNone(re.search(r"\+[0-9]{8,}", output))
             self.assertIsNone(re.search(r"[A-Za-z0-9+/]{64,}={0,2}", output))
+
+    async def test_unrouteable_group_event_is_discarded_without_parsing(self) -> None:
+        # Inline attachment large enough that parse_signal_event would reject it
+        # under the tiny max_attachment_bytes configured below.
+        private_payload = base64.b64encode(b"x" * 1024).decode("ascii")
+        group_id = "GROUP_ID_EXAMPLE_UNROUTED"
+        source_uuid = "synthetic-sender-uuid"
+        raw = {
+            "envelope": {
+                "sourceUuid": source_uuid,
+                "timestamp": 1,
+                "dataMessage": {
+                    "message": "private message text",
+                    "groupInfo": {"groupId": group_id},
+                    "attachments": [
+                        {
+                            "contentType": "text/plain",
+                            "filename": "private.txt",
+                            "data": private_payload,
+                        }
+                    ],
+                },
+            },
+            "account": "+00000000000",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            dedupe = DedupeStore()
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, max_attachment_bytes=10),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+            )
+            parse_calls: list[bool] = []
+
+            from signal_hermes_router import router as router_module
+
+            real_parse = router_module.parse_signal_event
+
+            def spying_parse(*args, **kwargs):  # type: ignore[no-untyped-def]
+                parse_calls.append(True)
+                return real_parse(*args, **kwargs)
+
+            with patch.object(router_module, "parse_signal_event", spying_parse):
+                with self.assertLogs("signal_hermes_router.router", level="DEBUG") as logs:
+                    result = await router.handle_raw_event(raw)
+            self.assertIsNone(result)
+            self.assertEqual(parse_calls, [])
+            self.assertEqual(signal.sends, [])
+            self.assertEqual(profile.prompts, [])
+            self.assertTrue(dedupe.claim(f"signal:{group_id}", source_uuid, 1))
+            output = "\n".join(logs.output)
+            self.assertIn("discarding unrouted Signal event", output)
+            self.assertNotIn(group_id, output)
+            self.assertNotIn(source_uuid, output)
+            self.assertNotIn("private message text", output)
+            self.assertNotIn("private.txt", output)
+            self.assertIsNone(re.search(r"[A-Za-z0-9+/]{64,}={0,2}", output))
+            media_files = list((Path(tmp) / "media").rglob("*"))
+            self.assertEqual(media_files, [])
+
+    async def test_unrouteable_normalized_event_is_discarded_before_dedupe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dedupe = DedupeStore()
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+            )
+            source_uuid = "synthetic-sender-uuid"
+            event = NormalizedEvent(
+                platform="signal",
+                group_id="missing-group",
+                sender_id="synthetic-sender",
+                source_uuid=source_uuid,
+                timestamp=1,
+                text="private message",
+                attachments=(
+                    SignalAttachment(
+                        content_type="text/plain",
+                        filename="private.txt",
+                        body=b"private body",
+                    ),
+                ),
+            )
+            with self.assertLogs("signal_hermes_router.router", level="DEBUG") as logs:
+                result = await router.handle_event(event)
+            self.assertIsNone(result)
+            self.assertEqual(signal.sends, [])
+            self.assertEqual(profile.prompts, [])
+            self.assertTrue(dedupe.claim("signal:missing-group", source_uuid, 1))
+            output = "\n".join(logs.output)
+            self.assertIn("discarding unrouted Signal event", output)
+            self.assertNotIn("missing-group", output)
+            self.assertNotIn("synthetic-sender", output)
+            self.assertNotIn(source_uuid, output)
+            self.assertNotIn("private message", output)
+            self.assertNotIn("private.txt", output)
+            media_files = list((Path(tmp) / "media").rglob("*"))
+            self.assertEqual(media_files, [])
 
     async def test_shadow_disabled_and_maintenance_do_not_call_backend(self) -> None:
         for state in (RouteState.SHADOW, RouteState.DISABLED, RouteState.MAINTENANCE):
