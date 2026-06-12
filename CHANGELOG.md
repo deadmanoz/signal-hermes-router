@@ -9,6 +9,10 @@
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- Surface unknown and exception Signal shreds in logs without private payloads.
+
 ### Features
 
 - Shred unrouteable Signal events before parsing, dedupe, media storage, or ACP delivery.

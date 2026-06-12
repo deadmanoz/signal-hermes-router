@@ -241,9 +241,11 @@ The router discards unrouteable Signal events — direct messages, non-group
 events, unknown shapes, and events for group IDs with no configured route —
 without normalising message text, decoding attachments, writing media, taking
 dedupe claims, or calling ACP. Each discarded event produces exactly one
-DEBUG-level log line containing only a content-free summary (`shape`,
-`message_type`, `has_group`). No sender identifier, group ID value, message
-text, attachment filename, or attachment payload appears at DEBUG or INFO.
+content-free summary (`shape`, `message_type`, `has_group`). Routine non-message
+events are logged at DEBUG, unknown inbound envelopes at INFO, and receive
+exception envelopes at WARNING with `has_exception=true`. No sender identifier,
+group ID value, message text, attachment filename, exception message, or
+attachment payload appears in these summaries.
 
 The router avoids retaining unrouteable payloads in router-owned objects, but
 Python cannot guarantee byte-level zeroisation of transient raw JSON/string

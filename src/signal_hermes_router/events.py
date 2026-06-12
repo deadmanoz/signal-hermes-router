@@ -31,26 +31,41 @@ class SignalEventSummary:
     shape: str
     message_type: str
     has_group: bool
+    has_exception: bool = False
 
     def __str__(self) -> str:
-        return (
+        summary = (
             f"shape={self.shape} message_type={self.message_type} "
             f"has_group={str(self.has_group).lower()}"
         )
+        if self.has_exception:
+            summary += " has_exception=true"
+        return summary
 
 
 def inspect_signal_event(raw: dict[str, Any]) -> SignalEventSummary:
     params = unwrap_signal_event(raw)
     envelope = params.get("envelope") if isinstance(params, dict) else None
+    has_exception = _has_exception(params)
     if not isinstance(envelope, dict):
-        return SignalEventSummary(shape="unknown", message_type="none", has_group=False)
+        return SignalEventSummary(
+            shape="unknown",
+            message_type="none",
+            has_group=False,
+            has_exception=has_exception,
+        )
     shape = "direct" if raw is params else "jsonrpc"
     message_type = _message_type(envelope)
     data_message = _data_message_from_envelope(envelope)
     has_group = False
     if isinstance(data_message, dict):
         has_group = _group_id(data_message) is not None
-    return SignalEventSummary(shape=shape, message_type=message_type, has_group=has_group)
+    return SignalEventSummary(
+        shape=shape,
+        message_type=message_type,
+        has_group=has_group,
+        has_exception=has_exception,
+    )
 
 
 def summarize_signal_event(raw: dict[str, Any]) -> str:
@@ -64,8 +79,14 @@ def probe_routeability(raw: dict[str, Any]) -> tuple[str | None, SignalEventSumm
     """
     params = unwrap_signal_event(raw)
     envelope = params.get("envelope") if isinstance(params, dict) else None
+    has_exception = _has_exception(params)
     if not isinstance(envelope, dict):
-        return None, SignalEventSummary(shape="unknown", message_type="none", has_group=False)
+        return None, SignalEventSummary(
+            shape="unknown",
+            message_type="none",
+            has_group=False,
+            has_exception=has_exception,
+        )
     shape = "direct" if raw is params else "jsonrpc"
     message_type = _message_type(envelope)
     data_message = _data_message_from_envelope(envelope)
@@ -73,7 +94,12 @@ def probe_routeability(raw: dict[str, Any]) -> tuple[str | None, SignalEventSumm
     if isinstance(data_message, dict):
         group_id = _group_id(data_message)
     has_group = group_id is not None
-    return group_id, SignalEventSummary(shape=shape, message_type=message_type, has_group=has_group)
+    return group_id, SignalEventSummary(
+        shape=shape,
+        message_type=message_type,
+        has_group=has_group,
+        has_exception=has_exception,
+    )
 
 
 def parse_signal_event(
@@ -116,7 +142,15 @@ def parse_signal_event(
 
 
 def _message_type(envelope: dict[str, Any]) -> str:
-    for key in ("dataMessage", "syncMessage", "typingMessage", "receiptMessage"):
+    for key in (
+        "dataMessage",
+        "editMessage",
+        "syncMessage",
+        "storyMessage",
+        "callMessage",
+        "typingMessage",
+        "receiptMessage",
+    ):
         if key in envelope:
             return key
     return "unknown"
@@ -125,8 +159,16 @@ def _message_type(envelope: dict[str, Any]) -> str:
 def _data_message_from_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
     data_message = envelope.get("dataMessage") or {}
     if not data_message:
+        data_message = (envelope.get("editMessage") or {}).get("dataMessage") or {}
+    if not data_message:
         data_message = (envelope.get("syncMessage") or {}).get("sentMessage") or {}
+    if isinstance(data_message, dict) and not _group_id(data_message):
+        data_message = (data_message.get("editMessage") or {}).get("dataMessage") or data_message
     return data_message if isinstance(data_message, dict) else {}
+
+
+def _has_exception(params: Any) -> bool:
+    return isinstance(params, dict) and params.get("exception") is not None
 
 
 def _group_id(data_message: dict[str, Any]) -> str | None:

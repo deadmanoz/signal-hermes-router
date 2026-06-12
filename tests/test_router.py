@@ -479,6 +479,36 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(re.search(r"\+[0-9]{8,}", output))
             self.assertIsNone(re.search(r"[A-Za-z0-9+/]{64,}={0,2}", output))
 
+    async def test_receive_exception_discard_is_warning_without_private_payload(self) -> None:
+        raw = {
+            "envelope": {
+                "source": "+00000000000",
+                "sourceUuid": "synthetic-sender",
+                "timestamp": 1,
+            },
+            "exception": {
+                "message": "private exception detail +00000000000",
+                "type": "RuntimeException",
+            },
+            "account": "+00000000000",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            with self.assertLogs("signal_hermes_router.router", level="WARNING") as logs:
+                await router.handle_raw_event(raw)
+            output = "\n".join(logs.output)
+            self.assertIn("discarding Signal event with receive exception", output)
+            self.assertIn("message_type=unknown", output)
+            self.assertIn("has_exception=true", output)
+            self.assertNotIn("private exception detail", output)
+            self.assertIsNone(re.search(r"\+[0-9]{8,}", output))
+            self.assertNotIn("synthetic-sender", output)
+
     async def test_unrouteable_group_event_is_discarded_without_parsing(self) -> None:
         # Inline attachment large enough that parse_signal_event would reject it
         # under the tiny max_attachment_bytes configured below.
