@@ -5,7 +5,7 @@
 
 ### Bug Fixes
 
-* **router:** surface Signal shred diagnostics ([a27e873](https://github.com/deadmanoz/signal-hermes-router/commit/a27e8730fe763b0249f1e9364dd9ad33cfd56e02))
+* **router:** surface Signal shred diagnostics
 
 ## [0.1.2](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.1...v0.1.2) (2026-06-09)
 
