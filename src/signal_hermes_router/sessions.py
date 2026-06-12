@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .acp import ACPProfile, DEFAULT_ACP_PROMPT_TIMEOUT_SECONDS, DEFAULT_MAX_ACP_LINE_BYTES
 from .config import Route
-from .models import NormalizedEvent, SessionPolicy
+from .models import ChatType, NormalizedEvent, SessionPolicy
 
 LOGGER = logging.getLogger(__name__)
 
@@ -156,9 +156,12 @@ class SessionRegistry:
         if route.session_policy == SessionPolicy.PERSISTENT_ROUTE:
             raw = route.key
         elif route.session_policy == SessionPolicy.PERSISTENT_SENDER:
-            raw = f"{route.key}:{event.sender_id}"
+            raw = f"{route.key}:{_routed_sender_id(route, event)}"
         else:
-            raw = f"{route.key}:{event.sender_id}:{event.timestamp}:{uuid.uuid4().hex}"
+            raw = (
+                f"{route.key}:{_routed_sender_id(route, event)}:"
+                f"{event.timestamp}:{uuid.uuid4().hex}"
+            )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _cwd(self, profile: str, session_key: str) -> Path:
@@ -169,3 +172,11 @@ class SessionRegistry:
         except (OSError, RuntimeError, ValueError) as exc:
             raise ValueError("session cwd escaped configured work_root") from exc
         return cwd
+
+
+def _routed_sender_id(route: Route, event: NormalizedEvent) -> str:
+    if route.chat_type == ChatType.DIRECT:
+        if not route.sender_id:
+            raise ValueError("direct route requires sender_id")
+        return route.sender_id
+    return event.sender_id

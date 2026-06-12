@@ -13,3 +13,18 @@ routes:
         arguments:
           path:
             prefix: "/private/deployment/read-only/"
+
+  # Direct-message routes are opt-in and exact-sender only. Keep real sender
+  # UUIDs/numbers in a private deployment repo and load them through secret refs.
+  # - platform: "signal"
+  #   chat_type: "direct"
+  #   sender_id: "env://SIGNAL_DIRECT_SENDER_UUID"
+  #   sender_number: "env://SIGNAL_DIRECT_SENDER_NUMBER"
+  #   friendly_name: "synthetic-direct-example"
+  #   profile: "example-hermes-profile"
+  #   session_policy: "persistent_sender"
+  #   state: "shadow"
+  #   route_context:
+  #     purpose: "Synthetic public direct-message example route."
+  #     route_alias: "direct-example"
+  #   permissions: []

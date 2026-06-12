@@ -98,11 +98,21 @@ Required keys are listed first; optional keys carry their defaults.
 
 - `platform` (required) — transport identifier; currently only `"signal"` is
   used in production.
-- `group_id` (required) — opaque per-platform group identifier. For Signal,
-  this is the base64 group-v2 ID emitted by `signal-cli`.
 - `profile` (required) — Hermes profile name. Must match
   `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` and must not contain path separators; the
   router supervises one `hermes -p <profile> acp` subprocess per profile.
+- `chat_type` (optional, default `group`) — route target type. `group` routes
+  target Signal groups. `direct` routes target one exact Signal sender identity.
+- `group_id` (required for `group`, forbidden for `direct`) — opaque
+  per-platform group identifier. For Signal, this is the base64 group-v2 ID
+  emitted by `signal-cli`.
+- `sender_id` (required for `direct`, ignored for `group`) — exact direct
+  sender identity. Use the Signal `sourceUuid` value and load it from private
+  config through a secret resolver such as `env://SIGNAL_DIRECT_SENDER_UUID`.
+- `sender_number` (optional for `direct`, ignored for `group`) — secondary
+  exact sender number used only when an inbound direct event lacks
+  `sourceUuid`. If `sourceUuid` is present and does not match `sender_id`, the
+  router discards the event even when `sender_number` matches.
 - `session_policy` (optional, default `persistent_route`) — one of the
   [session policy](#session-policies) values.
 - `state` (optional, default `shadow`) — one of the [route state](#route-states)
@@ -119,8 +129,11 @@ Required keys are listed first; optional keys carry their defaults.
   `router.maintenance_reply` (see [Operational reply strings](#operational-reply-strings)).
 - `failure_reply` (optional) — per-route override for `router.failure_reply`.
 
-`(platform, group_id)` must be unique across the routes list; duplicates are
-rejected at config load.
+For group routes, `(platform, group_id)` must be unique across the routes list.
+For direct routes, `(platform, sender_id)` must be unique, and any configured
+`sender_number` must not be reused by another direct route. Direct routes do not
+provide a default DM route or wildcard sender; wildcard-like identities such as
+`*` are rejected at config load.
 
 ## Runtime size limits
 
@@ -175,7 +188,7 @@ records a circuit-breaker failure for the route. Other ACP requests
 and are not affected by this key.
 
 `router.busy_notice_after_seconds` (default `120`) controls how long a turn
-may run before a one-shot busy notice is sent to the Signal group. To keep
+may run before a one-shot busy notice is sent to the Signal target. To keep
 the notice meaningful, configure
 `busy_notice_after_seconds < acp_prompt_timeout_seconds`.
 
@@ -237,15 +250,18 @@ canary prefix and chunking pipeline as ordinary assistant text — see
 
 ## Inbound discard and observability
 
-The router discards unrouteable Signal events — direct messages, non-group
-events, unknown shapes, and events for group IDs with no configured route —
-without normalising message text, decoding attachments, writing media, taking
-dedupe claims, or calling ACP. Each discarded event produces exactly one
-content-free summary (`shape`, `message_type`, `has_group`). Routine non-message
-events are logged at DEBUG, unknown inbound envelopes at INFO, and receive
-exception envelopes at WARNING with `has_exception=true`. No sender identifier,
-group ID value, message text, attachment filename, exception message, or
-attachment payload appears in these summaries.
+The router discards unrouteable Signal events — non-group non-direct events,
+unknown shapes, events for group IDs with no configured route, and direct
+messages from non-matching senders — without normalising message text, decoding
+attachments, writing media, taking dedupe claims, or calling ACP.
+Allowlisted direct `dataMessage` events are routed like group events, subject to
+the exact `sender_id` / `sender_number` matching rules above. Each discarded
+event produces exactly one content-free summary (`shape`, `message_type`,
+`has_group`). Routine non-message events are logged at DEBUG, unknown inbound
+envelopes at INFO, and receive exception envelopes at WARNING with
+`has_exception=true`. No sender identifier, group ID value, message text,
+attachment filename, exception message, or attachment payload appears in these
+summaries.
 
 The router avoids retaining unrouteable payloads in router-owned objects, but
 Python cannot guarantee byte-level zeroisation of transient raw JSON/string

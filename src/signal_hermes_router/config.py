@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .models import RouteState, SessionPolicy
+from .models import ChatType, NormalizedEvent, RouteState, SessionPolicy
 from .permissions import StaticPermissionPolicy
 from .secrets import resolve_secret_refs
 
@@ -51,10 +52,13 @@ class RouterConfig:
 @dataclass(frozen=True)
 class Route:
     platform: str
-    group_id: str
     profile: str
     session_policy: SessionPolicy
     state: RouteState
+    chat_type: ChatType = ChatType.GROUP
+    group_id: str | None = None
+    sender_id: str | None = None
+    sender_number: str | None = None
     route_context: dict[str, Any] = field(default_factory=dict)
     permission_policy: StaticPermissionPolicy = field(default_factory=StaticPermissionPolicy)
     friendly_name: str | None = None
@@ -63,7 +67,14 @@ class Route:
 
     @property
     def key(self) -> str:
-        return f"{self.platform}:{self.group_id}"
+        if self.chat_type == ChatType.GROUP:
+            if not self.group_id:
+                raise ValueError("group route requires group_id")
+            return f"{self.platform}:{self.group_id}"
+        if not self.sender_id:
+            raise ValueError("direct route requires sender_id")
+        digest = hashlib.sha256(self.sender_id.encode("utf-8")).hexdigest()[:24]
+        return f"{self.platform}:direct:{digest}"
 
 
 @dataclass(frozen=True)
@@ -72,10 +83,50 @@ class AppConfig:
     routes: tuple[Route, ...]
 
     def find_route(self, platform: str, group_id: str) -> Route | None:
+        return self.find_group_route(platform, group_id)
+
+    def find_group_route(self, platform: str, group_id: str) -> Route | None:
         for route in self.routes:
-            if route.platform == platform and route.group_id == group_id:
+            if (
+                route.platform == platform
+                and route.chat_type == ChatType.GROUP
+                and route.group_id == group_id
+            ):
                 return route
         return None
+
+    def find_direct_route(
+        self,
+        platform: str,
+        source_uuid: str | None,
+        source_number: str | None = None,
+    ) -> Route | None:
+        if source_uuid:
+            for route in self.routes:
+                if (
+                    route.platform == platform
+                    and route.chat_type == ChatType.DIRECT
+                    and route.sender_id == source_uuid
+                ):
+                    return route
+            return None
+        if not source_number:
+            return None
+        for route in self.routes:
+            if (
+                route.platform == platform
+                and route.chat_type == ChatType.DIRECT
+                and route.sender_number == source_number
+            ):
+                return route
+        return None
+
+    def find_route_for_event(self, event: NormalizedEvent) -> Route | None:
+        if event.chat_type == ChatType.DIRECT:
+            return self.find_direct_route(event.platform, event.source_uuid, event.source_number)
+        if event.group_id is None:
+            return None
+        return self.find_group_route(event.platform, event.group_id)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -183,8 +234,27 @@ def parse_routes(raw: dict[str, Any]) -> list[Route]:
         raise ValueError("routes.yaml requires a routes list")
     routes: list[Route] = []
     seen: dict[str, int] = {}
+    seen_direct_sender_ids: dict[tuple[str, str], int] = {}
+    seen_direct_numbers: dict[tuple[str, str], int] = {}
     for index, value in enumerate(values):
         route = parse_route(value)
+        if route.chat_type == ChatType.DIRECT:
+            assert route.sender_id is not None
+            sender_key = (route.platform, route.sender_id)
+            if sender_key in seen_direct_sender_ids:
+                raise ValueError(
+                    f"duplicate direct sender_id at routes[{index}] "
+                    f"(first defined at routes[{seen_direct_sender_ids[sender_key]}])"
+                )
+            seen_direct_sender_ids[sender_key] = index
+            if route.sender_number:
+                number_key = (route.platform, route.sender_number)
+                if number_key in seen_direct_numbers:
+                    raise ValueError(
+                        f"duplicate direct sender_number at routes[{index}] "
+                        f"(first defined at routes[{seen_direct_numbers[number_key]}])"
+                    )
+                seen_direct_numbers[number_key] = index
         if route.key in seen:
             raise ValueError(
                 f"duplicate route key {route.key!r} at routes[{index}] "
@@ -203,18 +273,53 @@ def parse_route(raw: dict[str, Any]) -> Route:
         json.dumps(route_context, sort_keys=True)
     except TypeError as exc:
         raise ValueError("route_context must be JSON serializable") from exc
+    chat_type = ChatType(raw.get("chat_type", ChatType.GROUP))
+    platform = str(raw["platform"])
+    group_id = raw.get("group_id")
+    sender_id = raw.get("sender_id")
+    sender_number = raw.get("sender_number")
+    if chat_type == ChatType.GROUP:
+        if group_id in (None, ""):
+            raise ValueError("group route requires group_id")
+        group_id = str(group_id)
+        sender_id = None
+        sender_number = None
+    else:
+        if "group_id" in raw:
+            raise ValueError("direct routes must not set group_id")
+        group_id = None
+        sender_id = _normalize_direct_identity(sender_id, "sender_id")
+        sender_number = (
+            _normalize_direct_identity(sender_number, "sender_number")
+            if sender_number is not None
+            else None
+        )
     return Route(
-        platform=str(raw["platform"]),
-        group_id=str(raw["group_id"]),
+        platform=platform,
         profile=normalize_profile_name(raw.get("profile")),
         session_policy=SessionPolicy(raw.get("session_policy", SessionPolicy.PERSISTENT_ROUTE)),
         state=RouteState(raw.get("state", RouteState.SHADOW)),
+        chat_type=chat_type,
+        group_id=group_id,
+        sender_id=sender_id,
+        sender_number=sender_number,
         route_context=route_context,
         permission_policy=StaticPermissionPolicy.from_config(raw.get("permissions") or []),
         friendly_name=raw.get("friendly_name"),
         maintenance_reply=raw.get("maintenance_reply"),
         failure_reply=raw.get("failure_reply"),
     )
+
+
+def _normalize_direct_identity(value: Any, field_name: str) -> str:
+    if value is None:
+        raise ValueError(f"direct route requires {field_name}")
+    identity = str(value).strip()
+    if not identity:
+        raise ValueError(f"direct route {field_name} must not be empty")
+    if identity == "*" or "*" in identity or identity.lower() in {"any", "all", "default"}:
+        raise ValueError(f"direct route {field_name} must be an exact identity, not a wildcard")
+    return identity
 
 
 def normalize_profile_name(value: Any) -> str:

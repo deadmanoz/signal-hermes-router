@@ -19,6 +19,11 @@ class SessionPolicy(StrEnum):
     EPHEMERAL = "ephemeral"
 
 
+class ChatType(StrEnum):
+    GROUP = "group"
+    DIRECT = "direct"
+
+
 @dataclass(frozen=True)
 class SignalAttachment:
     content_type: str
@@ -32,21 +37,23 @@ class SignalAttachment:
 @dataclass(frozen=True)
 class NormalizedEvent:
     platform: str
-    group_id: str
     sender_id: str
-    source_uuid: str
     timestamp: int
     text: str
+    source_uuid: str | None = None
+    chat_type: ChatType = ChatType.GROUP
+    group_id: str | None = None
+    source_number: str | None = None
     attachments: tuple[SignalAttachment, ...] = ()
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def dedupe_key(self) -> tuple[str, int]:
-        return (self.source_uuid, self.timestamp)
+    def dedupe_sender_id(self) -> str:
+        return str(self.source_uuid or self.source_number or self.sender_id or "unknown")
 
     @property
-    def route_key(self) -> str:
-        return f"{self.platform}:{self.group_id}"
+    def dedupe_key(self) -> tuple[str, int]:
+        return (self.dedupe_sender_id, self.timestamp)
 
 
 @dataclass(frozen=True)

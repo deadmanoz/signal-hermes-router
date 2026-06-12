@@ -14,7 +14,7 @@ The router is justified by a narrow gap in the upstream Hermes gateway model:
 - **Group allowlisting is not profile routing.** The Signal adapter filters group messages through `SIGNAL_GROUP_ALLOWED_USERS`, but accepted groups continue into the same adapter and therefore the same profile ([signal.py](https://raw.githubusercontent.com/NousResearch/hermes-agent/main/gateway/platforms/signal.py)).
 - **Upstream multi-profile gateway work is a design question, not a shipped mode.** The broader Hermes issue for "multi-profile deployments in a single gateway process" describes today's canonical shape as N gateway processes, one per profile, and asks whether one gateway hosting many profiles should exist ([NousResearch/hermes-agent#23735](https://github.com/NousResearch/hermes-agent/issues/23735)).
 
-Changing Hermes directly would mean teaching the gateway to load multiple profiles at once, select a profile from incoming Signal metadata, and keep session stores, memory, skills, permissions, lifecycle, observability, and platform routing isolated per profile. That is a much wider maintenance surface than this repo needs. `signal-hermes-router` keeps Hermes unchanged: it consumes Signal once, routes by group ID, and talks to each profile through the stable ACP subprocess boundary.
+Changing Hermes directly would mean teaching the gateway to load multiple profiles at once, select a profile from incoming Signal metadata, and keep session stores, memory, skills, permissions, lifecycle, observability, and platform routing isolated per profile. That is a much wider maintenance surface than this repo needs. `signal-hermes-router` keeps Hermes unchanged: it consumes Signal once, routes by explicit group or direct-message targets, and talks to each profile through the stable ACP subprocess boundary.
 
 ## What the router does not provide (that the Hermes Signal gateway does)
 
@@ -41,7 +41,7 @@ The Hermes gateway can react to messages via the Signal reaction API. The router
 
 ### Native reply quoting
 
-The Hermes gateway posts replies that natively quote the original message, and surfaces inbound reply-quote relationships to the agent. The router's `send_group` call passes `groupId` + `message` only, and the normalised event shape (`NormalizedEvent` in [src/signal_hermes_router/models.py](../src/signal_hermes_router/models.py)) carries no quote metadata, so quote relationships are neither sent nor surfaced.
+The Hermes gateway posts replies that natively quote the original message, and surfaces inbound reply-quote relationships to the agent. The router's Signal reply calls pass only the target (`groupId` for groups, `recipient` for explicit direct routes) plus `message`, and the normalised event shape (`NormalizedEvent` in [src/signal_hermes_router/models.py](../src/signal_hermes_router/models.py)) carries no quote metadata, so quote relationships are neither sent nor surfaced.
 
 ### Inbound voice transcription
 
@@ -51,7 +51,7 @@ If Whisper is configured, the Hermes gateway transcribes incoming voice messages
 
 The Hermes gateway handles both DMs and groups, with separate allowlists (`SIGNAL_ALLOWED_USERS`, DM pairing codes, "Note to Self" support with echo-back protection).
 
-The router is **groups-only by design**. A route is a Signal group ID mapped to a Hermes profile; the data model uses `route_key = f"{platform}:{group_id}"` and `send_group(group_id, message)`. DMs are not ingested and not delivered. If you need 1:1 chat with an agent, use a Signal group containing just you and the bot, and map that group to the relevant profile.
+The router is **explicit-route only by design**. Group routes map a Signal group ID to a Hermes profile. Direct-message routes are opt-in, require an exact configured sender identity, and do not provide a wildcard DM fallback. DMs from non-matching senders are discarded before attachment parsing, media storage, dedupe, or ACP delivery.
 
 ### Interactive setup and pairing flow
 
@@ -88,11 +88,11 @@ These are the reasons to choose the router in the first place, summarised here f
 - **Per-route session policies** — `persistent_route`, `persistent_sender`, `ephemeral` — controlling whether a group shares one ACP session, splits per sender, or starts fresh each turn.
 - **Per-route circuit breaker**, with configurable maintenance/failure replies.
 - **Route-scoped event dedupe** in a sqlite store, so the same Signal envelope can't be re-played across a router restart.
-- **Route-context preamble** injected into each prompt so a profile knows which route/group the turn belongs to (prompt-safe keys only; see [docs/route-context.md](route-context.md)).
+- **Route-context preamble** injected into each prompt so a profile knows which route target the turn belongs to (prompt-safe keys only; see [docs/route-context.md](route-context.md)).
 - **Static ACP permission allowlist** that answers `session/request_permission` from config, so a long-running agent doesn't block on operator input mid-turn (see [docs/permissions.md](permissions.md)).
 
 ## Summary
 
 If you run one Hermes profile against one Signal number and want every Signal feature out of the box (image/voice/video replies, native quotes, reactions, markdown formatting, voice transcription, DM support), use the **Hermes Signal gateway**.
 
-If you need more than one Hermes profile behind a single Signal number — at the cost of text-only replies for now, no reactions, no native quoting, and groups-only ingest — use **`signal-hermes-router`**.
+If you need more than one Hermes profile behind a single Signal number — at the cost of text-only replies for now, no reactions, no native quoting, and explicit-route-only ingest — use **`signal-hermes-router`**.
