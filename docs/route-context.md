@@ -19,4 +19,4 @@ Adding a new prompt-safe key exposes that value to the LLM prompt preamble and s
 
 The nonce changes per turn (`signal_hermes_router.context.new_context_nonce`). User text is sent as a separate ACP content block, and route-context delimiter lookalikes in user text are escaped (`signal_hermes_router.context.escape_user_text`) before delivery.
 
-Profiles should treat prompt-visible route context as trusted deployment context, not as user text. Keep raw Signal group IDs, friendly names, imported source labels, canary reply prefixes, and other private metadata in `routes.yaml`; they are not prompt-visible unless the public code allowlist is expanded.
+Profiles should treat prompt-visible route context as trusted deployment context, not as user text. Keep raw Signal route target identifiers, friendly names, imported source labels, canary reply prefixes, and other private metadata in `routes.yaml`; they are not prompt-visible unless the public code allowlist is expanded.

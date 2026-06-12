@@ -14,7 +14,7 @@ from signal_hermes_router.config import (
     parse_router_config,
     parse_routes,
 )
-from signal_hermes_router.models import RouteState, SessionPolicy
+from signal_hermes_router.models import ChatType, NormalizedEvent, RouteState, SessionPolicy
 
 
 class ConfigTests(unittest.TestCase):
@@ -228,6 +228,157 @@ router:
         }
         with self.assertRaisesRegex(ValueError, "duplicate route key"):
             parse_routes(raw)
+
+    def test_parse_direct_route_requires_sender_identity(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires sender_id"):
+            parse_route(
+                {
+                    "platform": "signal",
+                    "chat_type": "direct",
+                    "profile": "profile",
+                }
+            )
+
+    def test_parse_direct_route_rejects_wildcard_sender_identity(self) -> None:
+        for value in ("", "*", "prefix-*", "any"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "wildcard|empty"):
+                parse_route(
+                    {
+                        "platform": "signal",
+                        "chat_type": "direct",
+                        "sender_id": value,
+                        "profile": "profile",
+                    }
+                )
+
+    def test_parse_direct_route_rejects_group_id(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must not set group_id"):
+            parse_route(
+                {
+                    "platform": "signal",
+                    "chat_type": "direct",
+                    "group_id": "GROUP",
+                    "sender_id": "sender-uuid",
+                    "profile": "profile",
+                }
+            )
+
+    def test_parse_direct_route_uses_hashed_route_key(self) -> None:
+        route = parse_route(
+            {
+                "platform": "signal",
+                "chat_type": "direct",
+                "sender_id": "sender-uuid",
+                "sender_number": "+00000000000",
+                "profile": "profile",
+            }
+        )
+
+        self.assertEqual(route.chat_type, ChatType.DIRECT)
+        self.assertIsNone(route.group_id)
+        self.assertEqual(route.sender_id, "sender-uuid")
+        self.assertEqual(route.sender_number, "+00000000000")
+        self.assertTrue(route.key.startswith("signal:direct:"))
+        self.assertNotIn("sender-uuid", route.key)
+
+    def test_duplicate_direct_routes_are_rejected(self) -> None:
+        raw = {
+            "routes": [
+                {
+                    "platform": "signal",
+                    "chat_type": "direct",
+                    "sender_id": "sender-uuid",
+                    "profile": "profile-one",
+                },
+                {
+                    "platform": "signal",
+                    "chat_type": "direct",
+                    "sender_id": "sender-uuid",
+                    "profile": "profile-two",
+                },
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "duplicate direct sender_id"):
+            parse_routes(raw)
+
+    def test_duplicate_direct_sender_numbers_are_rejected(self) -> None:
+        raw = {
+            "routes": [
+                {
+                    "platform": "signal",
+                    "chat_type": "direct",
+                    "sender_id": "sender-one",
+                    "sender_number": "+00000000000",
+                    "profile": "profile-one",
+                },
+                {
+                    "platform": "signal",
+                    "chat_type": "direct",
+                    "sender_id": "sender-two",
+                    "sender_number": "+00000000000",
+                    "profile": "profile-two",
+                },
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "duplicate direct sender_number"):
+            parse_routes(raw)
+
+    def test_find_direct_route_is_uuid_authoritative(self) -> None:
+        direct = parse_route(
+            {
+                "platform": "signal",
+                "chat_type": "direct",
+                "sender_id": "sender-uuid",
+                "sender_number": "+00000000000",
+                "profile": "profile",
+            }
+        )
+        app = AppConfig(router=RouterConfig(), routes=(direct,))
+
+        self.assertEqual(app.find_direct_route("signal", "sender-uuid", None), direct)
+        self.assertEqual(app.find_direct_route("signal", None, "+00000000000"), direct)
+        self.assertIsNone(app.find_direct_route("signal", "other-uuid", "+00000000000"))
+
+    def test_find_route_for_event_routes_direct_and_group_events(self) -> None:
+        group = parse_route({"platform": "signal", "group_id": "GROUP", "profile": "group-profile"})
+        direct = parse_route(
+            {
+                "platform": "signal",
+                "chat_type": "direct",
+                "sender_id": "sender-uuid",
+                "profile": "direct-profile",
+            }
+        )
+        app = AppConfig(router=RouterConfig(), routes=(group, direct))
+
+        self.assertEqual(
+            app.find_route_for_event(
+                NormalizedEvent(
+                    platform="signal",
+                    chat_type=ChatType.GROUP,
+                    group_id="GROUP",
+                    sender_id="sender",
+                    source_uuid="sender",
+                    timestamp=1,
+                    text="hello",
+                )
+            ),
+            group,
+        )
+        self.assertEqual(
+            app.find_route_for_event(
+                NormalizedEvent(
+                    platform="signal",
+                    chat_type=ChatType.DIRECT,
+                    group_id=None,
+                    sender_id="sender-uuid",
+                    source_uuid="sender-uuid",
+                    timestamp=1,
+                    text="hello",
+                )
+            ),
+            direct,
+        )
 
     def test_parse_routes_requires_list(self) -> None:
         with self.assertRaisesRegex(ValueError, "routes list"):

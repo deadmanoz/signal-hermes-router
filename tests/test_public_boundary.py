@@ -62,6 +62,27 @@ class PublicBoundaryCheckTests(unittest.TestCase):
 
         self.assertIn("non-synthetic group_id", findings[0])
 
+    def test_direct_sender_uuid_and_number_must_not_be_real_values(self) -> None:
+        findings: list[str] = []
+        private_uuid = "-".join(["11111111", "1111", "1111", "1111", "111111111111"])
+        private_phone = "+123" + "45678901"
+
+        public_boundary.check_text(
+            Path("routes.example.yaml"),
+            f"""
+routes:
+  - platform: signal
+    chat_type: direct
+    sender_id: {private_uuid}
+    sender_number: {private_phone}
+    friendly_name: synthetic-direct-example
+""",
+            findings,
+        )
+
+        self.assertTrue(any("UUID-like identifier" in finding for finding in findings))
+        self.assertTrue(any("phone-like identifier" in finding for finding in findings))
+
     def test_action_commit_shas_are_not_treated_as_base64_secrets(self) -> None:
         findings: list[str] = []
 

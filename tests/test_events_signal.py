@@ -12,9 +12,11 @@ from signal_hermes_router import signal as signal_module
 from signal_hermes_router.events import (
     inspect_signal_event,
     parse_signal_event,
+    probe_signal_route,
     probe_routeability,
     summarize_signal_event,
 )
+from signal_hermes_router.models import ChatType
 from signal_hermes_router.signal import SignalHttpClient, _iter_sse_json
 
 
@@ -113,6 +115,81 @@ class EventTests(unittest.TestCase):
         self.assertEqual(event.sender_id, "sender-uuid")
         self.assertEqual(event.dedupe_key, ("sender-uuid", 1714521600000))
         self.assertEqual(event.text, "synthetic direct SSE text")
+
+    def test_parse_signal_direct_data_message(self) -> None:
+        raw = {
+            "envelope": {
+                "source": "+00000000000",
+                "sourceUuid": "sender-uuid",
+                "sourceNumber": "+00000000000",
+                "timestamp": 1714521600000,
+                "dataMessage": {
+                    "timestamp": 1714521600000,
+                    "message": "synthetic direct text",
+                    "attachments": [
+                        {
+                            "contentType": "text/plain",
+                            "filename": "a.txt",
+                            "data": base64.b64encode(b"body").decode("ascii"),
+                        }
+                    ],
+                },
+            },
+            "account": "synthetic-account-number",
+        }
+
+        event = parse_signal_event(raw)
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.chat_type, ChatType.DIRECT)
+        self.assertIsNone(event.group_id)
+        self.assertEqual(event.sender_id, "sender-uuid")
+        self.assertEqual(event.source_uuid, "sender-uuid")
+        self.assertEqual(event.source_number, "+00000000000")
+        self.assertEqual(event.dedupe_key, ("sender-uuid", 1714521600000))
+        self.assertEqual(event.text, "synthetic direct text")
+        self.assertEqual(event.attachments[0].body, b"body")
+
+    def test_parse_signal_direct_data_message_without_uuid_keeps_number_for_dedupe(
+        self,
+    ) -> None:
+        raw = {
+            "envelope": {
+                "source": "+00000000000",
+                "sourceNumber": "+00000000000",
+                "timestamp": 1714521600000,
+                "dataMessage": {"message": "synthetic direct text"},
+            },
+            "account": "synthetic-account-number",
+        }
+
+        event = parse_signal_event(raw)
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.chat_type, ChatType.DIRECT)
+        self.assertIsNone(event.source_uuid)
+        self.assertEqual(event.source_number, "+00000000000")
+        self.assertEqual(event.sender_id, "+00000000000")
+        self.assertEqual(event.dedupe_key, ("+00000000000", 1714521600000))
+
+    def test_parse_signal_direct_sync_message_is_not_a_direct_data_message(self) -> None:
+        raw = {
+            "envelope": {
+                "sourceUuid": "sender-uuid",
+                "timestamp": 1714521600000,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1714521600000,
+                        "message": "linked-device direct text",
+                    }
+                },
+            },
+            "account": "account",
+        }
+
+        self.assertIsNone(parse_signal_event(raw))
 
     def test_summarize_signal_event_is_content_free(self) -> None:
         raw = {
@@ -279,7 +356,7 @@ class EventTests(unittest.TestCase):
             "envelope": {
                 "sourceUuid": "sender-uuid",
                 "timestamp": 1,
-                "dataMessage": {"message": "direct message"},
+                "dataMessage": {"message": "secret direct payload"},
             },
             "account": "account",
         }
@@ -288,6 +365,30 @@ class EventTests(unittest.TestCase):
         self.assertEqual(summary.shape, "direct")
         self.assertEqual(summary.message_type, "dataMessage")
         self.assertFalse(summary.has_group)
+
+    def test_probe_signal_route_returns_direct_facts_without_leaking_summary(self) -> None:
+        raw = {
+            "envelope": {
+                "source": "+00000000000",
+                "sourceUuid": "sender-uuid",
+                "sourceNumber": "+00000000000",
+                "timestamp": 1,
+                "dataMessage": {"message": "direct message"},
+            },
+            "account": "account",
+        }
+
+        probe = probe_signal_route(raw)
+
+        self.assertIsNone(probe.group_id)
+        self.assertEqual(probe.source_uuid, "sender-uuid")
+        self.assertEqual(probe.source_number, "+00000000000")
+        self.assertTrue(probe.is_direct_data_message)
+        summary = str(probe.summary)
+        self.assertEqual(summary, "shape=direct message_type=dataMessage has_group=false")
+        self.assertNotIn("sender-uuid", summary)
+        self.assertNotIn("+00000000000", summary)
+        self.assertNotIn("secret direct payload", summary)
 
     def test_probe_routeability_returns_none_for_unknown_shape(self) -> None:
         raw = {"not": "a signal envelope"}
@@ -335,15 +436,27 @@ class SignalHttpTests(unittest.IsolatedAsyncioTestCase):
         try:
             self.assertTrue(await client.check())
             result = await client.send_group("group-id", "reply")
+            await client.send_direct("sender-uuid", "direct reply")
             await client.send_typing("group-id", True)
             await client.send_typing("group-id", False)
+            await client.send_typing_direct("sender-uuid", True)
+            await client.send_typing_direct("sender-uuid", False)
             self.assertEqual(result["timestamp"], 1)
             self.assertEqual(requests[0]["method"], "send")
             self.assertEqual(requests[0]["params"], {"groupId": "group-id", "message": "reply"})
-            self.assertEqual(requests[1]["method"], "sendTyping")
-            self.assertEqual(requests[1]["params"], {"groupId": "group-id"})
+            self.assertEqual(requests[1]["method"], "send")
+            self.assertEqual(
+                requests[1]["params"],
+                {"recipient": ["sender-uuid"], "message": "direct reply"},
+            )
             self.assertEqual(requests[2]["method"], "sendTyping")
-            self.assertEqual(requests[2]["params"], {"groupId": "group-id", "stop": True})
+            self.assertEqual(requests[2]["params"], {"groupId": "group-id"})
+            self.assertEqual(requests[3]["method"], "sendTyping")
+            self.assertEqual(requests[3]["params"], {"groupId": "group-id", "stop": True})
+            self.assertEqual(requests[4]["method"], "sendTyping")
+            self.assertEqual(requests[4]["params"], {"recipient": ["sender-uuid"]})
+            self.assertEqual(requests[5]["method"], "sendTyping")
+            self.assertEqual(requests[5]["params"], {"recipient": ["sender-uuid"], "stop": True})
         finally:
             await client.close()
 

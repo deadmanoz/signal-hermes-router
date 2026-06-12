@@ -12,6 +12,7 @@ from signal_hermes_router.acp import ACPProfile
 from signal_hermes_router.config import AppConfig, CircuitBreakerConfig, Route, RouterConfig
 from signal_hermes_router.dedupe import DedupeStore
 from signal_hermes_router.models import (
+    ChatType,
     NormalizedEvent,
     RouteState,
     SessionPolicy,
@@ -41,7 +42,10 @@ def router_config_for_tmp(tmp: str | Path, **overrides: Any) -> RouterConfig:
 def make_route(
     *,
     platform: str = "signal",
-    group_id: str = "group",
+    chat_type: ChatType = ChatType.GROUP,
+    group_id: str | None = "group",
+    sender_id: str | None = None,
+    sender_number: str | None = None,
     profile: str = "profile",
     session_policy: SessionPolicy = SessionPolicy.PERSISTENT_ROUTE,
     state: RouteState = RouteState.ACTIVE,
@@ -53,7 +57,10 @@ def make_route(
 ) -> Route:
     return Route(
         platform=platform,
-        group_id=group_id,
+        chat_type=chat_type,
+        group_id=None if chat_type == ChatType.DIRECT and group_id == "group" else group_id,
+        sender_id=sender_id,
+        sender_number=sender_number,
         profile=profile,
         session_policy=session_policy,
         state=state,
@@ -68,9 +75,11 @@ def make_route(
 def make_event(
     *,
     platform: str = "signal",
-    group_id: str = "group",
+    chat_type: ChatType = ChatType.GROUP,
+    group_id: str | None = "group",
     sender_id: str = "sender",
     source_uuid: str | None = None,
+    source_number: str | None = None,
     timestamp: int = 1,
     text: str = "hello",
     attachments: tuple[SignalAttachment, ...] = (),
@@ -78,9 +87,11 @@ def make_event(
 ) -> NormalizedEvent:
     return NormalizedEvent(
         platform=platform,
-        group_id=group_id,
+        chat_type=chat_type,
+        group_id=None if chat_type == ChatType.DIRECT and group_id == "group" else group_id,
         sender_id=sender_id,
         source_uuid=source_uuid or sender_id,
+        source_number=source_number,
         timestamp=timestamp,
         text=text,
         attachments=attachments,
@@ -128,14 +139,24 @@ def make_app(
 class FakeSignal:
     def __init__(self) -> None:
         self.sends: list[tuple[str, str]] = []
+        self.direct_sends: list[tuple[str, str]] = []
         self.typing: list[tuple[str, bool]] = []
+        self.direct_typing: list[tuple[str, bool]] = []
 
     async def send_group(self, group_id: str, message: str) -> dict[str, int]:
         self.sends.append((group_id, message))
         return {"timestamp": 1}
 
+    async def send_direct(self, recipient: str, message: str) -> dict[str, int]:
+        self.direct_sends.append((recipient, message))
+        return {"timestamp": 1}
+
     async def send_typing(self, group_id: str, enabled: bool) -> dict[str, int]:
         self.typing.append((group_id, enabled))
+        return {"timestamp": 1}
+
+    async def send_typing_direct(self, recipient: str, enabled: bool) -> dict[str, int]:
+        self.direct_typing.append((recipient, enabled))
         return {"timestamp": 1}
 
     async def close(self) -> None:

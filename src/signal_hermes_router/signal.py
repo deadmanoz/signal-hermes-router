@@ -70,6 +70,13 @@ class SignalHttpClient:
 
     async def send_group(self, group_id: str, message: str) -> dict[str, Any]:
         params = {"groupId": group_id, "message": message}
+        return await self._send(params)
+
+    async def send_direct(self, recipient: str, message: str) -> dict[str, Any]:
+        params = {"recipient": [recipient], "message": message}
+        return await self._send(params)
+
+    async def _send(self, params: dict[str, Any]) -> dict[str, Any]:
         try:
             return await self.rpc("send", params)
         except _RETRYABLE_SEND_ERRORS as exc:
@@ -83,6 +90,12 @@ class SignalHttpClient:
 
     async def send_typing(self, group_id: str, enabled: bool = True) -> dict[str, Any]:
         params: dict[str, Any] = {"groupId": group_id}
+        if not enabled:
+            params["stop"] = True
+        return await self.rpc("sendTyping", params)
+
+    async def send_typing_direct(self, recipient: str, enabled: bool = True) -> dict[str, Any]:
+        params: dict[str, Any] = {"recipient": [recipient]}
         if not enabled:
             params["stop"] = True
         return await self.rpc("sendTyping", params)

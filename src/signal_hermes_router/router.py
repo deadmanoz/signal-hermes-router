@@ -10,9 +10,10 @@ from .circuit import CircuitBreaker
 from .config import AppConfig, Route
 from .context import build_prompt_blocks
 from .dedupe import DedupeStore
-from .events import SignalEventSummary, parse_signal_event, probe_routeability
+from .events import SignalEventSummary, parse_signal_event, probe_signal_route
 from .media import write_attachment
 from .models import (
+    ChatType,
     MediaManifest,
     NormalizedEvent,
     RouteState,
@@ -57,7 +58,14 @@ class SignalHermesRouter:
         self.recovery_seconds = config.router.circuit_breaker.recovery_seconds
         self.redactor = Redactor()
         for route in config.routes:
-            self.redactor.add(route.key, route.group_id, route.profile, route.friendly_name)
+            self.redactor.add(
+                route.key,
+                route.group_id,
+                route.sender_id,
+                route.sender_number,
+                route.profile,
+                route.friendly_name,
+            )
         self.route_state_overrides: dict[str, RouteState] = {}
         self._trip_times: dict[str, float] = {}
 
@@ -75,38 +83,44 @@ class SignalHermesRouter:
         self.dedupe.close()
 
     async def handle_raw_event(self, raw: dict) -> TurnResult | None:
-        group_id, summary = probe_routeability(raw)
-        if group_id is None:
-            _discard_event(summary)
-            return None
-        route = self.config.find_route("signal", group_id)
+        probe = probe_signal_route(raw)
+        route = None
+        if probe.group_id is not None:
+            route = self.config.find_group_route("signal", probe.group_id)
+        elif probe.is_direct_data_message:
+            route = self.config.find_direct_route(
+                "signal",
+                probe.source_uuid,
+                probe.source_number,
+            )
         if route is None:
-            _discard_event(summary)
+            _discard_event(probe.summary)
             return None
         event = parse_signal_event(
             raw,
             max_attachment_bytes=self.config.router.max_attachment_bytes,
         )
         if event is None:
-            _discard_event(summary)
+            _discard_event(probe.summary)
             return None
         return await self.handle_event(event)
 
     async def handle_event(self, event: NormalizedEvent) -> TurnResult | None:
-        route = self.config.find_route(event.platform, event.group_id)
+        route = self.config.find_route_for_event(event)
         if route is None:
             _discard_event(
                 SignalEventSummary(
                     shape="normalized",
                     message_type="dataMessage",
-                    has_group=True,
+                    has_group=event.chat_type == ChatType.GROUP and event.group_id is not None,
                 )
             )
             return None
-        self.redactor.add(event.group_id, event.sender_id, event.source_uuid)
+        self.redactor.add(event.group_id, event.sender_id, event.source_uuid, event.source_number)
 
-        if not self.dedupe.claim(route.key, event.source_uuid, event.timestamp):
-            event_ref = f"{route.key}:{event.source_uuid}:{event.timestamp}"
+        dedupe_sender_id = _routed_sender_id(route, event)
+        if not self.dedupe.claim(route.key, dedupe_sender_id, event.timestamp):
+            event_ref = f"{route.key}:{dedupe_sender_id}:{event.timestamp}"
             LOGGER.info("deduped Signal event %s", self.redactor.ref("event", event_ref))
             return None
 
@@ -125,7 +139,7 @@ class SignalHermesRouter:
                 handled = True
                 return None
 
-            manifests = self._store_media(event)
+            manifests = self._store_media(route, event)
             if state == RouteState.SHADOW:
                 handled = True
                 return None
@@ -202,13 +216,18 @@ class SignalHermesRouter:
                     session.profile.release_session(session.session_id)
         finally:
             if handled:
-                self.dedupe.mark_handled(route.key, event.source_uuid, event.timestamp)
+                self.dedupe.mark_handled(route.key, dedupe_sender_id, event.timestamp)
             else:
-                self.dedupe.release(route.key, event.source_uuid, event.timestamp)
+                self.dedupe.release(route.key, dedupe_sender_id, event.timestamp)
 
-    def _store_media(self, event: NormalizedEvent) -> list[MediaManifest]:
+    def _store_media(self, route: Route, event: NormalizedEvent) -> list[MediaManifest]:
         manifests: list[MediaManifest] = []
-        group_ref = self.redactor.ref("group", event.group_id)
+        if event.chat_type == ChatType.DIRECT:
+            group_ref = self.redactor.ref("direct", _routed_sender_id(route, event))
+        else:
+            if event.group_id is None:
+                raise ValueError("group event requires group_id")
+            group_ref = self.redactor.ref("group", event.group_id)
         sender_ref = self.redactor.ref("sender", event.sender_id)
         for attachment in event.attachments:
             manifests.append(
@@ -259,7 +278,10 @@ class SignalHermesRouter:
         index = 0
         try:
             for index, chunk in enumerate(chunks, 1):
-                await self.signal.send_group(route.group_id, chunk)
+                if route.chat_type == ChatType.DIRECT:
+                    await self.signal.send_direct(_direct_recipient(route), chunk)
+                else:
+                    await self.signal.send_group(_group_id(route), chunk)
         except Exception as exc:
             LOGGER.error(
                 "failed Signal reply chunk %d/%d for %s: %s",
@@ -271,11 +293,16 @@ class SignalHermesRouter:
             LOGGER.debug("Signal reply failure details", exc_info=True)
 
     async def _typing(self, route: Route, enabled: bool) -> None:
-        send_typing = getattr(self.signal, "send_typing", None)
+        if route.chat_type == ChatType.DIRECT:
+            send_typing = getattr(self.signal, "send_typing_direct", None)
+            target = _direct_recipient(route)
+        else:
+            send_typing = getattr(self.signal, "send_typing", None)
+            target = _group_id(route)
         if send_typing is None:
             return
         try:
-            await send_typing(route.group_id, enabled)
+            await send_typing(target, enabled)
         except Exception:
             LOGGER.debug("Signal typing indicator failed", exc_info=True)
 
@@ -322,3 +349,21 @@ def _discard_event(summary: SignalEventSummary) -> None:
         LOGGER.info("discarding unrouted Signal event %s", summary)
     else:
         LOGGER.debug("discarding unrouted Signal event %s", summary)
+
+
+def _group_id(route: Route) -> str:
+    if not route.group_id:
+        raise ValueError("group route requires group_id")
+    return route.group_id
+
+
+def _direct_recipient(route: Route) -> str:
+    if not route.sender_id:
+        raise ValueError("direct route requires sender_id")
+    return route.sender_id
+
+
+def _routed_sender_id(route: Route, event: NormalizedEvent) -> str:
+    if route.chat_type == ChatType.DIRECT:
+        return _direct_recipient(route)
+    return event.dedupe_sender_id

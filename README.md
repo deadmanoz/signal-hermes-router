@@ -1,6 +1,6 @@
 # signal-hermes-router
 
-`signal-hermes-router` is a transport router. It owns one Signal account, consumes Signal group events from upstream `signal-cli`, maps each Signal group to an independent Hermes profile over ACP, and sends Hermes's replies back to Signal.
+`signal-hermes-router` is a transport router. It owns one Signal account, consumes allowlisted Signal events from upstream `signal-cli`, maps each route to an independent Hermes profile over ACP, and sends Hermes's replies back to Signal. Routes can target Signal groups, or one explicitly configured direct-message sender. There is no wildcard DM fallback.
 
 It exists because the built-in Hermes Signal gateway is profile-scoped. Hermes can allowlist multiple Signal groups for one configured Signal account, but those groups all feed the same profile. Running several independent Hermes profiles behind one Signal number is not a native gateway configuration: each profile runs its own gateway process, and Hermes's Signal adapter takes a `signal-phone` scoped lock on the configured account so two profile gateways cannot share that Signal identity at the same time.
 
