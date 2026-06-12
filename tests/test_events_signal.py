@@ -200,6 +200,80 @@ class EventTests(unittest.TestCase):
         self.assertNotIn("secret", summary_str)
         self.assertNotIn("sender-uuid", summary_str)
 
+    def test_probe_routeability_returns_edit_message_group_id(self) -> None:
+        raw = {
+            "envelope": {
+                "sourceUuid": "sender-uuid",
+                "timestamp": 1714521600000,
+                "editMessage": {
+                    "targetSentTimestamp": 1714521500000,
+                    "dataMessage": {
+                        "message": "edited secret",
+                        "groupInfo": {"groupId": "group-id="},
+                    },
+                },
+            },
+            "account": "account",
+        }
+        group_id, summary = probe_routeability(raw)
+        self.assertEqual(group_id, "group-id=")
+        self.assertEqual(summary.shape, "direct")
+        self.assertEqual(summary.message_type, "editMessage")
+        self.assertTrue(summary.has_group)
+        self.assertNotIn("group-id=", str(summary))
+        self.assertNotIn("edited secret", str(summary))
+
+    def test_probe_routeability_returns_sync_edit_message_group_id(self) -> None:
+        raw = {
+            "envelope": {
+                "sourceUuid": "sender-uuid",
+                "timestamp": 1714521600000,
+                "syncMessage": {
+                    "sentMessage": {
+                        "destination": None,
+                        "editMessage": {
+                            "targetSentTimestamp": 1714521500000,
+                            "dataMessage": {
+                                "message": "linked-device edited secret",
+                                "groupInfo": {"groupId": "group-id="},
+                            },
+                        },
+                    }
+                },
+            },
+            "account": "account",
+        }
+        group_id, summary = probe_routeability(raw)
+        self.assertEqual(group_id, "group-id=")
+        self.assertEqual(summary.shape, "direct")
+        self.assertEqual(summary.message_type, "syncMessage")
+        self.assertTrue(summary.has_group)
+        self.assertNotIn("group-id=", str(summary))
+        self.assertNotIn("linked-device edited secret", str(summary))
+
+    def test_probe_routeability_marks_receive_exception_without_payload(self) -> None:
+        raw = {
+            "envelope": {
+                "sourceUuid": "sender-uuid",
+                "timestamp": 1714521600000,
+            },
+            "exception": {
+                "message": "private exception detail",
+                "type": "RuntimeException",
+            },
+            "account": "account",
+        }
+        group_id, summary = probe_routeability(raw)
+        self.assertIsNone(group_id)
+        self.assertEqual(summary.shape, "direct")
+        self.assertEqual(summary.message_type, "unknown")
+        self.assertFalse(summary.has_group)
+        self.assertTrue(summary.has_exception)
+        summary_str = str(summary)
+        self.assertIn("has_exception=true", summary_str)
+        self.assertNotIn("private exception detail", summary_str)
+        self.assertNotIn("sender-uuid", summary_str)
+
     def test_probe_routeability_returns_none_for_non_group_event(self) -> None:
         raw = {
             "envelope": {
