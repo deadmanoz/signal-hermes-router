@@ -5,7 +5,7 @@
 
 ### Features
 
-* **router:** support human-only Signal direct routes ([7db6461](https://github.com/deadmanoz/signal-hermes-router/commit/7db646175a77f8651d52d40f832efd4c7b614382))
+* **router:** support human-only Signal direct routes
 
 ## [0.1.3](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.2...v0.1.3) (2026-06-12)
 
