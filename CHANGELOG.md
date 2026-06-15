@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.4...v0.1.5) (2026-06-15)
+
+
+### Features
+
+* **router:** support scheduled synthetic route turns
+
 ## [0.1.4](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.3...v0.1.4) (2026-06-12)
 
 
