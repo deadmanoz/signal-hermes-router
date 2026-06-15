@@ -5,7 +5,7 @@
 
 ### Features
 
-* **router:** support scheduled synthetic route turns ([edaaa78](https://github.com/deadmanoz/signal-hermes-router/commit/edaaa7812e9e7e5468a3883afdbc5bf28671328f))
+* **router:** support scheduled synthetic route turns
 
 ## [0.1.4](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.3...v0.1.4) (2026-06-12)
 
