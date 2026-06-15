@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import socket
+import stat
 import time
+import uuid
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 from .circuit import CircuitBreaker
-from .config import AppConfig, Route
-from .context import build_prompt_blocks
+from .config import AppConfig, Route, SyntheticRouteJob
+from .context import build_prompt_blocks, build_scheduled_prompt_blocks
 from .dedupe import DedupeStore
 from .events import SignalEventSummary, parse_signal_event, probe_signal_route
 from .media import write_attachment
@@ -17,17 +24,40 @@ from .models import (
     MediaManifest,
     NormalizedEvent,
     RouteState,
+    SessionKeyInput,
     SessionPolicy,
     SignalAttachment,
+    TurnOrigin,
+    TurnOutcome,
+    TurnOutcomeStatus,
     TurnResult,
 )
 from .outbound import chunk_for_signal_bytes, prepare_outgoing_message
-from .private_fs import validate_path_component
+from .permissions import StaticPermissionPolicy
+from .private_fs import ensure_private_dir, validate_path_component
 from .redaction import Redactor
 from .sessions import ProfileSupervisor, SessionRegistry
 from .signal import SignalHttpClient
 
 LOGGER = logging.getLogger(__name__)
+
+SYNTHETIC_DEDUPE_TIMESTAMP_SENTINEL = 0
+
+
+@dataclass(frozen=True)
+class RoutedTurnInput:
+    route: Route
+    origin: TurnOrigin
+    dedupe_sender_id: str
+    dedupe_timestamp: int
+    session: SessionKeyInput
+    secondary_dedupe: tuple[str, int] | None = None
+    signal_event: NormalizedEvent | None = None
+    scheduled_job: SyntheticRouteJob | None = None
+    scheduled_prompt: str | None = None
+    scheduled_at_ms: int | None = None
+    triggered_at_ms: int | None = None
+    permission_policy: StaticPermissionPolicy | None = None
 
 
 class SignalHermesRouter:
@@ -38,6 +68,8 @@ class SignalHermesRouter:
         signal_client: SignalHttpClient | None = None,
         supervisor: ProfileSupervisor | None = None,
         dedupe: DedupeStore | None = None,
+        clock_ms: Callable[[], int] | None = None,
+        nonce_factory: Callable[[], str] | None = None,
     ) -> None:
         self.config = config
         self.signal = signal_client or SignalHttpClient(
@@ -68,8 +100,37 @@ class SignalHermesRouter:
             )
         self.route_state_overrides: dict[str, RouteState] = {}
         self._trip_times: dict[str, float] = {}
+        self._route_locks: dict[str, asyncio.Lock] = {}
+        self._profile_locks: dict[str, asyncio.Lock] = {}
+        self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
+        self._nonce_factory = nonce_factory or (lambda: uuid.uuid4().hex)
+        self._control_server: asyncio.Server | None = None
+        self._control_socket_path: Path | None = None
 
     async def run_forever(self) -> None:
+        if self.config.router.control.enabled:
+            tasks = {
+                asyncio.create_task(self._run_signal_events()),
+                asyncio.create_task(self._run_control_server()),
+            }
+            try:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await asyncio.gather(*pending)
+                for task in done:
+                    task.result()
+                return
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await asyncio.gather(*tasks, return_exceptions=True)
+        await self._run_signal_events()
+
+    async def _run_signal_events(self) -> None:
         async for raw in self.signal.events():
             try:
                 await self.handle_raw_event(raw)
@@ -78,6 +139,7 @@ class SignalHermesRouter:
                 LOGGER.debug("event handler crash details", exc_info=True)
 
     async def close(self) -> None:
+        await self._close_control_server()
         await self.signal.close()
         await self.supervisor.close()
         self.dedupe.close()
@@ -117,12 +179,76 @@ class SignalHermesRouter:
             )
             return None
         self.redactor.add(event.group_id, event.sender_id, event.source_uuid, event.source_number)
+        turn = self._signal_turn_input(route, event)
+        lock = self._route_lock(route)
+        async with lock:
+            profile_lock = self._profile_lock(route.profile)
+            async with profile_lock:
+                outcome = await self._run_turn(turn)
+        return outcome.result if outcome.status == TurnOutcomeStatus.DELIVERED else None
 
-        dedupe_sender_id = _routed_sender_id(route, event)
-        if not self.dedupe.claim(route.key, dedupe_sender_id, event.timestamp):
-            event_ref = f"{route.key}:{dedupe_sender_id}:{event.timestamp}"
-            LOGGER.info("deduped Signal event %s", self.redactor.ref("event", event_ref))
-            return None
+    async def handle_synthetic_job(
+        self,
+        job_id: str,
+        *,
+        scheduled_at: int | None = None,
+        idempotency_key: str | None = None,
+        route_lock_timeout: float | None = None,
+    ) -> TurnOutcome:
+        job = self.config.find_synthetic_job(job_id)
+        if job is None:
+            return TurnOutcome(TurnOutcomeStatus.ERROR, error="unknown_job", job_id=job_id)
+        route = self.config.find_route_by_name(job.route_name)
+        if route is None:
+            return TurnOutcome(TurnOutcomeStatus.ERROR, error="unknown_route", job_id=job.id)
+        self.redactor.add(route.key, route.group_id, route.sender_id, route.sender_number)
+        turn = self._synthetic_turn_input(job, route, scheduled_at, idempotency_key)
+        timeout = (
+            self.config.router.control.route_lock_timeout_seconds
+            if route_lock_timeout is None
+            else route_lock_timeout
+        )
+        lock = self._route_lock(route)
+        if not await self._acquire_route_lock(lock, timeout):
+            return TurnOutcome(
+                TurnOutcomeStatus.BUSY,
+                route_state=self.route_state_overrides.get(route.key, route.state),
+                job_id=job.id,
+            )
+        try:
+            profile_lock = self._profile_lock(route.profile)
+            profile_lock_acquired = await self._acquire_route_lock(profile_lock, timeout)
+            if not profile_lock_acquired:
+                return TurnOutcome(
+                    TurnOutcomeStatus.BUSY,
+                    route_state=self.route_state_overrides.get(route.key, route.state),
+                    job_id=job.id,
+                )
+            try:
+                return await self._run_turn(turn)
+            finally:
+                profile_lock.release()
+        finally:
+            lock.release()
+
+    async def _run_turn(self, turn: RoutedTurnInput) -> TurnOutcome:
+        route = turn.route
+        dedupe_identities = [(turn.dedupe_sender_id, turn.dedupe_timestamp)]
+        if turn.secondary_dedupe is not None:
+            dedupe_identities.append(turn.secondary_dedupe)
+        claimed_dedupe: list[tuple[str, int]] = []
+        for dedupe_sender_id, dedupe_timestamp in dedupe_identities:
+            if not self.dedupe.claim(route.key, dedupe_sender_id, dedupe_timestamp):
+                for claimed_sender_id, claimed_timestamp in claimed_dedupe:
+                    self.dedupe.release(route.key, claimed_sender_id, claimed_timestamp)
+                event_ref = f"{route.key}:{dedupe_sender_id}:{dedupe_timestamp}"
+                LOGGER.info("deduped routed turn %s", self.redactor.ref("event", event_ref))
+                return TurnOutcome(
+                    TurnOutcomeStatus.DEDUPED,
+                    route_state=self.route_state_overrides.get(route.key, route.state),
+                    job_id=turn.scheduled_job.id if turn.scheduled_job else None,
+                )
+            claimed_dedupe.append((dedupe_sender_id, dedupe_timestamp))
 
         handled = False
         try:
@@ -131,25 +257,48 @@ class SignalHermesRouter:
             LOGGER.info("route %s in state %s", self.redactor.ref("route", route.key), state)
             if state == RouteState.DISABLED:
                 handled = True
-                return None
+                return TurnOutcome(
+                    TurnOutcomeStatus.SKIPPED,
+                    route_state=state,
+                    job_id=turn.scheduled_job.id if turn.scheduled_job else None,
+                )
             if state == RouteState.MAINTENANCE:
-                await self._send_once(
+                sent = await self._send_once(
                     route, route.maintenance_reply or self.config.router.maintenance_reply
                 )
+                if not sent:
+                    handled = True
+                    return TurnOutcome(
+                        TurnOutcomeStatus.ERROR,
+                        route_state=state,
+                        error="signal_send_failed",
+                        job_id=turn.scheduled_job.id if turn.scheduled_job else None,
+                    )
                 handled = True
-                return None
+                return TurnOutcome(
+                    TurnOutcomeStatus.DELIVERED,
+                    route_state=state,
+                    job_id=turn.scheduled_job.id if turn.scheduled_job else None,
+                )
 
-            manifests = self._store_media(route, event)
+            manifests: list[MediaManifest] = []
+            if turn.signal_event is not None:
+                manifests = self._store_media(route, turn.signal_event)
             if state == RouteState.SHADOW:
                 handled = True
-                return None
+                return TurnOutcome(
+                    TurnOutcomeStatus.SKIPPED,
+                    route_state=state,
+                    job_id=turn.scheduled_job.id if turn.scheduled_job else None,
+                )
 
-            blocks = build_prompt_blocks(
-                route_context=route.route_context,
-                user_text=event.text,
-                manifests=manifests,
+            blocks = self._build_turn_prompt_blocks(turn, manifests)
+            permission_policy = turn.permission_policy or route.permission_policy
+            session = await self.sessions.get(
+                route,
+                turn.session,
+                permission_policy=permission_policy,
             )
-            session = await self.sessions.get(route, event)
             await self._typing(route, True)
             turn_done = asyncio.Event()
             notice_task = asyncio.create_task(self._long_running_notice(route, turn_done))
@@ -158,11 +307,26 @@ class SignalHermesRouter:
                 # Stop the busy-notice task immediately so it cannot fire
                 # while a long chunked reply is still being sent.
                 await self._stop_busy_notice(turn_done, notice_task)
+                if result.text and not await self._send_once(route, result.text):
+                    handled = True
+                    return TurnOutcome(
+                        TurnOutcomeStatus.ERROR,
+                        route_state=state,
+                        result=result,
+                        error="signal_send_failed",
+                        job_id=turn.scheduled_job.id if turn.scheduled_job else None,
+                        reply_sent=False,
+                    )
+                reply_sent = bool(result.text)
                 self.circuit.record_success(route.key)
-                if result.text:
-                    await self._send_once(route, result.text)
                 handled = True
-                return result
+                return TurnOutcome(
+                    TurnOutcomeStatus.DELIVERED,
+                    route_state=state,
+                    result=result,
+                    job_id=turn.scheduled_job.id if turn.scheduled_job else None,
+                    reply_sent=reply_sent,
+                )
             except Exception as exc:
                 # Stop the busy-notice task BEFORE the failure reply / recovery,
                 # otherwise a slow restart_profile + replace_after_restart can
@@ -179,7 +343,7 @@ class SignalHermesRouter:
                 # BEFORE attempting subprocess recovery. If restart or
                 # replace_after_restart fails (e.g. binary missing, profile
                 # broken, cooldown), the user still gets a reply and the
-                # breaker still moves — recovery is best-effort for the
+                # breaker still moves; recovery is best-effort for the
                 # next event.
                 trip = self.circuit.record_failure(route.key)
                 if trip:
@@ -197,7 +361,12 @@ class SignalHermesRouter:
                 try:
                     await self.supervisor.restart_profile(route.profile)
                     if route.session_policy != SessionPolicy.EPHEMERAL:
-                        await self.sessions.replace_after_restart(route, event, session)
+                        session = await self.sessions.replace_after_restart(
+                            route,
+                            turn.session,
+                            session,
+                            permission_policy=permission_policy,
+                        )
                 except Exception as recovery_exc:
                     LOGGER.warning(
                         "Hermes recovery failed for %s: %s; route will retry on next event",
@@ -206,19 +375,155 @@ class SignalHermesRouter:
                     )
                     LOGGER.debug("Hermes recovery failure details", exc_info=True)
                 handled = True
-                return None
+                return TurnOutcome(
+                    TurnOutcomeStatus.ERROR,
+                    route_state=state,
+                    error=exc.__class__.__name__,
+                    job_id=turn.scheduled_job.id if turn.scheduled_job else None,
+                )
             finally:
                 # Defensive backup for cancellation paths that skip the
-                # try/except branches. Idempotent — no-op if already stopped.
+                # try/except branches. Idempotent: no-op if already stopped.
                 await self._stop_busy_notice(turn_done, notice_task)
                 await self._typing(route, False)
+                if (
+                    turn.scheduled_job is not None
+                    and turn.scheduled_job.permission_policy is not None
+                ):
+                    session.profile.set_permission_policy(
+                        session.session_id, route.permission_policy
+                    )
                 if session.ephemeral:
                     session.profile.release_session(session.session_id)
         finally:
             if handled:
-                self.dedupe.mark_handled(route.key, dedupe_sender_id, event.timestamp)
+                for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
+                    self.dedupe.mark_handled(route.key, dedupe_sender_id, dedupe_timestamp)
             else:
-                self.dedupe.release(route.key, dedupe_sender_id, event.timestamp)
+                for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
+                    self.dedupe.release(route.key, dedupe_sender_id, dedupe_timestamp)
+
+    def _signal_turn_input(self, route: Route, event: NormalizedEvent) -> RoutedTurnInput:
+        return RoutedTurnInput(
+            route=route,
+            origin=TurnOrigin.SIGNAL,
+            dedupe_sender_id=_routed_sender_id(route, event),
+            dedupe_timestamp=event.timestamp,
+            session=SessionKeyInput(
+                sender_id=_session_sender_id(route, event),
+                timestamp=event.timestamp,
+            ),
+            signal_event=event,
+            permission_policy=route.permission_policy,
+        )
+
+    def _synthetic_turn_input(
+        self,
+        job: SyntheticRouteJob,
+        route: Route,
+        scheduled_at: int | None,
+        idempotency_key: str | None,
+    ) -> RoutedTurnInput:
+        triggered_at_ms = self._clock_ms()
+        dedupe_sender_id, dedupe_timestamp = self._synthetic_dedupe_identity(
+            job.id,
+            scheduled_at=scheduled_at,
+            idempotency_key=idempotency_key,
+            triggered_at_ms=triggered_at_ms,
+        )
+        secondary_dedupe = None
+        if idempotency_key and scheduled_at is not None:
+            secondary_dedupe = (f"scheduled:{job.id}", scheduled_at)
+        return RoutedTurnInput(
+            route=route,
+            origin=TurnOrigin.SCHEDULED_JOB,
+            dedupe_sender_id=dedupe_sender_id,
+            dedupe_timestamp=dedupe_timestamp,
+            secondary_dedupe=secondary_dedupe,
+            session=SessionKeyInput(
+                sender_id=f"scheduled:{job.id}",
+                timestamp=scheduled_at if scheduled_at is not None else triggered_at_ms,
+            ),
+            scheduled_job=job,
+            scheduled_prompt=job.prompt,
+            scheduled_at_ms=scheduled_at,
+            triggered_at_ms=triggered_at_ms,
+            permission_policy=job.permission_policy or route.permission_policy,
+        )
+
+    def _synthetic_dedupe_identity(
+        self,
+        job_id: str,
+        *,
+        scheduled_at: int | None,
+        idempotency_key: str | None,
+        triggered_at_ms: int,
+    ) -> tuple[str, int]:
+        if idempotency_key:
+            key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:16]
+            return (
+                f"scheduled:{job_id}:key:{key_hash}",
+                SYNTHETIC_DEDUPE_TIMESTAMP_SENTINEL,
+            )
+        if scheduled_at is not None:
+            return f"scheduled:{job_id}", scheduled_at
+        return f"scheduled:{job_id}:manual:{self._nonce_factory()}", triggered_at_ms
+
+    def _build_turn_prompt_blocks(
+        self,
+        turn: RoutedTurnInput,
+        manifests: list[MediaManifest],
+    ) -> list[dict[str, str]]:
+        if turn.origin == TurnOrigin.SIGNAL:
+            if turn.signal_event is None:
+                raise ValueError("Signal turn requires event")
+            return build_prompt_blocks(
+                route_context=turn.route.route_context,
+                user_text=turn.signal_event.text,
+                manifests=manifests,
+            )
+        if turn.scheduled_job is None or turn.scheduled_prompt is None:
+            raise ValueError("scheduled turn requires job and prompt")
+        return build_scheduled_prompt_blocks(
+            route_context=turn.route.route_context,
+            scheduled_metadata={
+                "origin": TurnOrigin.SCHEDULED_JOB.value,
+                "job_id": turn.scheduled_job.id,
+                "scheduled_at_ms": turn.scheduled_at_ms,
+                "triggered_at_ms": turn.triggered_at_ms,
+            },
+            scheduled_prompt=turn.scheduled_prompt,
+        )
+
+    def _route_lock(self, route: Route) -> asyncio.Lock:
+        lock = self._route_locks.get(route.key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._route_locks[route.key] = lock
+        return lock
+
+    def _profile_lock(self, profile: str) -> asyncio.Lock:
+        lock = self._profile_locks.get(profile)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._profile_locks[profile] = lock
+        return lock
+
+    @staticmethod
+    async def _acquire_route_lock(lock: asyncio.Lock, timeout: float | None) -> bool:
+        if timeout is None:
+            await lock.acquire()
+            return True
+        if timeout <= 0:
+            if lock.locked():
+                return False
+            await lock.acquire()
+            return True
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=timeout)
+            return True
+        except TimeoutError:
+            return False
 
     def _store_media(self, route: Route, event: NormalizedEvent) -> list[MediaManifest]:
         manifests: list[MediaManifest] = []
@@ -258,7 +563,7 @@ class SignalHermesRouter:
             signal_id=signal_id,
         )
 
-    async def _send_once(self, route: Route, message: str) -> None:
+    async def _send_once(self, route: Route, message: str) -> bool:
         message = prepare_outgoing_message(
             route,
             message,
@@ -291,6 +596,8 @@ class SignalHermesRouter:
                 self.redactor.redact(exc.__class__.__name__),
             )
             LOGGER.debug("Signal reply failure details", exc_info=True)
+            return False
+        return True
 
     async def _typing(self, route: Route, enabled: bool) -> None:
         if route.chat_type == ChatType.DIRECT:
@@ -305,6 +612,127 @@ class SignalHermesRouter:
             await send_typing(target, enabled)
         except Exception:
             LOGGER.debug("Signal typing indicator failed", exc_info=True)
+
+    async def _run_control_server(self) -> None:
+        path = self.config.router.control_socket_path.expanduser()
+        self._prepare_control_socket(path)
+        server = await asyncio.start_unix_server(self._handle_control_client, path=str(path))
+        self._control_server = server
+        self._control_socket_path = path
+        try:
+            path.chmod(0o600)
+        except OSError:
+            LOGGER.debug("control socket chmod unsupported for %s", path)
+        LOGGER.info("router control socket listening at %s", self.redactor.ref("socket", str(path)))
+        try:
+            async with server:
+                await server.serve_forever()
+        finally:
+            await self._close_control_server()
+
+    def _prepare_control_socket(self, path: Path) -> None:
+        if path.parent == Path("."):
+            raise RuntimeError("router control socket path must include a private parent directory")
+        if not _is_relative_to(path.parent, self.config.router.work_root):
+            raise RuntimeError("router control socket path must be under router.work_root")
+        ensure_private_dir(path.parent)
+        if not path.exists():
+            return
+        try:
+            mode = path.stat().st_mode
+        except OSError:
+            mode = 0
+        if not stat.S_ISSOCK(mode):
+            raise RuntimeError("router control socket path exists and is not a socket")
+        if _unix_socket_accepts_connections(path):
+            raise RuntimeError("router control socket is already in use")
+        path.unlink()
+
+    async def _handle_control_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            while line := await reader.readline():
+                response = await self._handle_control_line(line)
+                writer.write(json.dumps(response, sort_keys=True).encode("utf-8") + b"\n")
+                await writer.drain()
+        finally:
+            writer.close()
+            with suppress(Exception):
+                await writer.wait_closed()
+
+    async def _handle_control_line(self, line: bytes) -> dict[str, Any]:
+        try:
+            payload = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": "malformed_json"}
+        if not isinstance(payload, dict):
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": "malformed_request"}
+        if payload.get("command") != "trigger_job":
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": "unknown_command"}
+        job_id = payload.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": "missing_job_id"}
+        scheduled_at = payload.get("scheduled_at")
+        if scheduled_at is not None:
+            if isinstance(scheduled_at, bool):
+                return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_scheduled_at"}
+            if isinstance(scheduled_at, int):
+                pass
+            elif isinstance(scheduled_at, str) and scheduled_at.isdecimal():
+                scheduled_at = int(scheduled_at)
+            else:
+                return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_scheduled_at"}
+            if scheduled_at < 0:
+                return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_scheduled_at"}
+        idempotency_key = payload.get("idempotency_key")
+        if idempotency_key is not None and (
+            not isinstance(idempotency_key, str) or not idempotency_key
+        ):
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_idempotency_key"}
+        timeout = payload.get("timeout")
+        if timeout is not None:
+            try:
+                timeout = float(timeout)
+            except (TypeError, ValueError):
+                return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_timeout"}
+            if timeout < 0:
+                return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_timeout"}
+        try:
+            outcome = await self.handle_synthetic_job(
+                job_id,
+                scheduled_at=scheduled_at,
+                idempotency_key=idempotency_key,
+                route_lock_timeout=timeout,
+            )
+        except Exception as exc:
+            LOGGER.error(
+                "control trigger failed for job %s: %s",
+                self.redactor.ref("job", job_id),
+                self.redactor.redact(exc.__class__.__name__),
+            )
+            LOGGER.debug("control trigger failure details", exc_info=True)
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "job_id": job_id,
+                "error": exc.__class__.__name__,
+            }
+        return outcome.to_control_response()
+
+    async def _close_control_server(self) -> None:
+        server = self._control_server
+        self._control_server = None
+        if server is not None:
+            server.close()
+            with suppress(Exception):
+                await server.wait_closed()
+        path = self._control_socket_path
+        self._control_socket_path = None
+        if path is not None:
+            with suppress(FileNotFoundError):
+                path.unlink()
 
     def _maybe_clear_breaker_override(self, route: Route) -> None:
         if self.route_state_overrides.get(route.key) is not RouteState.MAINTENANCE:
@@ -367,3 +795,31 @@ def _routed_sender_id(route: Route, event: NormalizedEvent) -> str:
     if route.chat_type == ChatType.DIRECT:
         return _direct_recipient(route)
     return event.dedupe_sender_id
+
+
+def _session_sender_id(route: Route, event: NormalizedEvent) -> str:
+    if route.chat_type == ChatType.DIRECT:
+        return _direct_recipient(route)
+    return event.sender_id
+
+
+def _unix_socket_accepts_connections(path: Path) -> bool:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(0.2)
+        sock.connect(str(path))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.expanduser().resolve(strict=False).relative_to(
+            parent.expanduser().resolve(strict=False)
+        )
+    except ValueError:
+        return False
+    return True

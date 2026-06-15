@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import re
 import tempfile
 import time
@@ -9,7 +10,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from signal_hermes_router.config import AppConfig, Route, RouterConfig
+from signal_hermes_router.config import (
+    AppConfig,
+    Route,
+    RouterConfig,
+    RouterControlConfig,
+    SyntheticRouteJob,
+)
 from signal_hermes_router.dedupe import DedupeStore
 from signal_hermes_router.models import (
     ChatType,
@@ -18,7 +25,10 @@ from signal_hermes_router.models import (
     SessionPolicy,
     SignalAttachment,
     TurnResult,
+    TurnOrigin,
+    TurnOutcomeStatus,
 )
+from signal_hermes_router.permissions import StaticPermissionPolicy
 from signal_hermes_router.router import SignalHermesRouter
 from tests.support import FakeProfile, FakeSignal, FakeSupervisor, make_app, make_event
 
@@ -66,6 +76,33 @@ def make_direct_raw(
     return {"envelope": envelope, "account": "synthetic-account-number"}
 
 
+def make_synthetic_app(
+    tmp: str | Path,
+    route: Route,
+    job: SyntheticRouteJob | None = None,
+    *,
+    control: RouterControlConfig | None = None,
+) -> AppConfig:
+    return AppConfig(
+        router=RouterConfig(
+            state_db=Path(tmp) / "state.db",
+            media_root=Path(tmp) / "media",
+            signal_attachment_root=Path(tmp) / "signal-attachments",
+            work_root=Path(tmp) / "work",
+            control=control or RouterControlConfig(),
+        ),
+        routes=(route,),
+        scheduled_jobs=(
+            job
+            or SyntheticRouteJob(
+                id="daily-agenda",
+                route_name=route.name or "agenda-route",
+                prompt="Prepare the synthetic daily agenda.",
+            ),
+        ),
+    )
+
+
 class RouterTests(unittest.IsolatedAsyncioTestCase):
     async def test_default_runtime_dependencies_can_be_constructed_and_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -104,6 +141,106 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(seen, [{"id": 1}, {"id": 2}])
             self.assertIn("event handler crashed", "\n".join(logs.output))
+
+    async def test_run_forever_with_control_cancels_sibling_when_signal_loop_ends(self) -> None:
+        class EmptySignal(FakeSignal):
+            async def events(self):
+                if False:
+                    yield {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    control=RouterControlConfig(enabled=True, socket_path=Path(tmp) / "c.sock"),
+                ),
+                signal_client=EmptySignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            control_cancelled = False
+
+            async def run_control() -> None:
+                nonlocal control_cancelled
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    control_cancelled = True
+                    raise
+
+            router._run_control_server = run_control  # type: ignore[method-assign]
+
+            await router.run_forever()
+
+            self.assertTrue(control_cancelled)
+
+    async def test_run_forever_with_control_cancels_children_when_parent_is_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    control=RouterControlConfig(
+                        enabled=True,
+                        socket_path=Path(tmp) / "work" / "control.sock",
+                    ),
+                ),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            signal_started = asyncio.Event()
+            control_started = asyncio.Event()
+            signal_cancelled = False
+            control_cancelled = False
+
+            async def run_signal() -> None:
+                nonlocal signal_cancelled
+                signal_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    signal_cancelled = True
+                    raise
+
+            async def run_control() -> None:
+                nonlocal control_cancelled
+                control_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    control_cancelled = True
+                    raise
+
+            router._run_signal_events = run_signal  # type: ignore[method-assign]
+            router._run_control_server = run_control  # type: ignore[method-assign]
+            task = asyncio.create_task(router.run_forever())
+            await asyncio.wait_for(signal_started.wait(), timeout=1)
+            await asyncio.wait_for(control_started.wait(), timeout=1)
+
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            self.assertTrue(signal_cancelled)
+            self.assertTrue(control_cancelled)
 
     async def test_close_closes_signal_supervisor_and_dedupe(self) -> None:
         class CloseSignal(FakeSignal):
@@ -192,6 +329,755 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(signal.direct_typing, [("sender-uuid", True), ("sender-uuid", False)])
             self.assertTrue(profile.prompts[0][0]["text"].startswith("[route_context:"))
             self.assertEqual(profile.prompts[0][1]["text"], "hello direct")
+
+    async def test_active_group_synthetic_job_calls_backend_and_replies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                route_context={"purpose": "synthetic", "route_alias": "agenda-route"},
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: 1714521600100,
+            )
+
+            outcome = await router.handle_synthetic_job(
+                "daily-agenda",
+                scheduled_at=1714521600000,
+            )
+
+            self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(outcome.route_state, RouteState.ACTIVE)
+            self.assertEqual(signal.sends, [("group", "reply")])
+            self.assertEqual(signal.typing, [("group", True), ("group", False)])
+            self.assertTrue(profile.prompts[0][0]["text"].startswith("[route_context:"))
+            self.assertTrue(profile.prompts[0][1]["text"].startswith("[scheduled_event:"))
+            self.assertIn('"job_id":"daily-agenda"', profile.prompts[0][1]["text"])
+            self.assertEqual(profile.prompts[0][2]["text"], "Prepare the synthetic daily agenda.")
+
+    async def test_active_direct_synthetic_job_replies_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = make_direct_route()
+            route = Route(
+                platform=route.platform,
+                name="direct-agenda",
+                chat_type=route.chat_type,
+                sender_id=route.sender_id,
+                sender_number=route.sender_number,
+                profile=route.profile,
+                session_policy=route.session_policy,
+                state=route.state,
+                route_context=route.route_context,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    SyntheticRouteJob(
+                        id="direct-daily",
+                        route_name="direct-agenda",
+                        prompt="Prepare the direct synthetic agenda.",
+                    ),
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            outcome = await router.handle_synthetic_job("direct-daily", scheduled_at=1000)
+
+            self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(signal.sends, [])
+            self.assertEqual(signal.direct_sends, [("sender-uuid", "reply")])
+            self.assertEqual(signal.direct_typing, [("sender-uuid", True), ("sender-uuid", False)])
+
+    async def test_synthetic_route_states_match_signal_gates(self) -> None:
+        for state in (RouteState.SHADOW, RouteState.DISABLED, RouteState.MAINTENANCE):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
+                route = Route(
+                    platform="signal",
+                    name="agenda-route",
+                    group_id="group",
+                    profile="profile",
+                    session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                    state=state,
+                )
+                signal = FakeSignal()
+                profile = FakeProfile()
+                router = SignalHermesRouter(
+                    make_synthetic_app(tmp, route),
+                    signal_client=signal,  # type: ignore[arg-type]
+                    supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                    dedupe=DedupeStore(),
+                )
+
+                outcome = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+                self.assertEqual(profile.prompts, [])
+                if state == RouteState.MAINTENANCE:
+                    self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+                    self.assertEqual(
+                        signal.sends,
+                        [("group", "This route is temporarily under maintenance.")],
+                    )
+                else:
+                    self.assertEqual(outcome.status, TurnOutcomeStatus.SKIPPED)
+                    self.assertEqual(signal.sends, [])
+
+    async def test_synthetic_unknown_job_and_missing_route_return_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    SyntheticRouteJob(
+                        id="orphan-job",
+                        route_name="missing-route",
+                        prompt="Synthetic orphan prompt.",
+                    ),
+                ),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            unknown = await router.handle_synthetic_job("missing-job")
+            orphan = await router.handle_synthetic_job("orphan-job")
+
+            self.assertEqual(unknown.status, TurnOutcomeStatus.ERROR)
+            self.assertEqual(unknown.error, "unknown_job")
+            self.assertEqual(orphan.status, TurnOutcomeStatus.ERROR)
+            self.assertEqual(orphan.error, "unknown_route")
+
+    async def test_synthetic_job_reuses_persistent_route_session_with_signal_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            await router.handle_event(make_event(timestamp=1))
+            await router.handle_synthetic_job("daily-agenda", scheduled_at=2)
+
+            self.assertEqual(profile.prompt_session_ids, ["session-1", "session-1"])
+            self.assertEqual(profile.new_sessions, 1)
+
+    async def test_synthetic_permission_override_does_not_leak_to_signal_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route_policy = StaticPermissionPolicy.from_config(
+                [{"tool": "read_file", "arguments": {"path": {"prefix": "/route"}}}]
+            )
+            job_policy = StaticPermissionPolicy.from_config(
+                [{"tool": "read_file", "arguments": {"path": {"prefix": "/job"}}}]
+            )
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                permission_policy=route_policy,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    SyntheticRouteJob(
+                        id="daily-agenda",
+                        route_name="agenda-route",
+                        prompt="Prepare the synthetic daily agenda.",
+                        permission_policy=job_policy,
+                    ),
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            await router.handle_synthetic_job("daily-agenda", scheduled_at=1)
+            self.assertEqual(
+                profile.policies, [("session-1", job_policy), ("session-1", route_policy)]
+            )
+            await router.handle_event(make_event(timestamp=2))
+
+            self.assertEqual(
+                profile.policies,
+                [
+                    ("session-1", job_policy),
+                    ("session-1", route_policy),
+                    ("session-1", route_policy),
+                ],
+            )
+
+    async def test_synthetic_scheduled_at_and_idempotency_key_are_deduped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: 2000,
+            )
+
+            first = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+            duplicate = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+            keyed_first = await router.handle_synthetic_job(
+                "daily-agenda",
+                scheduled_at=1001,
+                idempotency_key="stable-fire",
+            )
+            keyed_duplicate = await router.handle_synthetic_job(
+                "daily-agenda",
+                scheduled_at=1002,
+                idempotency_key="stable-fire",
+            )
+            scheduled_duplicate_with_new_key = await router.handle_synthetic_job(
+                "daily-agenda",
+                scheduled_at=1001,
+                idempotency_key="changed-fire-id",
+            )
+
+            self.assertEqual(first.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(duplicate.status, TurnOutcomeStatus.DEDUPED)
+            self.assertEqual(keyed_first.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(keyed_duplicate.status, TurnOutcomeStatus.DEDUPED)
+            self.assertEqual(scheduled_duplicate_with_new_key.status, TurnOutcomeStatus.DEDUPED)
+            self.assertEqual(len(profile.prompts), 2)
+            self.assertEqual(len(signal.sends), 2)
+
+    async def test_synthetic_send_failure_returns_error_and_marks_dedupe_handled(self) -> None:
+        class FlakySignal(FakeSignal):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_send = True
+
+            async def send_group(self, group_id: str, message: str) -> dict[str, int]:
+                if self.fail_send:
+                    raise RuntimeError("send failed")
+                return await super().send_group(group_id, message)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FlakySignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+            signal.fail_send = False
+            retry = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            self.assertEqual(failed.status, TurnOutcomeStatus.ERROR)
+            self.assertEqual(failed.error, "signal_send_failed")
+            self.assertFalse(failed.to_control_response()["reply_sent"])
+            self.assertEqual(retry.status, TurnOutcomeStatus.DEDUPED)
+            self.assertEqual(len(profile.prompts), 1)
+            self.assertEqual(signal.sends, [])
+
+    async def test_synthetic_bare_manual_triggers_are_fresh_with_same_clock(self) -> None:
+        nonces = iter(("nonce-one", "nonce-two"))
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: 2000,
+                nonce_factory=lambda: next(nonces),
+            )
+
+            first = await router.handle_synthetic_job("daily-agenda")
+            second = await router.handle_synthetic_job("daily-agenda")
+
+            self.assertEqual(first.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(second.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(len(profile.prompts), 2)
+            self.assertEqual(len(signal.sends), 2)
+
+    async def test_synthetic_busy_does_not_leave_dedupe_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            lock = router._route_lock(route)
+            await lock.acquire()
+            try:
+                busy = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+            finally:
+                lock.release()
+
+            retry = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            self.assertEqual(busy.status, TurnOutcomeStatus.BUSY)
+            self.assertEqual(retry.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(len(profile.prompts), 1)
+
+    async def test_synthetic_trigger_contends_with_in_flight_signal_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.prompt_delay = 0.05
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            signal_task = asyncio.create_task(router.handle_event(make_event(timestamp=1)))
+            try:
+                for _ in range(50):
+                    if profile.prompts:
+                        break
+                    await asyncio.sleep(0.001)
+                busy = await router.handle_synthetic_job(
+                    "daily-agenda",
+                    scheduled_at=2,
+                    route_lock_timeout=0,
+                )
+            finally:
+                await signal_task
+
+            retry = await router.handle_synthetic_job("daily-agenda", scheduled_at=2)
+
+            self.assertEqual(busy.status, TurnOutcomeStatus.BUSY)
+            self.assertEqual(retry.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(len(profile.prompts), 2)
+
+    async def test_synthetic_triggers_on_distinct_routes_share_profile_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            agenda = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group-one",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            summary = Route(
+                platform="signal",
+                name="summary-route",
+                group_id="group-two",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            profile = FakeProfile()
+            profile.prompt_delay = 0.05
+            router = SignalHermesRouter(
+                AppConfig(
+                    router=RouterConfig(
+                        state_db=Path(tmp) / "state.db",
+                        media_root=Path(tmp) / "media",
+                        signal_attachment_root=Path(tmp) / "signal-attachments",
+                        work_root=Path(tmp) / "work",
+                    ),
+                    routes=(agenda, summary),
+                    scheduled_jobs=(
+                        SyntheticRouteJob(
+                            id="daily-agenda",
+                            route_name="agenda-route",
+                            prompt="Prepare the synthetic daily agenda.",
+                        ),
+                        SyntheticRouteJob(
+                            id="daily-summary",
+                            route_name="summary-route",
+                            prompt="Prepare the synthetic daily summary.",
+                        ),
+                    ),
+                ),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            first_task = asyncio.create_task(
+                router.handle_synthetic_job("daily-agenda", scheduled_at=1)
+            )
+            try:
+                for _ in range(50):
+                    if profile.prompts:
+                        break
+                    await asyncio.sleep(0.001)
+                busy = await router.handle_synthetic_job(
+                    "daily-summary",
+                    scheduled_at=2,
+                    route_lock_timeout=0,
+                )
+            finally:
+                first = await first_task
+            retry = await router.handle_synthetic_job(
+                "daily-summary",
+                scheduled_at=2,
+                route_lock_timeout=0,
+            )
+
+            self.assertEqual(first.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(busy.status, TurnOutcomeStatus.BUSY)
+            self.assertEqual(retry.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(len(profile.prompts), 2)
+
+    async def test_control_line_maps_requests_to_synthetic_outcomes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            self.assertEqual(
+                await router._handle_control_line(b"not-json\n"),
+                {"status": "error", "error": "malformed_json"},
+            )
+            self.assertEqual(
+                await router._handle_control_line(b'{"command":"missing"}\n'),
+                {"status": "error", "error": "unknown_command"},
+            )
+            response = await router._handle_control_line(
+                b'{"command":"trigger_job","job_id":"daily-agenda","scheduled_at":1000}\n'
+            )
+
+            self.assertEqual(response["status"], "delivered")
+            self.assertEqual(response["route_state"], "active")
+            self.assertEqual(response["job_id"], "daily-agenda")
+            self.assertEqual(signal.sends, [("group", "reply")])
+
+    async def test_control_line_rejects_invalid_request_fields_and_reports_exceptions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            cases = (
+                (b"[]\n", "malformed_request"),
+                (b'{"command":"trigger_job"}\n', "missing_job_id"),
+                (
+                    b'{"command":"trigger_job","job_id":"daily-agenda","scheduled_at":"bad"}\n',
+                    "invalid_scheduled_at",
+                ),
+                (
+                    b'{"command":"trigger_job","job_id":"daily-agenda","scheduled_at":-1}\n',
+                    "invalid_scheduled_at",
+                ),
+                (
+                    b'{"command":"trigger_job","job_id":"daily-agenda","scheduled_at":true}\n',
+                    "invalid_scheduled_at",
+                ),
+                (
+                    b'{"command":"trigger_job","job_id":"daily-agenda","scheduled_at":1000.9}\n',
+                    "invalid_scheduled_at",
+                ),
+                (
+                    b'{"command":"trigger_job","job_id":"daily-agenda","idempotency_key":1}\n',
+                    "invalid_idempotency_key",
+                ),
+                (
+                    b'{"command":"trigger_job","job_id":"daily-agenda","idempotency_key":""}\n',
+                    "invalid_idempotency_key",
+                ),
+                (
+                    b'{"command":"trigger_job","job_id":"daily-agenda","timeout":"bad"}\n',
+                    "invalid_timeout",
+                ),
+                (
+                    b'{"command":"trigger_job","job_id":"daily-agenda","timeout":-1}\n',
+                    "invalid_timeout",
+                ),
+            )
+            for payload, error in cases:
+                with self.subTest(error=error):
+                    self.assertEqual(
+                        await router._handle_control_line(payload),
+                        {"status": "error", "error": error},
+                    )
+
+            async def fail_trigger(*_args, **_kwargs):
+                raise RuntimeError("synthetic")
+
+            router.handle_synthetic_job = fail_trigger  # type: ignore[method-assign]
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                response = await router._handle_control_line(
+                    b'{"command":"trigger_job","job_id":"daily-agenda"}\n'
+                )
+
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["error"], "RuntimeError")
+
+    async def test_control_socket_refuses_non_socket_path_and_removes_stale_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            non_socket = Path(tmp) / "work" / "control" / "router.sock"
+            non_socket.parent.mkdir(parents=True)
+            non_socket.write_text("not a socket", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "not a socket"):
+                router._prepare_control_socket(non_socket)
+
+            non_socket.unlink()
+            stale = non_socket
+            import socket
+
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.bind(str(stale))
+            finally:
+                sock.close()
+
+            router._prepare_control_socket(stale)
+            self.assertFalse(stale.exists())
+
+            with self.assertRaisesRegex(RuntimeError, "must include a private parent"):
+                router._prepare_control_socket(Path("control.sock"))
+            with self.assertRaisesRegex(RuntimeError, "under router.work_root"):
+                router._prepare_control_socket(Path(tmp) / "outside" / "router.sock")
+
+    async def test_control_socket_refuses_live_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            socket_path = Path(tmp) / "work" / "control" / "router.sock"
+            socket_path.parent.mkdir(parents=True)
+            import socket
+
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.bind(str(socket_path))
+                sock.listen(1)
+                with self.assertRaisesRegex(RuntimeError, "already in use"):
+                    router._prepare_control_socket(socket_path)
+            finally:
+                sock.close()
+
+    async def test_control_socket_serves_trigger_job_and_cleans_up(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "work" / "control" / "router.sock"
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    control=RouterControlConfig(enabled=True, socket_path=socket_path),
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            server_task = asyncio.create_task(router._run_control_server())
+            try:
+                for _ in range(50):
+                    if socket_path.exists():
+                        break
+                    await asyncio.sleep(0.01)
+                reader, writer = await asyncio.open_unix_connection(str(socket_path))
+                writer.write(
+                    b'{"command":"trigger_job","job_id":"daily-agenda","scheduled_at":1000}\n'
+                )
+                await writer.drain()
+                response = json.loads((await reader.readline()).decode("utf-8"))
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                server_task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await server_task
+
+            self.assertEqual(response["status"], "delivered")
+            self.assertEqual(signal.sends, [("group", "reply")])
+            self.assertFalse(socket_path.exists())
+
+    async def test_turn_prompt_block_guards_reject_malformed_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            with self.assertRaisesRegex(ValueError, "Signal turn requires event"):
+                router._build_turn_prompt_blocks(
+                    router._signal_turn_input(route, make_event()).__class__(
+                        route=route,
+                        origin=TurnOrigin.SIGNAL,
+                        dedupe_sender_id="sender",
+                        dedupe_timestamp=1,
+                        session=router._signal_turn_input(route, make_event()).session,
+                    ),
+                    [],
+                )
+            with self.assertRaisesRegex(ValueError, "scheduled turn requires job"):
+                router._build_turn_prompt_blocks(
+                    router._signal_turn_input(route, make_event()).__class__(
+                        route=route,
+                        origin=TurnOrigin.SCHEDULED_JOB,
+                        dedupe_sender_id="scheduled:job",
+                        dedupe_timestamp=1,
+                        session=router._signal_turn_input(route, make_event()).session,
+                    ),
+                    [],
+                )
+
+    async def test_route_lock_helper_covers_waiting_and_timeout_paths(self) -> None:
+        lock = asyncio.Lock()
+        self.assertTrue(await SignalHermesRouter._acquire_route_lock(lock, None))
+        lock.release()
+
+        await lock.acquire()
+        try:
+            self.assertFalse(await SignalHermesRouter._acquire_route_lock(lock, 0.001))
+        finally:
+            lock.release()
 
     async def test_number_only_direct_event_routes_with_canonical_route_sender_identity(
         self,
@@ -1161,7 +2047,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             route = router.config.routes[0]
 
             with self.assertLogs("signal_hermes_router.router", level="ERROR"):
-                await router._send_once(route, "reply")
+                self.assertFalse(await router._send_once(route, "reply"))
             await router._typing(route, True)
 
     async def test_typing_is_optional_and_long_running_notice_skips_when_done(self) -> None:

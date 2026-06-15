@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import logging
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from unittest.mock import AsyncMock
 
 from signal_hermes_router import cli as cli_module
 from signal_hermes_router import sessions as sessions_module
 from signal_hermes_router.config import AppConfig, Route, RouterConfig
-from signal_hermes_router.models import RouteState, SessionPolicy
+from signal_hermes_router.models import RouteState, SessionKeyInput, SessionPolicy
 from signal_hermes_router.permissions import StaticPermissionPolicy
 from signal_hermes_router.sessions import ProfileSupervisor, RoutedSession, SessionRegistry
 from tests.support import make_event, make_route
@@ -34,6 +37,14 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
             )
 
         basic_config.assert_called_once_with(level=logging.DEBUG)
+        coroutine = run.call_args.args[0]
+        self.assertTrue(asyncio.iscoroutine(coroutine))
+        coroutine.close()
+
+    def test_main_accepts_explicit_serve_alias(self) -> None:
+        with patch.object(cli_module.asyncio, "run") as run:
+            cli_module.main(["--log-level", "warning", "serve"])
+
         coroutine = run.call_args.args[0]
         self.assertTrue(asyncio.iscoroutine(coroutine))
         coroutine.close()
@@ -86,6 +97,249 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("routes={'active': 1, 'shadow': 1}", output)
             self.assertNotIn("signal.test", output)
             self.assertNotIn(str(Path(tmp) / "work"), output)
+
+    def test_parse_scheduled_at_accepts_epoch_ms_and_aware_iso(self) -> None:
+        self.assertEqual(cli_module.parse_scheduled_at("1714521600000"), 1714521600000)
+        self.assertEqual(
+            cli_module.parse_scheduled_at("2024-05-01T00:00:00+00:00"),
+            1714521600000,
+        )
+        self.assertEqual(cli_module.parse_scheduled_at("2024-05-01T00:00:00Z"), 1714521600000)
+
+        with self.assertRaisesRegex(ValueError, "timezone"):
+            cli_module.parse_scheduled_at("2024-05-01T00:00:00")
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            cli_module.parse_scheduled_at("-1")
+
+    async def test_main_async_dispatches_trigger_job_and_rejects_unknown_command(self) -> None:
+        args = argparse.Namespace(command="trigger-job")
+        with patch.object(cli_module, "_trigger_job", AsyncMock(return_value=0)) as trigger:
+            self.assertEqual(await cli_module._main_async(args), 0)
+        trigger.assert_awaited_once_with(args)
+
+        with self.assertRaisesRegex(ValueError, "unknown command"):
+            await cli_module._main_async(argparse.Namespace(command="unknown"))
+
+    def test_main_raises_for_nonzero_async_exit(self) -> None:
+        with patch.object(cli_module.asyncio, "run", return_value=1) as run:
+            with self.assertRaises(SystemExit) as raised:
+                cli_module.main(["trigger-job", "daily-agenda"])
+
+        coroutine = run.call_args.args[0]
+        self.assertTrue(asyncio.iscoroutine(coroutine))
+        coroutine.close()
+        self.assertEqual(raised.exception.code, 1)
+
+    async def test_trigger_job_via_control_socket_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "control.sock"
+            requests: list[dict] = []
+
+            async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                requests.append(json.loads((await reader.readline()).decode("utf-8")))
+                writer.write(b'{"status":"delivered"}\n')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_unix_server(handle, path=str(socket_path))
+            async with server:
+                response = await cli_module.trigger_job_via_control_socket(
+                    socket_path,
+                    "daily-agenda",
+                    scheduled_at=1714521600000,
+                    idempotency_key="stable-fire",
+                    timeout=1.5,
+                    client_timeout=1.5,
+                )
+                server.close()
+                await server.wait_closed()
+
+            self.assertEqual(response, {"status": "delivered"})
+            self.assertEqual(
+                requests,
+                [
+                    {
+                        "command": "trigger_job",
+                        "job_id": "daily-agenda",
+                        "scheduled_at": 1714521600000,
+                        "idempotency_key": "stable-fire",
+                        "timeout": 1.5,
+                    }
+                ],
+            )
+
+    async def test_trigger_job_via_control_socket_rejects_bad_responses(self) -> None:
+        async def run_server(body: bytes) -> Path:
+            socket_path = Path(tempfile.mkdtemp()) / "control.sock"
+
+            async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                await reader.readline()
+                if body:
+                    writer.write(body)
+                    await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_unix_server(handle, path=str(socket_path))
+            servers.append(server)
+            return socket_path
+
+        servers: list[asyncio.Server] = []
+        try:
+            empty_socket = await run_server(b"")
+            with self.assertRaisesRegex(RuntimeError, "closed without a response"):
+                await cli_module.trigger_job_via_control_socket(empty_socket, "daily-agenda")
+
+            list_socket = await run_server(b'["not-an-object"]\n')
+            with self.assertRaisesRegex(RuntimeError, "non-object"):
+                await cli_module.trigger_job_via_control_socket(list_socket, "daily-agenda")
+        finally:
+            for server in servers:
+                server.close()
+                await server.wait_closed()
+
+    async def test_trigger_job_via_control_socket_times_out_waiting_for_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "control.sock"
+            release = asyncio.Event()
+
+            async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                await reader.readline()
+                await release.wait()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_unix_server(handle, path=str(socket_path))
+            try:
+                async with server:
+                    with self.assertRaises(asyncio.TimeoutError):
+                        await cli_module.trigger_job_via_control_socket(
+                            socket_path,
+                            "daily-agenda",
+                            client_timeout=0.001,
+                        )
+                    release.set()
+                    server.close()
+                    await server.wait_closed()
+            finally:
+                release.set()
+
+    async def test_trigger_job_uses_control_socket_and_exit_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            config.write_text(
+                """
+router:
+  control:
+    socket_path: private/control.sock
+""",
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                config=config,
+                control_socket=None,
+                job_id="daily-agenda",
+                scheduled_at="2024-05-01T00:00:00Z",
+                idempotency_key="stable-fire",
+                timeout=1.5,
+                client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+            )
+
+            with (
+                patch.object(
+                    cli_module,
+                    "trigger_job_via_control_socket",
+                    AsyncMock(return_value={"status": "busy"}),
+                ) as trigger,
+                patch("builtins.print") as printed,
+            ):
+                code = await cli_module._trigger_job(args)
+
+            self.assertEqual(code, 0)
+            trigger.assert_awaited_once_with(
+                Path("private/control.sock"),
+                "daily-agenda",
+                scheduled_at=1714521600000,
+                idempotency_key="stable-fire",
+                timeout=1.5,
+                client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+            )
+            self.assertIn('"status": "busy"', printed.call_args.args[0])
+
+            with (
+                patch.object(
+                    cli_module,
+                    "trigger_job_via_control_socket",
+                    AsyncMock(return_value={"status": "error", "error": "unknown_job"}),
+                ),
+                patch("builtins.print"),
+            ):
+                self.assertEqual(await cli_module._trigger_job(args), 1)
+
+    async def test_trigger_job_expands_configured_control_socket_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            config.write_text(
+                """
+router:
+  control:
+    socket_path: ~/private/control.sock
+""",
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                config=config,
+                control_socket=None,
+                job_id="daily-agenda",
+                scheduled_at=None,
+                idempotency_key=None,
+                timeout=None,
+                client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+            )
+
+            with (
+                patch.object(
+                    cli_module,
+                    "trigger_job_via_control_socket",
+                    AsyncMock(return_value={"status": "deduped"}),
+                ) as trigger,
+                patch("builtins.print"),
+            ):
+                self.assertEqual(await cli_module._trigger_job(args), 0)
+
+            trigger.assert_awaited_once_with(
+                Path("~/private/control.sock").expanduser(),
+                "daily-agenda",
+                scheduled_at=None,
+                idempotency_key=None,
+                timeout=None,
+                client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+            )
+
+    async def test_trigger_job_socket_failure_returns_nonzero_without_router_fallback(self) -> None:
+        args = argparse.Namespace(
+            config=Path("config.yaml"),
+            control_socket=Path("/tmp/missing-router.sock"),
+            job_id="daily-agenda",
+            scheduled_at=None,
+            idempotency_key=None,
+            timeout=None,
+        )
+
+        with (
+            patch.object(cli_module, "SignalHermesRouter") as router_class,
+            patch.object(cli_module.logging, "error"),
+            patch.object(
+                cli_module,
+                "trigger_job_via_control_socket",
+                AsyncMock(side_effect=FileNotFoundError),
+            ),
+        ):
+            code = await cli_module._trigger_job(args)
+
+        self.assertEqual(code, 1)
+        router_class.assert_not_called()
 
 
 class FakeManagedProfile:
@@ -242,6 +496,23 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [policy[0] for policy in profile.policies], ["session-1"] * 2 + ["session-2"]
             )
+
+    async def test_registry_accepts_explicit_session_key_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = RegistryProfile()
+            registry = SessionRegistry(
+                Path(tmp),
+                supervisor=MutableSupervisor(profile),  # type: ignore[arg-type]
+            )
+            route = make_route(session_policy=SessionPolicy.PERSISTENT_SENDER)
+
+            first = await registry.get(route, SessionKeyInput("scheduled:daily", 1))
+            first_again = await registry.get(route, SessionKeyInput("scheduled:daily", 2))
+            second = await registry.get(route, SessionKeyInput("scheduled:weekly", 2))
+
+            self.assertIs(first, first_again)
+            self.assertIsNot(first, second)
+            self.assertEqual(profile.new_sessions, 2)
 
     async def test_stale_cached_session_is_resumed_on_restarted_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

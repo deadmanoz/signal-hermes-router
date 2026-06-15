@@ -36,23 +36,27 @@ The router writes private state under a handful of paths. All defaults are
 relative to the working directory of the running process; in production
 deployments these are typically absolute paths under the service's private
 data root. The router-managed roots (`media_root` and `work_root`) are
-created with `0700` permissions, and files written beneath them — including
-the dedupe sqlite DB at `state_db` — are written with `0600` (see
+created with `0700` permissions, and files written beneath them - including
+the dedupe sqlite DB at `state_db` - are written with `0600` (see
 `signal_hermes_router.private_fs`). `signal_attachment_root` is read-only
 from the router's perspective and is not created or chmodded by the router.
 
-- `router.state_db` (default `./private/state/router.db`) — sqlite database
+- `router.state_db` (default `./private/state/router.db`) - sqlite database
   used by the dedupe layer (`signal_hermes_router.dedupe`) to record
   route-scoped event claims. The file itself is `0600`; its parent directory
   is created `0700`.
-- `router.media_root` (default `./private/media`) — root for attachments and
+- `router.media_root` (default `./private/media`) - root for attachments and
   their sidecar manifests written by `signal_hermes_router.media`. See
   [media handling](media.md) for the on-disk layout.
-- `router.work_root` (default `./private/work`) — root for per-profile working
+- `router.work_root` (default `./private/work`) - root for per-profile working
   state used by the ACP subprocess supervisor
   (`signal_hermes_router.sessions`).
+- `router.control.socket_path` (default `router.work_root / "control.sock"`
+  when control is enabled and no explicit path is set) - local Unix socket
+  used by `signal-hermes-router trigger-job` to ask the running router to
+  inject a configured scheduled synthetic turn.
 - `router.signal_attachment_root` (default
-  `~/.local/share/signal-cli/attachments`) — read-only path used to resolve
+  `~/.local/share/signal-cli/attachments`) - read-only path used to resolve
   signal-cli events that reference an attachment by ID instead of carrying
   inline bytes. The value is `expanduser`-ed at config load time. The router
   does not create or change permissions on this directory.
@@ -61,10 +65,10 @@ from the router's perspective and is not created or chmodded by the router.
 
 String values in YAML are passed through `signal_hermes_router.secrets.resolve_secret_refs`. Supported URI schemes:
 
-- `file:///absolute/path` — read the file contents
-- `env://VARIABLE_NAME` — read the named environment variable
-- `op://...` — run `op read`; the 1Password CLI must be installed and authenticated
-- `systemd-credential://credential-name` — read a single credential basename from `$CREDENTIALS_DIRECTORY`
+- `file:///absolute/path` - read the file contents
+- `env://VARIABLE_NAME` - read the named environment variable
+- `op://...` - run `op read`; the 1Password CLI must be installed and authenticated
+- `systemd-credential://credential-name` - read a single credential basename from `$CREDENTIALS_DIRECTORY`
 
 `systemd-credential://` names must be basenames. Path separators and dot
 segments are rejected so a credential URI cannot escape the systemd credential
@@ -74,10 +78,10 @@ directory.
 
 Defined in `signal_hermes_router.models.RouteState`:
 
-- `shadow` — store media and log redacted route decisions only; do not call Hermes, do not reply
-- `active` — call Hermes and reply to Signal
-- `maintenance` — store minimal event information and send one bounded maintenance reply
-- `disabled` — redacted audit only; nothing else
+- `shadow` - store media and log redacted route decisions only; do not call Hermes, do not reply
+- `active` - call Hermes and reply to Signal
+- `maintenance` - store minimal event information and send one bounded maintenance reply
+- `disabled` - redacted audit only; nothing else
 
 A route's state is read at config load time. A circuit-breaker trip can override a route to `maintenance` at runtime (`signal_hermes_router.circuit`).
 
@@ -85,9 +89,9 @@ A route's state is read at config load time. A circuit-breaker trip can override
 
 Defined in `signal_hermes_router.models.SessionPolicy`:
 
-- `persistent_route` — one ACP session per route, shared across senders and turns
-- `persistent_sender` — one ACP session per `(route, sender)` pair
-- `ephemeral` — a fresh ACP session per turn
+- `persistent_route` - one ACP session per route, shared across senders and turns
+- `persistent_sender` - one ACP session per `(route, sender)` pair
+- `ephemeral` - a fresh ACP session per turn
 
 Sessions are replaced when the underlying Hermes subprocess restarts. If the Hermes profile advertises `sessionCapabilities.resume`, the router will call `session/resume` rather than creating a new session.
 
@@ -96,44 +100,128 @@ Sessions are replaced when the underlying Hermes subprocess restarts. If the Her
 Each entry in `routes.yaml` is parsed by `signal_hermes_router.config.parse_route`.
 Required keys are listed first; optional keys carry their defaults.
 
-- `platform` (required) — transport identifier; currently only `"signal"` is
+- `platform` (required) - transport identifier; currently only `"signal"` is
   used in production.
-- `profile` (required) — Hermes profile name. Must match
+- `profile` (required) - Hermes profile name. Must match
   `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` and must not contain path separators; the
   router supervises one `hermes -p <profile> acp` subprocess per profile.
-- `chat_type` (optional, default `group`) — route target type. `group` routes
+- `chat_type` (optional, default `group`) - route target type. `group` routes
   target Signal groups. `direct` routes target one exact Signal sender identity.
-- `group_id` (required for `group`, forbidden for `direct`) — opaque
+- `group_id` (required for `group`, forbidden for `direct`) - opaque
   per-platform group identifier. For Signal, this is the base64 group-v2 ID
   emitted by `signal-cli`.
-- `sender_id` (required for `direct`, ignored for `group`) — exact direct
+- `sender_id` (required for `direct`, ignored for `group`) - exact direct
   sender identity. Use the Signal `sourceUuid` value and load it from private
   config through a secret resolver such as `env://SIGNAL_DIRECT_SENDER_UUID`.
-- `sender_number` (optional for `direct`, ignored for `group`) — secondary
+- `sender_number` (optional for `direct`, ignored for `group`) - secondary
   exact sender number used only when an inbound direct event lacks
   `sourceUuid`. If `sourceUuid` is present and does not match `sender_id`, the
   router discards the event even when `sender_number` matches.
-- `session_policy` (optional, default `persistent_route`) — one of the
+- `session_policy` (optional, default `persistent_route`) - one of the
   [session policy](#session-policies) values.
-- `state` (optional, default `shadow`) — one of the [route state](#route-states)
+- `state` (optional, default `shadow`) - one of the [route state](#route-states)
   values.
-- `route_context` (optional, default `{}`) — JSON-serialisable mapping of
+- `name` (optional) - stable private selector used by `scheduled_jobs`.
+  Must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` and be unique when present.
+  Do not use `friendly_name` for scheduler selection.
+- `route_context` (optional, default `{}`) - JSON-serialisable mapping of
   private route metadata. Only the code-controlled prompt-safe keys are sent
   to Hermes; the rest stay in `routes.yaml`. See [route context](route-context.md).
-- `permissions` (optional, default `[]`) — static ACP permission allowlist
+- `permissions` (optional, default `[]`) - static ACP permission allowlist
   for this route. Denylists are rejected at parse time. See [permissions](permissions.md)
   for the predicate shape.
-- `friendly_name` (optional) — private operator-facing label. Never sent over
+- `friendly_name` (optional) - private operator-facing label. Never sent over
   ACP; only used in redacted logs.
-- `maintenance_reply` (optional) — per-route override for
+- `maintenance_reply` (optional) - per-route override for
   `router.maintenance_reply` (see [Operational reply strings](#operational-reply-strings)).
-- `failure_reply` (optional) — per-route override for `router.failure_reply`.
+- `failure_reply` (optional) - per-route override for `router.failure_reply`.
 
 For group routes, `(platform, group_id)` must be unique across the routes list.
 For direct routes, `(platform, sender_id)` must be unique, and any configured
 `sender_number` must not be reused by another direct route. Direct routes do not
 provide a default DM route or wildcard sender; wildcard-like identities such as
 `*` are rejected at config load.
+
+## Scheduled synthetic route jobs
+
+`scheduled_jobs` is a top-level list in `routes.yaml`. A job is trusted
+deployment config for a local scheduler; it is not a Signal event and it does
+not contain raw Signal group IDs. Each job targets a route by the route's
+stable `name`.
+
+```yaml
+routes:
+  - platform: "signal"
+    name: "agenda-route"
+    group_id: "SIGNAL_GROUP_ID_BASE64_EXAMPLE"
+    profile: "example-hermes-profile"
+    state: "active"
+
+scheduled_jobs:
+  - id: "daily-agenda"
+    route: "agenda-route"
+    prompt: "Prepare the synthetic daily agenda for this route."
+    description: "Optional operator note, not sent to Hermes."
+```
+
+Job keys:
+
+- `id` (required) - safe token used by `trigger-job` and host timers. Must
+  match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` and be unique.
+- `route` (required) - a configured route `name`.
+- `prompt` (required) - trusted scheduled prompt text from private deployment
+  config. Empty prompts are rejected.
+- `description` (optional) - operator note. It is not sent to Hermes.
+- `permissions` (optional) - static ACP permission allowlist for this one
+  scheduled turn. When omitted, the route's normal `permissions` apply.
+
+Scheduled turns use the selected route's state gate and session policy. A
+`persistent_route` scheduled turn shares the route session with later Signal
+messages; a `persistent_sender` scheduled turn is keyed to a synthetic sender
+for that job; an `ephemeral` scheduled turn gets a fresh session.
+
+## Router control socket
+
+`router.control` is disabled by default. When enabled, the running router
+serves a local Unix socket and accepts one JSON-lines command, `trigger_job`.
+The CLI uses that socket; it does not send Signal, start Hermes, or call ACP on
+its own.
+
+```yaml
+router:
+  work_root: "./private/work"
+  control:
+    enabled: true
+    # Optional. Defaults to ./private/work/control.sock for this work_root.
+    socket_path: "./private/work/control.sock"
+    # 0 means acquire-or-return-busy immediately.
+    route_lock_timeout_seconds: 0
+```
+
+The socket path must be under `router.work_root`. The socket parent is created
+with `0700` permissions and the socket is chmodded to `0600` where the platform
+supports it. Startup refuses a path outside `router.work_root`, a non-socket
+file at the configured path, or a live socket already accepting connections
+there. A stale socket is removed only after the router proves no listener is
+accepting connections there.
+
+Use `trigger-job` from a host scheduler:
+
+```bash
+signal-hermes-router --config /path/to/private/config.yaml trigger-job daily-agenda --scheduled-at 1714521600000 --idempotency-key daily-agenda-1714521600000
+```
+
+`--scheduled-at` accepts either an epoch millisecond integer or a timezone-aware
+ISO 8601 timestamp. Naive datetimes are rejected. `--idempotency-key` is hashed
+before it is used in the dedupe identity. Reusing the same `--scheduled-at` or
+the same idempotency key dedupes repeated timer attempts for the same job fire.
+`--client-timeout` bounds the local control socket round trip and defaults to
+300 seconds.
+
+CLI exit status is zero for `delivered`, `deduped`, `busy`, and expected
+`skipped` outcomes such as shadow or disabled routes. It is non-zero for an
+unavailable socket, malformed request or response, unknown job, config parse
+error, or router-reported `error`.
 
 ## Runtime size limits
 
@@ -164,14 +252,14 @@ are truncated and marked before they are sent; this is an operational
 spam/resource guardrail, not a Signal protocol limit.
 
 `router.max_signal_message_bytes` bounds each individual Signal message
-dispatched by the router, measured in UTF-8 bytes (not characters — non-ASCII
+dispatched by the router, measured in UTF-8 bytes (not characters - non-ASCII
 text like emoji or CJK can produce more bytes than characters). Replies
 longer than this are split into multiple sequential messages prefixed with
 `[N/M] ` ordering markers; single-chunk replies are sent without a marker.
 The default is `1900` bytes, chosen to sit safely below Signal-Desktop's
 2048-byte long-attachment threshold (the marker itself consumes part of each
 chunk's budget). Values below `16` are rejected at config load; values above
-`2000` are accepted with a warning — Signal-Android may silently truncate the
+`2000` are accepted with a warning - Signal-Android may silently truncate the
 body and Signal-Desktop may convert it to an attachment. At pathologically
 tight settings (a budget close to the 16-byte floor combined with very long
 multibyte input), the marker may not fit alongside even one codepoint of
@@ -198,11 +286,11 @@ The per-route circuit breaker (`signal_hermes_router.circuit`) tracks Hermes
 turn failures and parks repeatedly-failing routes in `maintenance` state
 until cooldown elapses.
 
-- `router.circuit_breaker.failures` (default `3`) — failures within
+- `router.circuit_breaker.failures` (default `3`) - failures within
   `window_seconds` required to trip the breaker.
-- `router.circuit_breaker.window_seconds` (default `300`) — sliding window
+- `router.circuit_breaker.window_seconds` (default `300`) - sliding window
   for the failure count. Failures older than this are discarded.
-- `router.circuit_breaker.recovery_seconds` (default `300`) — cooldown after
+- `router.circuit_breaker.recovery_seconds` (default `300`) - cooldown after
   a trip. When this much time has elapsed since the trip, the next event for
   the route clears the override and the route is evaluated in its configured
   state for one probe. A successful probe leaves the route running. A failed
@@ -222,13 +310,13 @@ notice). Each can be overridden per route in `routes.yaml` (`maintenance_reply`
 and `failure_reply` only); otherwise the router-level default applies.
 
 - `router.maintenance_reply` (default `"This route is temporarily under
-  maintenance."`) — sent on every event for a route in `maintenance` state,
+  maintenance."`) - sent on every event for a route in `maintenance` state,
   whether that state was configured directly or installed by the circuit
   breaker.
 - `router.failure_reply` (default `"I hit an internal router error handling
-  that message."`) — sent when a Hermes turn fails but the failure did not
+  that message."`) - sent when a Hermes turn fails but the failure did not
   trip the circuit breaker.
-- `router.busy_notice` (default `"Still working on this."`) — the one-shot
+- `router.busy_notice` (default `"Still working on this."`) - the one-shot
   notice fired at `busy_notice_after_seconds` if the turn has not completed.
 
 Per-route overrides in `routes.yaml`:
@@ -245,14 +333,14 @@ routes:
 
 All four operational replies (`maintenance_reply`, `failure_reply`,
 `busy_notice`, and assistant replies from Hermes) flow through the same
-canary prefix and chunking pipeline as ordinary assistant text — see
+canary prefix and chunking pipeline as ordinary assistant text - see
 [Runtime size limits](#runtime-size-limits) above.
 
 ## Inbound discard and observability
 
-The router discards unrouteable Signal events — non-group non-direct events,
+The router discards unrouteable Signal events - non-group non-direct events,
 unknown shapes, events for group IDs with no configured route, and direct
-messages from non-matching senders — without normalising message text, decoding
+messages from non-matching senders - without normalising message text, decoding
 attachments, writing media, taking dedupe claims, or calling ACP.
 Allowlisted direct `dataMessage` events are routed like group events, subject to
 the exact `sender_id` / `sender_number` matching rules above. Each discarded
