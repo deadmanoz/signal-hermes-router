@@ -24,6 +24,19 @@ class ChatType(StrEnum):
     DIRECT = "direct"
 
 
+class TurnOrigin(StrEnum):
+    SIGNAL = "signal"
+    SCHEDULED_JOB = "scheduled_job"
+
+
+class TurnOutcomeStatus(StrEnum):
+    DELIVERED = "delivered"
+    SKIPPED = "skipped"
+    DEDUPED = "deduped"
+    BUSY = "busy"
+    ERROR = "error"
+
+
 @dataclass(frozen=True)
 class SignalAttachment:
     content_type: str
@@ -101,3 +114,33 @@ class MediaManifest:
 class TurnResult:
     text: str
     stop_reason: str = "end_turn"
+
+
+@dataclass(frozen=True)
+class SessionKeyInput:
+    sender_id: str
+    timestamp: int
+
+
+@dataclass(frozen=True)
+class TurnOutcome:
+    status: TurnOutcomeStatus
+    route_state: RouteState | None = None
+    result: TurnResult | None = None
+    error: str | None = None
+    job_id: str | None = None
+    reply_sent: bool | None = None
+
+    def to_control_response(self) -> dict[str, Any]:
+        response: dict[str, Any] = {"status": self.status.value}
+        if self.route_state is not None:
+            response["route_state"] = self.route_state.value
+        if self.job_id is not None:
+            response["job_id"] = self.job_id
+        if self.result is not None:
+            response["stop_reason"] = self.result.stop_reason
+        if self.reply_sent is not None:
+            response["reply_sent"] = self.reply_sent
+        if self.error is not None:
+            response["error"] = self.error
+        return response

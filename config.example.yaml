@@ -19,3 +19,9 @@ router:
     failures: 3
     window_seconds: 300
     recovery_seconds: 300
+  control:
+    enabled: false
+    # Defaults to ./private/work/control.sock when enabled.
+    socket_path: "./private/work/control.sock"
+    # 0 means trigger-job returns busy immediately if the route is in flight.
+    route_lock_timeout_seconds: 0

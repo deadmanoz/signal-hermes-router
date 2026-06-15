@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from signal_hermes_router.acp import ACPProfile
-from signal_hermes_router.config import AppConfig, CircuitBreakerConfig, Route, RouterConfig
+from signal_hermes_router.config import (
+    AppConfig,
+    CircuitBreakerConfig,
+    Route,
+    RouterConfig,
+    SyntheticRouteJob,
+)
 from signal_hermes_router.dedupe import DedupeStore
 from signal_hermes_router.models import (
     ChatType,
@@ -49,6 +55,7 @@ def make_route(
     profile: str = "profile",
     session_policy: SessionPolicy = SessionPolicy.PERSISTENT_ROUTE,
     state: RouteState = RouteState.ACTIVE,
+    name: str | None = None,
     route_context: dict[str, Any] | None = None,
     permission_policy: StaticPermissionPolicy | None = None,
     friendly_name: str | None = None,
@@ -57,6 +64,7 @@ def make_route(
 ) -> Route:
     return Route(
         platform=platform,
+        name=name,
         chat_type=chat_type,
         group_id=None if chat_type == ChatType.DIRECT and group_id == "group" else group_id,
         sender_id=sender_id,
@@ -120,6 +128,7 @@ def make_app(
     failures: int = 3,
     route_context: dict[str, Any] | None = None,
     routes: tuple[Route, ...] | None = None,
+    scheduled_jobs: tuple[SyntheticRouteJob, ...] = (),
     **router_overrides: Any,
 ) -> AppConfig:
     route = make_route(
@@ -133,6 +142,7 @@ def make_app(
     return AppConfig(
         router=router_config_for_tmp(tmp, **router_overrides),
         routes=routes or (route,),
+        scheduled_jobs=scheduled_jobs,
     )
 
 
@@ -176,6 +186,7 @@ class FakeProfile:
         self.fail = False
         self.reply_text = "reply"
         self.prompt_delay = 0.0
+        self.policies: list[tuple[str, StaticPermissionPolicy]] = []
 
     async def new_session(self, cwd: Path) -> str:
         cwd.mkdir(parents=True, exist_ok=True)
@@ -188,6 +199,7 @@ class FakeProfile:
         return self.resume_available
 
     def set_permission_policy(self, session_id: str, policy: StaticPermissionPolicy) -> None:
+        self.policies.append((session_id, policy))
         return None
 
     def release_session(self, session_id: str) -> None:

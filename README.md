@@ -6,18 +6,21 @@ It exists because the built-in Hermes Signal gateway is profile-scoped. Hermes c
 
 The router sits upstream of Hermes and dispatches each group to its own profile, preserving the one-number, many-agents shape (the same arrangement OpenClaw provided via its own gateway) without modifying Hermes gateway internals.
 
-Hermes profiles own behaviour, skills, app access, and media interpretation. The router is the message-bus glue — nothing more.
+Hermes profiles own behaviour, skills, app access, and media interpretation. The router is the message-bus glue - nothing more.
 
-```
-                                               ┌─→  hermes -p A acp
-signal-cli  ──events──→  signal-hermes-router ─┼─→  hermes -p B acp
-                ↑                              └─→  hermes -p C acp
-                └────────────── replies ────────────────┘
+```text
+signal-cli events  ------> signal-hermes-router -----> hermes -p A acp
+local scheduler    --+             |            \-----> hermes -p B acp
+  trigger-job        |             \------------------> hermes -p C acp
+  control.sock       |
+                     \-------- Signal replies --------> signal-cli
 ```
 
 This public tree is intentionally generic. Keep real Signal group IDs, phone numbers, hostnames, profile-private identifiers, route context, state DBs, secrets, and audit checklists in a private deployment repo.
 
-Media today flows inbound only — Signal attachments are normalised, stored on disk, and forwarded to Hermes as ACP content blocks, but replies back to Signal are text-only. A narrow router-owned outbound media contract (so a profile-side plugin — TTS audio, a generated image or chart, and so on — can hand the router a validated local attachment reference to deliver alongside the reply) is planned future work. Route delivery, chunking, retries, and audit logging will stay with the router; profiles won't call Signal directly.
+Media today flows inbound only - Signal attachments are normalised, stored on disk, and forwarded to Hermes as ACP content blocks, but replies back to Signal are text-only. A narrow router-owned outbound media contract (so a profile-side plugin - TTS audio, a generated image or chart, and so on - can hand the router a validated local attachment reference to deliver alongside the reply) is planned future work. Route delivery, chunking, retries, and audit logging will stay with the router; profiles won't call Signal directly.
+
+Scheduled synthetic route events let a trusted local scheduler trigger a configured route through the already-running router. The CLI sends a job ID to the router's local Unix control socket; the router then uses the same route state, session policy, permission allowlist, ACP supervision, Signal outbound chunking, retries, redaction, and audit behavior as an inbound Signal turn. The scheduler never sends Signal directly and never starts its own Hermes ACP session.
 
 ## Why a router
 
@@ -82,16 +85,29 @@ signal-cli -a "$SIGNAL_ACCOUNT" daemon --http 127.0.0.1:8080 --receive-mode=on-c
 signal-hermes-router --config /path/to/private/config.yaml --routes /path/to/private/routes.yaml
 ```
 
+The long-running command also accepts an explicit `serve` alias:
+
+```bash
+signal-hermes-router --config /path/to/private/config.yaml --routes /path/to/private/routes.yaml serve
+```
+
+If the private config enables `router.control` and the private routes file defines a scheduled job, a host timer can trigger it through the running router:
+
+```bash
+signal-hermes-router --config /path/to/private/config.yaml trigger-job daily-agenda --scheduled-at 1714521600000 --idempotency-key daily-agenda-1714521600000
+```
+
 ## Documentation
 
-- [docs/configuration.md](docs/configuration.md) — config schema, secret resolvers, route states, session policies
-- [docs/deployment.md](docs/deployment.md) — generic code sync procedure for private deployments
-- [docs/route-context.md](docs/route-context.md) — prompt-safe context keys, nonce delimiter, escaping
-- [docs/permissions.md](docs/permissions.md) — what the static ACP permission handler is (and isn't)
-- [docs/media.md](docs/media.md) — attachment storage layout, manifests, ACP content blocks
-- [docs/hermes-gateway-tradeoffs.md](docs/hermes-gateway-tradeoffs.md) — what you give up (and gain) versus the built-in Hermes Signal gateway
-- [docs/profile-audit-checklist.md](docs/profile-audit-checklist.md) — pre-activation checklist template (use a copy in the private deployment repo)
-- [docs/releasing.md](docs/releasing.md) — versioning policy and release procedure
+- [docs/configuration.md](docs/configuration.md) - config schema, secret resolvers, route states, session policies
+- [docs/deployment.md](docs/deployment.md) - generic code sync procedure for private deployments
+- [docs/route-context.md](docs/route-context.md) - prompt-safe context keys, nonce delimiter, escaping
+- [docs/permissions.md](docs/permissions.md) - what the static ACP permission handler is (and isn't)
+- [docs/media.md](docs/media.md) - attachment storage layout, manifests, ACP content blocks
+- [docs/scheduled-synthetic-events.md](docs/scheduled-synthetic-events.md) - router-owned scheduler triggers through the local control socket
+- [docs/hermes-gateway-tradeoffs.md](docs/hermes-gateway-tradeoffs.md) - what you give up (and gain) versus the built-in Hermes Signal gateway
+- [docs/profile-audit-checklist.md](docs/profile-audit-checklist.md) - pre-activation checklist template (use a copy in the private deployment repo)
+- [docs/releasing.md](docs/releasing.md) - versioning policy and release procedure
 
 ## Project metadata
 

@@ -9,10 +9,12 @@ from signal_hermes_router.config import (
     Route,
     RouterConfig,
     load_app_config,
+    load_router_config,
     normalize_profile_name,
     parse_route,
     parse_router_config,
     parse_routes,
+    parse_scheduled_jobs,
 )
 from signal_hermes_router.models import ChatType, NormalizedEvent, RouteState, SessionPolicy
 
@@ -49,6 +51,24 @@ routes:
             self.assertEqual(app.router.state_db, Path("./state/router.db"))
             self.assertEqual(app.router.max_attachment_bytes, 1234)
             self.assertEqual(app.routes[0].key, "signal:GROUP")
+
+    def test_load_router_config_reads_only_router_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            config.write_text(
+                """
+router:
+  work_root: ./private-work
+  control:
+    enabled: true
+""",
+                encoding="utf-8",
+            )
+
+            router = load_router_config(config)
+
+            self.assertTrue(router.control.enabled)
+            self.assertEqual(router.control_socket_path, Path("private-work") / "control.sock")
 
     def test_app_config_find_route_returns_none_for_missing_route(self) -> None:
         app = AppConfig(
@@ -121,6 +141,28 @@ routes:
         self.assertEqual(router.acp_prompt_timeout_seconds, 300.0)
         self.assertEqual(router.circuit_breaker.recovery_seconds, 300.0)
         self.assertEqual(router.max_signal_message_bytes, 1900)
+        self.assertFalse(router.control.enabled)
+        self.assertEqual(router.control_socket_path, Path("./private/work") / "control.sock")
+
+    def test_parse_router_config_reads_control_socket_settings(self) -> None:
+        router = parse_router_config(
+            {
+                "work_root": "work",
+                "control": {
+                    "enabled": "true",
+                    "socket_path": "work/control.sock",
+                    "route_lock_timeout_seconds": "2.5",
+                },
+            }
+        )
+
+        self.assertTrue(router.control.enabled)
+        self.assertEqual(router.control.socket_path, Path("work/control.sock"))
+        self.assertEqual(router.control_socket_path, Path("work/control.sock"))
+        self.assertEqual(router.control.route_lock_timeout_seconds, 2.5)
+
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            parse_router_config({"control": {"route_lock_timeout_seconds": -1}})
 
     def test_parse_router_config_warns_when_signal_message_bytes_above_threshold(self) -> None:
         with self.assertLogs("signal_hermes_router.config", level="WARNING") as logs:
@@ -228,6 +270,142 @@ router:
         }
         with self.assertRaisesRegex(ValueError, "duplicate route key"):
             parse_routes(raw)
+
+    def test_route_names_are_optional_and_unique_safe_tokens(self) -> None:
+        routes = parse_routes(
+            {
+                "routes": [
+                    {"platform": "signal", "group_id": "GROUP", "profile": "profile"},
+                    {
+                        "platform": "signal",
+                        "group_id": "OTHER",
+                        "profile": "profile",
+                        "name": "agenda-route_1",
+                    },
+                ]
+            }
+        )
+        self.assertIsNone(routes[0].name)
+        self.assertEqual(routes[1].name, "agenda-route_1")
+
+        with self.assertRaisesRegex(ValueError, "duplicate route name"):
+            parse_routes(
+                {
+                    "routes": [
+                        {
+                            "platform": "signal",
+                            "group_id": "GROUP",
+                            "profile": "profile",
+                            "name": "same",
+                        },
+                        {
+                            "platform": "signal",
+                            "group_id": "OTHER",
+                            "profile": "profile",
+                            "name": "same",
+                        },
+                    ]
+                }
+            )
+
+        with self.assertRaisesRegex(ValueError, "route name must match"):
+            parse_route(
+                {
+                    "platform": "signal",
+                    "group_id": "GROUP",
+                    "profile": "profile",
+                    "name": "../bad",
+                }
+            )
+
+    def test_scheduled_jobs_parse_against_named_routes(self) -> None:
+        routes = tuple(
+            parse_routes(
+                {
+                    "routes": [
+                        {
+                            "platform": "signal",
+                            "group_id": "GROUP",
+                            "profile": "profile",
+                            "name": "agenda-route",
+                        }
+                    ]
+                }
+            )
+        )
+
+        jobs = parse_scheduled_jobs(
+            {
+                "scheduled_jobs": [
+                    {
+                        "id": "daily-agenda",
+                        "route": "agenda-route",
+                        "prompt": "Prepare the daily agenda.",
+                        "description": "Synthetic example",
+                        "permissions": [
+                            {
+                                "tool": "read_file",
+                                "arguments": {"path": {"prefix": "/tmp/example"}},
+                            }
+                        ],
+                    }
+                ]
+            },
+            routes,
+        )
+
+        self.assertEqual(jobs[0].id, "daily-agenda")
+        self.assertEqual(jobs[0].route_name, "agenda-route")
+        self.assertIsNotNone(jobs[0].permission_policy)
+
+    def test_scheduled_jobs_reject_invalid_shapes(self) -> None:
+        routes = tuple(
+            parse_routes(
+                {
+                    "routes": [
+                        {
+                            "platform": "signal",
+                            "group_id": "GROUP",
+                            "profile": "profile",
+                            "name": "agenda-route",
+                        }
+                    ]
+                }
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "scheduled_jobs must be a list"):
+            parse_scheduled_jobs({"scheduled_jobs": {}}, routes)
+        with self.assertRaisesRegex(ValueError, "duplicate scheduled job id"):
+            parse_scheduled_jobs(
+                {
+                    "scheduled_jobs": [
+                        {"id": "daily", "route": "agenda-route", "prompt": "one"},
+                        {"id": "daily", "route": "agenda-route", "prompt": "two"},
+                    ]
+                },
+                routes,
+            )
+        with self.assertRaisesRegex(ValueError, "unknown route name"):
+            parse_scheduled_jobs(
+                {"scheduled_jobs": [{"id": "daily", "route": "missing", "prompt": "one"}]},
+                routes,
+            )
+        with self.assertRaisesRegex(ValueError, "prompt must not be empty"):
+            parse_scheduled_jobs(
+                {"scheduled_jobs": [{"id": "daily", "route": "agenda-route", "prompt": "  "}]},
+                routes,
+            )
+        with self.assertRaisesRegex(ValueError, "prompt must be a string"):
+            parse_scheduled_jobs(
+                {"scheduled_jobs": [{"id": "daily", "route": "agenda-route", "prompt": None}]},
+                routes,
+            )
+        with self.assertRaisesRegex(ValueError, "prompt must be a string"):
+            parse_scheduled_jobs(
+                {"scheduled_jobs": [{"id": "daily", "route": "agenda-route", "prompt": []}]},
+                routes,
+            )
 
     def test_parse_direct_route_requires_sender_identity(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires sender_id"):

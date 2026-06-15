@@ -9,7 +9,8 @@ from pathlib import Path
 
 from .acp import ACPProfile, DEFAULT_ACP_PROMPT_TIMEOUT_SECONDS, DEFAULT_MAX_ACP_LINE_BYTES
 from .config import Route
-from .models import ChatType, NormalizedEvent, SessionPolicy
+from .models import ChatType, NormalizedEvent, SessionKeyInput, SessionPolicy
+from .permissions import StaticPermissionPolicy
 
 LOGGER = logging.getLogger(__name__)
 
@@ -98,19 +99,26 @@ class SessionRegistry:
         self.supervisor = supervisor
         self._sessions: dict[str, RoutedSession] = {}
 
-    async def get(self, route: Route, event: NormalizedEvent) -> RoutedSession:
+    async def get(
+        self,
+        route: Route,
+        session_ref: NormalizedEvent | SessionKeyInput,
+        *,
+        permission_policy: StaticPermissionPolicy | None = None,
+    ) -> RoutedSession:
         profile = await self.supervisor.get_profile(route)
-        session_key = self._session_key(route, event)
+        session_key = self._session_key(route, session_ref)
+        policy = permission_policy or route.permission_policy
         existing = self._sessions.get(session_key)
         if existing:
             if existing.profile is not profile:
-                existing = await self._resume_or_recreate(route, profile, existing)
+                existing = await self._resume_or_recreate(route, profile, existing, policy)
                 self._sessions[session_key] = existing
-            profile.set_permission_policy(existing.session_id, route.permission_policy)
+            profile.set_permission_policy(existing.session_id, policy)
             return existing
         cwd = self._cwd(route.profile, session_key)
         session_id = await profile.new_session(cwd)
-        profile.set_permission_policy(session_id, route.permission_policy)
+        profile.set_permission_policy(session_id, policy)
         ephemeral = route.session_policy == SessionPolicy.EPHEMERAL
         session = RoutedSession(
             profile=profile, session_id=session_id, cwd=cwd, ephemeral=ephemeral
@@ -122,13 +130,16 @@ class SessionRegistry:
     async def replace_after_restart(
         self,
         route: Route,
-        event: NormalizedEvent,
+        session_ref: NormalizedEvent | SessionKeyInput,
         previous: RoutedSession,
+        *,
+        permission_policy: StaticPermissionPolicy | None = None,
     ) -> RoutedSession:
         profile = await self.supervisor.get_profile(route)
-        replacement = await self._resume_or_recreate(route, profile, previous)
+        policy = permission_policy or route.permission_policy
+        replacement = await self._resume_or_recreate(route, profile, previous, policy)
         if route.session_policy != SessionPolicy.EPHEMERAL:
-            self._sessions[self._session_key(route, event)] = replacement
+            self._sessions[self._session_key(route, session_ref)] = replacement
         return replacement
 
     async def _resume_or_recreate(
@@ -136,6 +147,7 @@ class SessionRegistry:
         route: Route,
         profile: ACPProfile,
         previous: RoutedSession,
+        permission_policy: StaticPermissionPolicy,
     ) -> RoutedSession:
         if await profile.resume_session(previous.session_id, previous.cwd):
             session_id = previous.session_id
@@ -144,7 +156,7 @@ class SessionRegistry:
                 "Hermes profile does not advertise ACP session resume; creating a fresh session"
             )
             session_id = await profile.new_session(previous.cwd)
-        profile.set_permission_policy(session_id, route.permission_policy)
+        profile.set_permission_policy(session_id, permission_policy)
         return RoutedSession(
             profile=profile,
             session_id=session_id,
@@ -152,15 +164,16 @@ class SessionRegistry:
             ephemeral=previous.ephemeral,
         )
 
-    def _session_key(self, route: Route, event: NormalizedEvent) -> str:
+    def _session_key(self, route: Route, session_ref: NormalizedEvent | SessionKeyInput) -> str:
+        session_input = _session_key_input(route, session_ref)
         if route.session_policy == SessionPolicy.PERSISTENT_ROUTE:
             raw = route.key
         elif route.session_policy == SessionPolicy.PERSISTENT_SENDER:
-            raw = f"{route.key}:{_routed_sender_id(route, event)}"
+            raw = f"{route.key}:{session_input.sender_id}"
         else:
             raw = (
-                f"{route.key}:{_routed_sender_id(route, event)}:"
-                f"{event.timestamp}:{uuid.uuid4().hex}"
+                f"{route.key}:{session_input.sender_id}:"
+                f"{session_input.timestamp}:{uuid.uuid4().hex}"
             )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -180,3 +193,15 @@ def _routed_sender_id(route: Route, event: NormalizedEvent) -> str:
             raise ValueError("direct route requires sender_id")
         return route.sender_id
     return event.sender_id
+
+
+def _session_key_input(
+    route: Route,
+    session_ref: NormalizedEvent | SessionKeyInput,
+) -> SessionKeyInput:
+    if isinstance(session_ref, SessionKeyInput):
+        return session_ref
+    return SessionKeyInput(
+        sender_id=_routed_sender_id(route, session_ref),
+        timestamp=session_ref.timestamp,
+    )

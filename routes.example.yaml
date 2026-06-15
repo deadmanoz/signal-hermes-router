@@ -1,5 +1,6 @@
 routes:
   - platform: "signal"
+    name: "example-route"
     group_id: "SIGNAL_GROUP_ID_BASE64_EXAMPLE"
     friendly_name: "example-signal-group"
     profile: "example-hermes-profile"
@@ -17,6 +18,7 @@ routes:
   # Direct-message routes are opt-in and exact-sender only. Keep real sender
   # UUIDs/numbers in a private deployment repo and load them through secret refs.
   # - platform: "signal"
+  #   name: "synthetic-direct-route"
   #   chat_type: "direct"
   #   sender_id: "env://SIGNAL_DIRECT_SENDER_UUID"
   #   sender_number: "env://SIGNAL_DIRECT_SENDER_NUMBER"
@@ -28,3 +30,13 @@ routes:
   #     purpose: "Synthetic public direct-message example route."
   #     route_alias: "direct-example"
   #   permissions: []
+
+scheduled_jobs: []
+
+# Example scheduled job. Keep real prompts and route names in private config.
+# scheduled_jobs:
+#   - id: "daily-agenda"
+#     route: "example-route"
+#     prompt: "Prepare the synthetic daily agenda for this route."
+#     description: "Synthetic public scheduled-job example."
+#     permissions: []
