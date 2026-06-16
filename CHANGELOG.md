@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.5...v0.1.6) (2026-06-16)
+
+
+### Features
+
+* **router:** route external notifications through control socket ([#11](https://github.com/deadmanoz/signal-hermes-router/issues/11)) ([f405ce7](https://github.com/deadmanoz/signal-hermes-router/commit/f405ce7336014c5b598a1c475f73345756eeb332))
+
 ## [0.1.5](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.4...v0.1.5) (2026-06-15)
 
 
