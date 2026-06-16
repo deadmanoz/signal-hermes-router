@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import socket
 import stat
 import time
@@ -14,8 +15,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .circuit import CircuitBreaker
-from .config import AppConfig, Route, SyntheticRouteJob
-from .context import build_prompt_blocks, build_scheduled_prompt_blocks
+from .config import AppConfig, Route, SyntheticRouteDefinition
+from .context import build_prompt_blocks, build_synthetic_prompt_blocks
 from .dedupe import DedupeStore
 from .events import SignalEventSummary, parse_signal_event, probe_signal_route
 from .media import write_attachment
@@ -27,12 +28,19 @@ from .models import (
     SessionKeyInput,
     SessionPolicy,
     SignalAttachment,
+    SyntheticTurnKind,
     TurnOrigin,
     TurnOutcome,
     TurnOutcomeStatus,
     TurnResult,
 )
 from .outbound import chunk_for_signal_bytes, prepare_outgoing_message
+from .payloads import (
+    CanonicalNotificationPayload,
+    NotificationPayloadError,
+    canonicalize_notification_payload,
+    encode_control_message,
+)
 from .permissions import StaticPermissionPolicy
 from .private_fs import ensure_private_dir, validate_path_component
 from .redaction import Redactor
@@ -42,6 +50,7 @@ from .signal import SignalHttpClient
 LOGGER = logging.getLogger(__name__)
 
 SYNTHETIC_DEDUPE_TIMESTAMP_SENTINEL = 0
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -53,8 +62,9 @@ class RoutedTurnInput:
     session: SessionKeyInput
     secondary_dedupe: tuple[str, int] | None = None
     signal_event: NormalizedEvent | None = None
-    scheduled_job: SyntheticRouteJob | None = None
-    scheduled_prompt: str | None = None
+    synthetic: SyntheticRouteDefinition | None = None
+    synthetic_prompt: str | None = None
+    synthetic_payload: CanonicalNotificationPayload | None = None
     scheduled_at_ms: int | None = None
     triggered_at_ms: int | None = None
     permission_policy: StaticPermissionPolicy | None = None
@@ -197,12 +207,68 @@ class SignalHermesRouter:
     ) -> TurnOutcome:
         job = self.config.find_synthetic_job(job_id)
         if job is None:
-            return TurnOutcome(TurnOutcomeStatus.ERROR, error="unknown_job", job_id=job_id)
-        route = self.config.find_route_by_name(job.route_name)
+            return TurnOutcome(
+                TurnOutcomeStatus.ERROR,
+                error="unknown_job",
+                synthetic_id=job_id,
+                synthetic_kind=SyntheticTurnKind.SCHEDULED_JOB,
+            )
+        return await self._handle_synthetic_definition(
+            job,
+            scheduled_at=scheduled_at,
+            idempotency_key=idempotency_key,
+            route_lock_timeout=route_lock_timeout,
+        )
+
+    async def handle_notification(
+        self,
+        notification_id: str,
+        payload: CanonicalNotificationPayload,
+        *,
+        idempotency_key: str | None = None,
+        route_lock_timeout: float | None = None,
+    ) -> TurnOutcome:
+        notification = self.config.find_notification(notification_id)
+        if notification is None:
+            return TurnOutcome(
+                TurnOutcomeStatus.ERROR,
+                error="unknown_notification",
+                synthetic_id=notification_id,
+                synthetic_kind=SyntheticTurnKind.NOTIFICATION,
+            )
+        return await self._handle_synthetic_definition(
+            notification,
+            scheduled_at=None,
+            idempotency_key=idempotency_key,
+            route_lock_timeout=route_lock_timeout,
+            payload=payload,
+        )
+
+    async def _handle_synthetic_definition(
+        self,
+        synthetic: SyntheticRouteDefinition,
+        *,
+        scheduled_at: int | None = None,
+        idempotency_key: str | None = None,
+        route_lock_timeout: float | None = None,
+        payload: CanonicalNotificationPayload | None = None,
+    ) -> TurnOutcome:
+        route = self.config.find_route_by_name(synthetic.route_name)
         if route is None:
-            return TurnOutcome(TurnOutcomeStatus.ERROR, error="unknown_route", job_id=job.id)
+            return TurnOutcome(
+                TurnOutcomeStatus.ERROR,
+                error="unknown_route",
+                synthetic_id=synthetic.id,
+                synthetic_kind=synthetic.kind,
+            )
         self.redactor.add(route.key, route.group_id, route.sender_id, route.sender_number)
-        turn = self._synthetic_turn_input(job, route, scheduled_at, idempotency_key)
+        turn = self._synthetic_turn_input(
+            synthetic,
+            route,
+            scheduled_at,
+            idempotency_key,
+            payload,
+        )
         timeout = (
             self.config.router.control.route_lock_timeout_seconds
             if route_lock_timeout is None
@@ -213,7 +279,8 @@ class SignalHermesRouter:
             return TurnOutcome(
                 TurnOutcomeStatus.BUSY,
                 route_state=self.route_state_overrides.get(route.key, route.state),
-                job_id=job.id,
+                synthetic_id=synthetic.id,
+                synthetic_kind=synthetic.kind,
             )
         try:
             profile_lock = self._profile_lock(route.profile)
@@ -222,7 +289,8 @@ class SignalHermesRouter:
                 return TurnOutcome(
                     TurnOutcomeStatus.BUSY,
                     route_state=self.route_state_overrides.get(route.key, route.state),
-                    job_id=job.id,
+                    synthetic_id=synthetic.id,
+                    synthetic_kind=synthetic.kind,
                 )
             try:
                 return await self._run_turn(turn)
@@ -246,7 +314,7 @@ class SignalHermesRouter:
                 return TurnOutcome(
                     TurnOutcomeStatus.DEDUPED,
                     route_state=self.route_state_overrides.get(route.key, route.state),
-                    job_id=turn.scheduled_job.id if turn.scheduled_job else None,
+                    **self._synthetic_outcome_fields(turn),
                 )
             claimed_dedupe.append((dedupe_sender_id, dedupe_timestamp))
 
@@ -260,7 +328,7 @@ class SignalHermesRouter:
                 return TurnOutcome(
                     TurnOutcomeStatus.SKIPPED,
                     route_state=state,
-                    job_id=turn.scheduled_job.id if turn.scheduled_job else None,
+                    **self._synthetic_outcome_fields(turn),
                 )
             if state == RouteState.MAINTENANCE:
                 sent = await self._send_once(
@@ -272,13 +340,13 @@ class SignalHermesRouter:
                         TurnOutcomeStatus.ERROR,
                         route_state=state,
                         error="signal_send_failed",
-                        job_id=turn.scheduled_job.id if turn.scheduled_job else None,
+                        **self._synthetic_outcome_fields(turn),
                     )
                 handled = True
                 return TurnOutcome(
                     TurnOutcomeStatus.DELIVERED,
                     route_state=state,
-                    job_id=turn.scheduled_job.id if turn.scheduled_job else None,
+                    **self._synthetic_outcome_fields(turn),
                 )
 
             manifests: list[MediaManifest] = []
@@ -289,7 +357,7 @@ class SignalHermesRouter:
                 return TurnOutcome(
                     TurnOutcomeStatus.SKIPPED,
                     route_state=state,
-                    job_id=turn.scheduled_job.id if turn.scheduled_job else None,
+                    **self._synthetic_outcome_fields(turn),
                 )
 
             blocks = self._build_turn_prompt_blocks(turn, manifests)
@@ -314,8 +382,8 @@ class SignalHermesRouter:
                         route_state=state,
                         result=result,
                         error="signal_send_failed",
-                        job_id=turn.scheduled_job.id if turn.scheduled_job else None,
                         reply_sent=False,
+                        **self._synthetic_outcome_fields(turn),
                     )
                 reply_sent = bool(result.text)
                 self.circuit.record_success(route.key)
@@ -324,8 +392,8 @@ class SignalHermesRouter:
                     TurnOutcomeStatus.DELIVERED,
                     route_state=state,
                     result=result,
-                    job_id=turn.scheduled_job.id if turn.scheduled_job else None,
                     reply_sent=reply_sent,
+                    **self._synthetic_outcome_fields(turn),
                 )
             except Exception as exc:
                 # Stop the busy-notice task BEFORE the failure reply / recovery,
@@ -379,17 +447,14 @@ class SignalHermesRouter:
                     TurnOutcomeStatus.ERROR,
                     route_state=state,
                     error=exc.__class__.__name__,
-                    job_id=turn.scheduled_job.id if turn.scheduled_job else None,
+                    **self._synthetic_outcome_fields(turn),
                 )
             finally:
                 # Defensive backup for cancellation paths that skip the
                 # try/except branches. Idempotent: no-op if already stopped.
                 await self._stop_busy_notice(turn_done, notice_task)
                 await self._typing(route, False)
-                if (
-                    turn.scheduled_job is not None
-                    and turn.scheduled_job.permission_policy is not None
-                ):
+                if turn.synthetic is not None and turn.synthetic.permission_policy is not None:
                     session.profile.set_permission_policy(
                         session.session_id, route.permission_policy
                     )
@@ -419,41 +484,43 @@ class SignalHermesRouter:
 
     def _synthetic_turn_input(
         self,
-        job: SyntheticRouteJob,
+        synthetic: SyntheticRouteDefinition,
         route: Route,
         scheduled_at: int | None,
         idempotency_key: str | None,
+        payload: CanonicalNotificationPayload | None = None,
     ) -> RoutedTurnInput:
         triggered_at_ms = self._clock_ms()
         dedupe_sender_id, dedupe_timestamp = self._synthetic_dedupe_identity(
-            job.id,
+            synthetic.namespace,
             scheduled_at=scheduled_at,
             idempotency_key=idempotency_key,
             triggered_at_ms=triggered_at_ms,
         )
         secondary_dedupe = None
         if idempotency_key and scheduled_at is not None:
-            secondary_dedupe = (f"scheduled:{job.id}", scheduled_at)
+            secondary_dedupe = (synthetic.namespace, scheduled_at)
         return RoutedTurnInput(
             route=route,
-            origin=TurnOrigin.SCHEDULED_JOB,
+            origin=_origin_for_synthetic_kind(synthetic.kind),
             dedupe_sender_id=dedupe_sender_id,
             dedupe_timestamp=dedupe_timestamp,
             secondary_dedupe=secondary_dedupe,
             session=SessionKeyInput(
-                sender_id=f"scheduled:{job.id}",
+                sender_id=synthetic.namespace,
                 timestamp=scheduled_at if scheduled_at is not None else triggered_at_ms,
             ),
-            scheduled_job=job,
-            scheduled_prompt=job.prompt,
+            synthetic=synthetic,
+            synthetic_prompt=synthetic.prompt,
+            synthetic_payload=payload,
             scheduled_at_ms=scheduled_at,
             triggered_at_ms=triggered_at_ms,
-            permission_policy=job.permission_policy or route.permission_policy,
+            permission_policy=synthetic.permission_policy or route.permission_policy,
         )
 
     def _synthetic_dedupe_identity(
         self,
-        job_id: str,
+        namespace: str,
         *,
         scheduled_at: int | None,
         idempotency_key: str | None,
@@ -462,12 +529,12 @@ class SignalHermesRouter:
         if idempotency_key:
             key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:16]
             return (
-                f"scheduled:{job_id}:key:{key_hash}",
+                f"{namespace}:key:{key_hash}",
                 SYNTHETIC_DEDUPE_TIMESTAMP_SENTINEL,
             )
         if scheduled_at is not None:
-            return f"scheduled:{job_id}", scheduled_at
-        return f"scheduled:{job_id}:manual:{self._nonce_factory()}", triggered_at_ms
+            return namespace, scheduled_at
+        return f"{namespace}:manual:{self._nonce_factory()}", triggered_at_ms
 
     def _build_turn_prompt_blocks(
         self,
@@ -482,18 +549,34 @@ class SignalHermesRouter:
                 user_text=turn.signal_event.text,
                 manifests=manifests,
             )
-        if turn.scheduled_job is None or turn.scheduled_prompt is None:
-            raise ValueError("scheduled turn requires job and prompt")
-        return build_scheduled_prompt_blocks(
+        if turn.synthetic is None or turn.synthetic_prompt is None:
+            raise ValueError("synthetic turn requires definition and prompt")
+        metadata: dict[str, Any] = {
+            "id": turn.synthetic.id,
+            "kind": turn.synthetic.kind.value,
+            "origin": turn.origin.value,
+            "scheduled_at_ms": turn.scheduled_at_ms,
+            "triggered_at_ms": turn.triggered_at_ms,
+        }
+        if turn.synthetic.kind == SyntheticTurnKind.SCHEDULED_JOB:
+            metadata["job_id"] = turn.synthetic.id
+        if turn.synthetic_payload is not None:
+            metadata["payload_bytes"] = turn.synthetic_payload.byte_length
+            metadata["payload_sha256"] = turn.synthetic_payload.sha256
+        return build_synthetic_prompt_blocks(
             route_context=turn.route.route_context,
-            scheduled_metadata={
-                "origin": TurnOrigin.SCHEDULED_JOB.value,
-                "job_id": turn.scheduled_job.id,
-                "scheduled_at_ms": turn.scheduled_at_ms,
-                "triggered_at_ms": turn.triggered_at_ms,
-            },
-            scheduled_prompt=turn.scheduled_prompt,
+            synthetic_metadata=metadata,
+            synthetic_prompt=turn.synthetic_prompt,
+            payload_json=turn.synthetic_payload.text
+            if turn.synthetic_payload is not None
+            else None,
         )
+
+    @staticmethod
+    def _synthetic_outcome_fields(turn: RoutedTurnInput) -> dict[str, Any]:
+        if turn.synthetic is None:
+            return {}
+        return {"synthetic_id": turn.synthetic.id, "synthetic_kind": turn.synthetic.kind}
 
     def _route_lock(self, route: Route) -> asyncio.Lock:
         lock = self._route_locks.get(route.key)
@@ -616,7 +699,11 @@ class SignalHermesRouter:
     async def _run_control_server(self) -> None:
         path = self.config.router.control_socket_path.expanduser()
         self._prepare_control_socket(path)
-        server = await asyncio.start_unix_server(self._handle_control_client, path=str(path))
+        server = await asyncio.start_unix_server(
+            self._handle_control_client,
+            path=str(path),
+            limit=self.config.router.control_request_line_limit_bytes,
+        )
         self._control_server = server
         self._control_socket_path = path
         try:
@@ -654,9 +741,24 @@ class SignalHermesRouter:
         writer: asyncio.StreamWriter,
     ) -> None:
         try:
-            while line := await reader.readline():
+            while True:
+                try:
+                    line = await reader.readline()
+                except ValueError:
+                    writer.write(
+                        encode_control_message(
+                            {
+                                "status": TurnOutcomeStatus.ERROR.value,
+                                "error": "request_too_large",
+                            }
+                        )
+                    )
+                    await writer.drain()
+                    break
+                if not line:
+                    break
                 response = await self._handle_control_line(line)
-                writer.write(json.dumps(response, sort_keys=True).encode("utf-8") + b"\n")
+                writer.write(encode_control_message(response))
                 await writer.drain()
         finally:
             writer.close()
@@ -670,36 +772,26 @@ class SignalHermesRouter:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": "malformed_json"}
         if not isinstance(payload, dict):
             return {"status": TurnOutcomeStatus.ERROR.value, "error": "malformed_request"}
-        if payload.get("command") != "trigger_job":
-            return {"status": TurnOutcomeStatus.ERROR.value, "error": "unknown_command"}
+        command = payload.get("command")
+        if command == "trigger_job":
+            return await self._handle_trigger_job_control(payload)
+        if command == "notify_route":
+            return await self._handle_notify_route_control(payload)
+        return {"status": TurnOutcomeStatus.ERROR.value, "error": "unknown_command"}
+
+    async def _handle_trigger_job_control(self, payload: dict[str, Any]) -> dict[str, Any]:
         job_id = payload.get("job_id")
         if not isinstance(job_id, str) or not job_id:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": "missing_job_id"}
-        scheduled_at = payload.get("scheduled_at")
-        if scheduled_at is not None:
-            if isinstance(scheduled_at, bool):
-                return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_scheduled_at"}
-            if isinstance(scheduled_at, int):
-                pass
-            elif isinstance(scheduled_at, str) and scheduled_at.isdecimal():
-                scheduled_at = int(scheduled_at)
-            else:
-                return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_scheduled_at"}
-            if scheduled_at < 0:
-                return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_scheduled_at"}
-        idempotency_key = payload.get("idempotency_key")
-        if idempotency_key is not None and (
-            not isinstance(idempotency_key, str) or not idempotency_key
-        ):
-            return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_idempotency_key"}
-        timeout = payload.get("timeout")
-        if timeout is not None:
-            try:
-                timeout = float(timeout)
-            except (TypeError, ValueError):
-                return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_timeout"}
-            if timeout < 0:
-                return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_timeout"}
+        scheduled_at, error = _parse_control_scheduled_at(payload.get("scheduled_at"))
+        if error is not None:
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": error}
+        idempotency_key, error = _parse_control_idempotency_key(payload.get("idempotency_key"))
+        if error is not None:
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": error}
+        timeout, error = _parse_control_timeout(payload.get("timeout"))
+        if error is not None:
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": error}
         try:
             outcome = await self.handle_synthetic_job(
                 job_id,
@@ -717,6 +809,50 @@ class SignalHermesRouter:
             return {
                 "status": TurnOutcomeStatus.ERROR.value,
                 "job_id": job_id,
+                "synthetic_id": job_id,
+                "synthetic_kind": SyntheticTurnKind.SCHEDULED_JOB.value,
+                "error": exc.__class__.__name__,
+            }
+        return outcome.to_control_response()
+
+    async def _handle_notify_route_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+        notification_id = payload.get("notification_id")
+        if not isinstance(notification_id, str) or not notification_id:
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": "missing_notification_id"}
+        raw_payload = payload.get("payload", _MISSING)
+        if raw_payload is _MISSING:
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": "missing_payload"}
+        try:
+            notification_payload = canonicalize_notification_payload(
+                raw_payload,
+                max_bytes=self.config.router.control.max_notification_payload_bytes,
+            )
+        except NotificationPayloadError as exc:
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": exc.error_code}
+        idempotency_key, error = _parse_control_idempotency_key(payload.get("idempotency_key"))
+        if error is not None:
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": error}
+        timeout, error = _parse_control_timeout(payload.get("timeout"))
+        if error is not None:
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": error}
+        try:
+            outcome = await self.handle_notification(
+                notification_id,
+                notification_payload,
+                idempotency_key=idempotency_key,
+                route_lock_timeout=timeout,
+            )
+        except Exception as exc:
+            LOGGER.error(
+                "control notification failed for notification %s: %s",
+                self.redactor.ref("notification", notification_id),
+                self.redactor.redact(exc.__class__.__name__),
+            )
+            LOGGER.debug("control notification failure details", exc_info=True)
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "synthetic_id": notification_id,
+                "synthetic_kind": SyntheticTurnKind.NOTIFICATION.value,
                 "error": exc.__class__.__name__,
             }
         return outcome.to_control_response()
@@ -801,6 +937,50 @@ def _session_sender_id(route: Route, event: NormalizedEvent) -> str:
     if route.chat_type == ChatType.DIRECT:
         return _direct_recipient(route)
     return event.sender_id
+
+
+def _origin_for_synthetic_kind(kind: SyntheticTurnKind) -> TurnOrigin:
+    if kind == SyntheticTurnKind.SCHEDULED_JOB:
+        return TurnOrigin.SCHEDULED_JOB
+    if kind == SyntheticTurnKind.NOTIFICATION:
+        return TurnOrigin.NOTIFICATION
+    raise ValueError(f"unknown synthetic turn kind {kind!r}")
+
+
+def _parse_control_scheduled_at(value: Any) -> tuple[int | None, str | None]:
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return None, "invalid_scheduled_at"
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and value.isdecimal():
+        parsed = int(value)
+    else:
+        return None, "invalid_scheduled_at"
+    if parsed < 0:
+        return None, "invalid_scheduled_at"
+    return parsed, None
+
+
+def _parse_control_idempotency_key(value: Any) -> tuple[str | None, str | None]:
+    if value is None:
+        return None, None
+    if not isinstance(value, str) or not value:
+        return None, "invalid_idempotency_key"
+    return value, None
+
+
+def _parse_control_timeout(value: Any) -> tuple[float | None, str | None]:
+    if value is None:
+        return None, None
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        return None, "invalid_timeout"
+    if not math.isfinite(timeout) or timeout < 0:
+        return None, "invalid_timeout"
+    return timeout, None
 
 
 def _unix_socket_accepts_connections(path: Path) -> bool:

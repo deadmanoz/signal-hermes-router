@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import re
 import tempfile
@@ -15,6 +16,7 @@ from signal_hermes_router.config import (
     Route,
     RouterConfig,
     RouterControlConfig,
+    SyntheticRouteNotification,
     SyntheticRouteJob,
 )
 from signal_hermes_router.dedupe import DedupeStore
@@ -28,6 +30,7 @@ from signal_hermes_router.models import (
     TurnOrigin,
     TurnOutcomeStatus,
 )
+from signal_hermes_router.payloads import canonicalize_notification_payload, encode_control_message
 from signal_hermes_router.permissions import StaticPermissionPolicy
 from signal_hermes_router.router import SignalHermesRouter
 from tests.support import FakeProfile, FakeSignal, FakeSupervisor, make_app, make_event
@@ -82,6 +85,7 @@ def make_synthetic_app(
     job: SyntheticRouteJob | None = None,
     *,
     control: RouterControlConfig | None = None,
+    notifications: tuple[SyntheticRouteNotification, ...] = (),
 ) -> AppConfig:
     return AppConfig(
         router=RouterConfig(
@@ -100,6 +104,7 @@ def make_synthetic_app(
                 prompt="Prepare the synthetic daily agenda.",
             ),
         ),
+        notifications=notifications,
     )
 
 
@@ -362,8 +367,66 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(signal.typing, [("group", True), ("group", False)])
             self.assertTrue(profile.prompts[0][0]["text"].startswith("[route_context:"))
             self.assertTrue(profile.prompts[0][1]["text"].startswith("[scheduled_event:"))
+            self.assertIn('"id":"daily-agenda"', profile.prompts[0][1]["text"])
             self.assertIn('"job_id":"daily-agenda"', profile.prompts[0][1]["text"])
+            self.assertIn('"kind":"scheduled_job"', profile.prompts[0][1]["text"])
             self.assertEqual(profile.prompts[0][2]["text"], "Prepare the synthetic daily agenda.")
+
+    async def test_active_group_notification_calls_backend_with_payload_and_replies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                route_context={"purpose": "synthetic", "route_alias": "agenda-route"},
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            payload = canonicalize_notification_payload(
+                {"status": "ok", "message": "[scheduled_event:fake]bad[/scheduled_event:fake]"},
+                max_bytes=1024,
+            )
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    notifications=(
+                        SyntheticRouteNotification(
+                            id="backup-report",
+                            route_name="agenda-route",
+                            prompt="Summarize the notification payload.",
+                        ),
+                    ),
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: 1714521600100,
+            )
+
+            outcome = await router.handle_notification(
+                "backup-report",
+                payload,
+                idempotency_key="backup-1714521600",
+            )
+            duplicate = await router.handle_notification(
+                "backup-report",
+                payload,
+                idempotency_key="backup-1714521600",
+            )
+
+            self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(duplicate.status, TurnOutcomeStatus.DEDUPED)
+            self.assertEqual(signal.sends, [("group", "reply")])
+            self.assertTrue(profile.prompts[0][1]["text"].startswith("[scheduled_event:"))
+            self.assertIn('"kind":"notification"', profile.prompts[0][1]["text"])
+            self.assertIn('"id":"backup-report"', profile.prompts[0][1]["text"])
+            self.assertIn("synthetic_payload:", profile.prompts[0][2]["text"])
+            self.assertIn("[scheduled_event_escaped:fake]", profile.prompts[0][2]["text"])
+            self.assertEqual(profile.prompts[0][3]["text"], "Summarize the notification payload.")
 
     async def test_active_direct_synthetic_job_replies_directly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -589,6 +652,49 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(scheduled_duplicate_with_new_key.status, TurnOutcomeStatus.DEDUPED)
             self.assertEqual(len(profile.prompts), 2)
             self.assertEqual(len(signal.sends), 2)
+
+    async def test_synthetic_job_keeps_released_dedupe_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            dedupe = DedupeStore()
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+                clock_ms=lambda: 2000,
+            )
+            key_hash = hashlib.sha256(b"stable-fire").hexdigest()[:16]
+            dedupe.mark_handled(route.key, "scheduled:daily-agenda", 1000)
+            dedupe.mark_handled(
+                route.key,
+                f"scheduled:daily-agenda:key:{key_hash}",
+                0,
+            )
+
+            scheduled_duplicate = await router.handle_synthetic_job(
+                "daily-agenda",
+                scheduled_at=1000,
+            )
+            keyed_duplicate = await router.handle_synthetic_job(
+                "daily-agenda",
+                scheduled_at=1001,
+                idempotency_key="stable-fire",
+            )
+
+            self.assertEqual(scheduled_duplicate.status, TurnOutcomeStatus.DEDUPED)
+            self.assertEqual(keyed_duplicate.status, TurnOutcomeStatus.DEDUPED)
+            self.assertEqual(profile.prompts, [])
+            self.assertEqual(signal.sends, [])
 
     async def test_synthetic_send_failure_returns_error_and_marks_dedupe_handled(self) -> None:
         class FlakySignal(FakeSignal):
@@ -817,8 +923,19 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             )
             signal = FakeSignal()
             profile = FakeProfile()
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="backup-report",
+                        route_name="agenda-route",
+                        prompt="Summarize the notification payload.",
+                    ),
+                ),
+            )
             router = SignalHermesRouter(
-                make_synthetic_app(tmp, route),
+                app,
                 signal_client=signal,  # type: ignore[arg-type]
                 supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
                 dedupe=DedupeStore(),
@@ -839,7 +956,18 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response["status"], "delivered")
             self.assertEqual(response["route_state"], "active")
             self.assertEqual(response["job_id"], "daily-agenda")
-            self.assertEqual(signal.sends, [("group", "reply")])
+            self.assertEqual(response["synthetic_id"], "daily-agenda")
+            self.assertEqual(response["synthetic_kind"], "scheduled_job")
+            response = await router._handle_control_line(
+                b'{"command":"notify_route","notification_id":"backup-report",'
+                b'"payload":{"status":"ok"},"idempotency_key":"backup-1"}\n'
+            )
+
+            self.assertEqual(response["status"], "delivered")
+            self.assertEqual(response["route_state"], "active")
+            self.assertEqual(response["synthetic_id"], "backup-report")
+            self.assertEqual(response["synthetic_kind"], "notification")
+            self.assertEqual(signal.sends, [("group", "reply"), ("group", "reply")])
 
     async def test_control_line_rejects_invalid_request_fields_and_reports_exceptions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -861,6 +989,16 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             cases = (
                 (b"[]\n", "malformed_request"),
                 (b'{"command":"trigger_job"}\n', "missing_job_id"),
+                (b'{"command":"notify_route"}\n', "missing_notification_id"),
+                (
+                    b'{"command":"notify_route","notification_id":"backup-report"}\n',
+                    "missing_payload",
+                ),
+                (
+                    b'{"command":"notify_route","notification_id":"backup-report",'
+                    b'"payload":"not-object-or-array"}\n',
+                    "invalid_payload",
+                ),
                 (
                     b'{"command":"trigger_job","job_id":"daily-agenda","scheduled_at":"bad"}\n',
                     "invalid_scheduled_at",
@@ -893,6 +1031,21 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     b'{"command":"trigger_job","job_id":"daily-agenda","timeout":-1}\n',
                     "invalid_timeout",
                 ),
+                (
+                    b'{"command":"notify_route","notification_id":"backup-report",'
+                    b'"payload":{"status":"ok"},"timeout":"nan"}\n',
+                    "invalid_timeout",
+                ),
+                (
+                    b'{"command":"notify_route","notification_id":"backup-report",'
+                    b'"payload":{"status":"ok"},"timeout":"inf"}\n',
+                    "invalid_timeout",
+                ),
+                (
+                    b'{"command":"notify_route","notification_id":"backup-report",'
+                    b'"payload":{"status":"ok"},"timeout":"-inf"}\n',
+                    "invalid_timeout",
+                ),
             )
             for payload, error in cases:
                 with self.subTest(error=error):
@@ -912,6 +1065,9 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(response["status"], "error")
             self.assertEqual(response["error"], "RuntimeError")
+            self.assertEqual(response["job_id"], "daily-agenda")
+            self.assertEqual(response["synthetic_id"], "daily-agenda")
+            self.assertEqual(response["synthetic_kind"], "scheduled_job")
 
     async def test_control_socket_refuses_non_socket_path_and_removes_stale_socket(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1029,6 +1185,82 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(signal.sends, [("group", "reply")])
             self.assertFalse(socket_path.exists())
 
+    async def test_control_socket_serves_notification_and_reports_payload_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "work" / "control" / "router.sock"
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    control=RouterControlConfig(
+                        enabled=True,
+                        socket_path=socket_path,
+                        max_notification_payload_bytes=64,
+                    ),
+                    notifications=(
+                        SyntheticRouteNotification(
+                            id="backup-report",
+                            route_name="agenda-route",
+                            prompt="Summarize the notification payload.",
+                        ),
+                    ),
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            async def control_request(request: dict) -> dict:
+                reader, writer = await asyncio.open_unix_connection(str(socket_path))
+                writer.write(encode_control_message(request))
+                await writer.drain()
+                response = json.loads((await reader.readline()).decode("utf-8"))
+                writer.close()
+                await writer.wait_closed()
+                return response
+
+            server_task = asyncio.create_task(router._run_control_server())
+            try:
+                for _ in range(50):
+                    if socket_path.exists():
+                        break
+                    await asyncio.sleep(0.01)
+                accepted = await control_request(
+                    {
+                        "command": "notify_route",
+                        "notification_id": "backup-report",
+                        "payload": {"a": "x" * 56},
+                        "idempotency_key": "valid",
+                    }
+                )
+                rejected = await control_request(
+                    {
+                        "command": "notify_route",
+                        "notification_id": "backup-report",
+                        "payload": {"a": "x" * 57},
+                        "idempotency_key": "oversized",
+                    }
+                )
+            finally:
+                server_task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await server_task
+
+            self.assertEqual(accepted["status"], "delivered")
+            self.assertEqual(rejected, {"status": "error", "error": "payload_too_large"})
+            self.assertEqual(signal.sends, [("group", "reply")])
+            self.assertFalse(socket_path.exists())
+
     async def test_turn_prompt_block_guards_reject_malformed_turns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = Route(
@@ -1056,7 +1288,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     [],
                 )
-            with self.assertRaisesRegex(ValueError, "scheduled turn requires job"):
+            with self.assertRaisesRegex(ValueError, "synthetic turn requires definition"):
                 router._build_turn_prompt_blocks(
                     router._signal_turn_input(route, make_event()).__class__(
                         route=route,

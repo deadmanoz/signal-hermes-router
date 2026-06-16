@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 from dataclasses import dataclass, field
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlparse
 
-from .models import ChatType, NormalizedEvent, RouteState, SessionPolicy
+from .models import ChatType, NormalizedEvent, RouteState, SessionPolicy, SyntheticTurnKind
+from .payloads import compact_json_dumps
 from .permissions import StaticPermissionPolicy
 from .secrets import resolve_secret_refs
 
@@ -20,6 +20,8 @@ PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SAFE_TOKEN_RE = PROFILE_NAME_RE
 SIGNAL_MESSAGE_WARNING_BYTES = 2000
 MIN_SIGNAL_MESSAGE_BYTES = 16
+DEFAULT_MAX_NOTIFICATION_PAYLOAD_BYTES = 16 * 1024
+CONTROL_REQUEST_HEADROOM_BYTES = 8 * 1024
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,7 @@ class RouterControlConfig:
     enabled: bool = False
     socket_path: Path | None = None
     route_lock_timeout_seconds: float = 0.0
+    max_notification_payload_bytes: int = DEFAULT_MAX_NOTIFICATION_PAYLOAD_BYTES
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,10 @@ class RouterConfig:
     @property
     def control_socket_path(self) -> Path:
         return self.control.socket_path or self.work_root / "control.sock"
+
+    @property
+    def control_request_line_limit_bytes(self) -> int:
+        return self.control.max_notification_payload_bytes + CONTROL_REQUEST_HEADROOM_BYTES
 
 
 @dataclass(frozen=True)
@@ -92,12 +99,34 @@ class Route:
 
 
 @dataclass(frozen=True)
-class SyntheticRouteJob:
+class SyntheticRouteDefinition:
     id: str
     route_name: str
     prompt: str
+    kind: SyntheticTurnKind
     description: str | None = None
     permission_policy: StaticPermissionPolicy | None = None
+
+    @property
+    def namespace(self) -> str:
+        return f"synthetic:{self.kind.value}:{self.id}"
+
+
+@dataclass(frozen=True)
+class SyntheticRouteJob(SyntheticRouteDefinition):
+    kind: SyntheticTurnKind = SyntheticTurnKind.SCHEDULED_JOB
+
+    @property
+    def namespace(self) -> str:
+        return f"scheduled:{self.id}"
+
+
+@dataclass(frozen=True)
+class SyntheticRouteNotification(SyntheticRouteDefinition):
+    kind: SyntheticTurnKind = SyntheticTurnKind.NOTIFICATION
+
+
+SyntheticDefinitionT = TypeVar("SyntheticDefinitionT", bound=SyntheticRouteDefinition)
 
 
 @dataclass(frozen=True)
@@ -105,6 +134,7 @@ class AppConfig:
     router: RouterConfig
     routes: tuple[Route, ...]
     scheduled_jobs: tuple[SyntheticRouteJob, ...] = ()
+    notifications: tuple[SyntheticRouteNotification, ...] = ()
 
     def find_route(self, platform: str, group_id: str) -> Route | None:
         return self.find_group_route(platform, group_id)
@@ -119,6 +149,12 @@ class AppConfig:
         for job in self.scheduled_jobs:
             if job.id == job_id:
                 return job
+        return None
+
+    def find_notification(self, notification_id: str) -> SyntheticRouteNotification | None:
+        for notification in self.notifications:
+            if notification.id == notification_id:
+                return notification
         return None
 
     def find_group_route(self, platform: str, group_id: str) -> Route | None:
@@ -186,6 +222,7 @@ def load_app_config(config_path: Path, routes_path: Path) -> AppConfig:
         router=router,
         routes=routes,
         scheduled_jobs=tuple(parse_scheduled_jobs(raw_routes, routes)),
+        notifications=tuple(parse_notifications(raw_routes, routes)),
     )
 
 
@@ -242,6 +279,13 @@ def parse_router_config(raw: dict[str, Any]) -> RouterConfig:
     )
     if route_lock_timeout_seconds < 0:
         raise ValueError("router.control.route_lock_timeout_seconds must be non-negative")
+    max_notification_payload_bytes = _as_positive_int(
+        control.get(
+            "max_notification_payload_bytes",
+            defaults.control.max_notification_payload_bytes,
+        ),
+        "router.control.max_notification_payload_bytes",
+    )
     socket_path = control.get("socket_path")
     return RouterConfig(
         signal_base_url=signal_base_url,
@@ -286,6 +330,7 @@ def parse_router_config(raw: dict[str, Any]) -> RouterConfig:
             enabled=_as_bool(control.get("enabled", defaults.control.enabled)),
             socket_path=Path(socket_path) if socket_path not in (None, "") else None,
             route_lock_timeout_seconds=route_lock_timeout_seconds,
+            max_notification_payload_bytes=max_notification_payload_bytes,
         ),
     )
 
@@ -336,38 +381,66 @@ def parse_routes(raw: dict[str, Any]) -> list[Route]:
 
 
 def parse_scheduled_jobs(raw: dict[str, Any], routes: tuple[Route, ...]) -> list[SyntheticRouteJob]:
-    values = raw.get("scheduled_jobs", [])
+    return _parse_synthetic_definitions(
+        raw,
+        routes,
+        key="scheduled_jobs",
+        label="scheduled job",
+        factory=SyntheticRouteJob,
+    )
+
+
+def parse_notifications(
+    raw: dict[str, Any],
+    routes: tuple[Route, ...],
+) -> list[SyntheticRouteNotification]:
+    return _parse_synthetic_definitions(
+        raw,
+        routes,
+        key="notifications",
+        label="notification",
+        factory=SyntheticRouteNotification,
+    )
+
+
+def _parse_synthetic_definitions(
+    raw: dict[str, Any],
+    routes: tuple[Route, ...],
+    *,
+    key: str,
+    label: str,
+    factory: type[SyntheticDefinitionT],
+) -> list[SyntheticDefinitionT]:
+    values = raw.get(key, [])
     if values is None:
         values = []
     if not isinstance(values, list):
-        raise ValueError("routes.yaml scheduled_jobs must be a list")
+        raise ValueError(f"routes.yaml {key} must be a list")
     named_routes = {route.name: route for route in routes if route.name is not None}
-    jobs: list[SyntheticRouteJob] = []
+    definitions: list[SyntheticDefinitionT] = []
     seen: dict[str, int] = {}
     for index, value in enumerate(values):
         if not isinstance(value, dict):
-            raise ValueError(f"scheduled_jobs[{index}] must be a mapping")
-        job_id = normalize_safe_token(value.get("id"), "scheduled job id")
-        if job_id in seen:
+            raise ValueError(f"{key}[{index}] must be a mapping")
+        synthetic_id = normalize_safe_token(value.get("id"), f"{label} id")
+        if synthetic_id in seen:
             raise ValueError(
-                f"duplicate scheduled job id {job_id!r} at scheduled_jobs[{index}] "
-                f"(first defined at scheduled_jobs[{seen[job_id]}])"
+                f"duplicate {label} id {synthetic_id!r} at {key}[{index}] "
+                f"(first defined at {key}[{seen[synthetic_id]}])"
             )
-        seen[job_id] = index
-        route_name = normalize_safe_token(value.get("route"), "scheduled job route")
+        seen[synthetic_id] = index
+        route_name = normalize_safe_token(value.get("route"), f"{label} route")
         if route_name not in named_routes:
-            raise ValueError(
-                f"scheduled_jobs[{index}] references unknown route name {route_name!r}"
-            )
+            raise ValueError(f"{key}[{index}] references unknown route name {route_name!r}")
         prompt = value.get("prompt")
         if not isinstance(prompt, str):
-            raise ValueError(f"scheduled_jobs[{index}] prompt must be a string")
+            raise ValueError(f"{key}[{index}] prompt must be a string")
         if not prompt.strip():
-            raise ValueError(f"scheduled_jobs[{index}] prompt must not be empty")
+            raise ValueError(f"{key}[{index}] prompt must not be empty")
         raw_permissions = value.get("permissions")
-        jobs.append(
-            SyntheticRouteJob(
-                id=job_id,
+        definitions.append(
+            factory(
+                id=synthetic_id,
                 route_name=route_name,
                 prompt=prompt,
                 description=value.get("description"),
@@ -378,7 +451,7 @@ def parse_scheduled_jobs(raw: dict[str, Any], routes: tuple[Route, ...]) -> list
                 ),
             )
         )
-    return jobs
+    return definitions
 
 
 def parse_route(raw: dict[str, Any]) -> Route:
@@ -386,9 +459,9 @@ def parse_route(raw: dict[str, Any]) -> Route:
         raise ValueError("route permission policy is allowlist-only; denylists are not supported")
     route_context = dict(raw.get("route_context") or {})
     try:
-        json.dumps(route_context, sort_keys=True)
-    except TypeError as exc:
-        raise ValueError("route_context must be JSON serializable") from exc
+        compact_json_dumps(route_context)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("route_context must be finite JSON serializable") from exc
     chat_type = ChatType(raw.get("chat_type", ChatType.GROUP))
     platform = str(raw["platform"])
     route_name = raw.get("name")

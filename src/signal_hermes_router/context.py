@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import uuid
 from pathlib import Path
@@ -8,6 +7,7 @@ from typing import Any
 
 from .mime import content_type_for_path, is_image_content_type
 from .models import MediaManifest
+from .payloads import compact_json_dumps
 
 # This set is deliberately code-controlled, not config-controlled. Adding a key
 # here exposes that route_context value to the LLM via the prompt preamble.
@@ -24,13 +24,13 @@ def context_for_prompt(route_context: dict[str, Any]) -> dict[str, Any]:
 
 def render_route_context(route_context: dict[str, Any], nonce: str | None = None) -> dict[str, str]:
     nonce = nonce or new_context_nonce()
-    body = json.dumps(route_context, sort_keys=True, separators=(",", ":"))
+    body = compact_json_dumps(route_context)
     return {"type": "text", "text": f"[route_context:{nonce}]{body}[/route_context:{nonce}]"}
 
 
 def render_scheduled_event(metadata: dict[str, Any], nonce: str | None = None) -> dict[str, str]:
     nonce = nonce or new_context_nonce()
-    body = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+    body = compact_json_dumps(metadata)
     return {
         "type": "text",
         "text": f"[scheduled_event:{nonce}]{body}[/scheduled_event:{nonce}]",
@@ -91,10 +91,26 @@ def build_scheduled_prompt_blocks(
     scheduled_metadata: dict[str, Any],
     scheduled_prompt: str,
 ) -> list[dict[str, str]]:
+    return build_synthetic_prompt_blocks(
+        route_context=route_context,
+        synthetic_metadata=scheduled_metadata,
+        synthetic_prompt=scheduled_prompt,
+    )
+
+
+def build_synthetic_prompt_blocks(
+    *,
+    route_context: dict[str, Any],
+    synthetic_metadata: dict[str, Any],
+    synthetic_prompt: str,
+    payload_json: str | None = None,
+) -> list[dict[str, str]]:
     blocks = [
         render_route_context(context_for_prompt(route_context)),
-        render_scheduled_event(scheduled_metadata),
+        render_scheduled_event(synthetic_metadata),
     ]
-    if scheduled_prompt:
-        blocks.append(text_block(escape_prompt_text(scheduled_prompt)))
+    if payload_json is not None:
+        blocks.append(text_block("synthetic_payload:\n" + escape_prompt_text(payload_json)))
+    if synthetic_prompt:
+        blocks.append(text_block(escape_prompt_text(synthetic_prompt)))
     return blocks

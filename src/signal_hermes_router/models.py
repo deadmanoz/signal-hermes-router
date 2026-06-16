@@ -27,6 +27,12 @@ class ChatType(StrEnum):
 class TurnOrigin(StrEnum):
     SIGNAL = "signal"
     SCHEDULED_JOB = "scheduled_job"
+    NOTIFICATION = "notification"
+
+
+class SyntheticTurnKind(StrEnum):
+    SCHEDULED_JOB = "scheduled_job"
+    NOTIFICATION = "notification"
 
 
 class TurnOutcomeStatus(StrEnum):
@@ -128,15 +134,20 @@ class TurnOutcome:
     route_state: RouteState | None = None
     result: TurnResult | None = None
     error: str | None = None
-    job_id: str | None = None
+    synthetic_id: str | None = None
+    synthetic_kind: SyntheticTurnKind | None = None
     reply_sent: bool | None = None
 
     def to_control_response(self) -> dict[str, Any]:
         response: dict[str, Any] = {"status": self.status.value}
         if self.route_state is not None:
             response["route_state"] = self.route_state.value
-        if self.job_id is not None:
-            response["job_id"] = self.job_id
+        if self.synthetic_id is not None:
+            if self.synthetic_kind == SyntheticTurnKind.SCHEDULED_JOB:
+                response["job_id"] = self.synthetic_id
+            response["synthetic_id"] = self.synthetic_id
+        if self.synthetic_kind is not None:
+            response["synthetic_kind"] = self.synthetic_kind.value
         if self.result is not None:
             response["stop_reason"] = self.result.stop_reason
         if self.reply_sent is not None:

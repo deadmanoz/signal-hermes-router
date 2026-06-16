@@ -11,12 +11,19 @@ from signal_hermes_router.config import (
     load_app_config,
     load_router_config,
     normalize_profile_name,
+    parse_notifications,
     parse_route,
     parse_router_config,
     parse_routes,
     parse_scheduled_jobs,
 )
-from signal_hermes_router.models import ChatType, NormalizedEvent, RouteState, SessionPolicy
+from signal_hermes_router.models import (
+    ChatType,
+    NormalizedEvent,
+    RouteState,
+    SessionPolicy,
+    SyntheticTurnKind,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -152,6 +159,7 @@ router:
                     "enabled": "true",
                     "socket_path": "work/control.sock",
                     "route_lock_timeout_seconds": "2.5",
+                    "max_notification_payload_bytes": "4096",
                 },
             }
         )
@@ -160,9 +168,13 @@ router:
         self.assertEqual(router.control.socket_path, Path("work/control.sock"))
         self.assertEqual(router.control_socket_path, Path("work/control.sock"))
         self.assertEqual(router.control.route_lock_timeout_seconds, 2.5)
+        self.assertEqual(router.control.max_notification_payload_bytes, 4096)
+        self.assertEqual(router.control_request_line_limit_bytes, 4096 + 8 * 1024)
 
         with self.assertRaisesRegex(ValueError, "non-negative"):
             parse_router_config({"control": {"route_lock_timeout_seconds": -1}})
+        with self.assertRaisesRegex(ValueError, "positive"):
+            parse_router_config({"control": {"max_notification_payload_bytes": 0}})
 
     def test_parse_router_config_warns_when_signal_message_bytes_above_threshold(self) -> None:
         with self.assertLogs("signal_hermes_router.config", level="WARNING") as logs:
@@ -356,7 +368,51 @@ router:
 
         self.assertEqual(jobs[0].id, "daily-agenda")
         self.assertEqual(jobs[0].route_name, "agenda-route")
+        self.assertEqual(jobs[0].kind, SyntheticTurnKind.SCHEDULED_JOB)
+        self.assertEqual(jobs[0].namespace, "scheduled:daily-agenda")
         self.assertIsNotNone(jobs[0].permission_policy)
+
+    def test_notifications_parse_against_named_routes(self) -> None:
+        routes = tuple(
+            parse_routes(
+                {
+                    "routes": [
+                        {
+                            "platform": "signal",
+                            "group_id": "GROUP",
+                            "profile": "profile",
+                            "name": "agenda-route",
+                        }
+                    ]
+                }
+            )
+        )
+
+        notifications = parse_notifications(
+            {
+                "notifications": [
+                    {
+                        "id": "backup-report",
+                        "route": "agenda-route",
+                        "prompt": "Summarize the notification payload.",
+                        "description": "Synthetic notification example",
+                        "permissions": [
+                            {
+                                "tool": "read_file",
+                                "arguments": {"path": {"prefix": "/tmp/example"}},
+                            }
+                        ],
+                    }
+                ]
+            },
+            routes,
+        )
+
+        self.assertEqual(notifications[0].id, "backup-report")
+        self.assertEqual(notifications[0].route_name, "agenda-route")
+        self.assertEqual(notifications[0].kind, SyntheticTurnKind.NOTIFICATION)
+        self.assertEqual(notifications[0].namespace, "synthetic:notification:backup-report")
+        self.assertIsNotNone(notifications[0].permission_policy)
 
     def test_scheduled_jobs_reject_invalid_shapes(self) -> None:
         routes = tuple(
@@ -404,6 +460,19 @@ router:
         with self.assertRaisesRegex(ValueError, "prompt must be a string"):
             parse_scheduled_jobs(
                 {"scheduled_jobs": [{"id": "daily", "route": "agenda-route", "prompt": []}]},
+                routes,
+            )
+
+        with self.assertRaisesRegex(ValueError, "notifications must be a list"):
+            parse_notifications({"notifications": {}}, routes)
+        with self.assertRaisesRegex(ValueError, "duplicate notification id"):
+            parse_notifications(
+                {
+                    "notifications": [
+                        {"id": "report", "route": "agenda-route", "prompt": "one"},
+                        {"id": "report", "route": "agenda-route", "prompt": "two"},
+                    ]
+                },
                 routes,
             )
 
@@ -582,6 +651,23 @@ router:
                     "route_context": {"bad": object()},
                 }
             )
+
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "finite JSON serializable",
+                ),
+            ):
+                parse_route(
+                    {
+                        "platform": "signal",
+                        "group_id": "GROUP",
+                        "profile": "profile",
+                        "route_context": {"purpose": value},
+                    }
+                )
 
     def test_profile_names_reject_path_shapes(self) -> None:
         for value in (
