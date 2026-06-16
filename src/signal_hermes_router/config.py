@@ -116,6 +116,10 @@ class SyntheticRouteDefinition:
 class SyntheticRouteJob(SyntheticRouteDefinition):
     kind: SyntheticTurnKind = SyntheticTurnKind.SCHEDULED_JOB
 
+    @property
+    def namespace(self) -> str:
+        return f"scheduled:{self.id}"
+
 
 @dataclass(frozen=True)
 class SyntheticRouteNotification(SyntheticRouteDefinition):

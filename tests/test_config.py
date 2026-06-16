@@ -369,6 +369,7 @@ router:
         self.assertEqual(jobs[0].id, "daily-agenda")
         self.assertEqual(jobs[0].route_name, "agenda-route")
         self.assertEqual(jobs[0].kind, SyntheticTurnKind.SCHEDULED_JOB)
+        self.assertEqual(jobs[0].namespace, "scheduled:daily-agenda")
         self.assertIsNotNone(jobs[0].permission_policy)
 
     def test_notifications_parse_against_named_routes(self) -> None:

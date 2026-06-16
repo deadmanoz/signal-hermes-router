@@ -133,7 +133,8 @@ Scheduled turns use the selected route's session policy:
 - `persistent_route`: reuse the route session. Later human Signal messages can
   discuss the scheduled report in the same ACP session.
 - `persistent_sender`: use a synthetic sender identity for the definition,
-  such as `synthetic:scheduled_job:daily-agenda`.
+  such as `scheduled:daily-agenda` for scheduled jobs or
+  `synthetic:notification:backup-report` for notifications.
 - `ephemeral`: create a fresh session for each synthetic turn.
 
 ## Idempotency

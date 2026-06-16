@@ -557,6 +557,8 @@ class SignalHermesRouter:
             "scheduled_at_ms": turn.scheduled_at_ms,
             "triggered_at_ms": turn.triggered_at_ms,
         }
+        if turn.synthetic.kind == SyntheticTurnKind.SCHEDULED_JOB:
+            metadata["job_id"] = turn.synthetic.id
         if turn.synthetic_payload is not None:
             metadata["payload_bytes"] = turn.synthetic_payload.byte_length
             metadata["payload_sha256"] = turn.synthetic_payload.sha256
@@ -805,6 +807,7 @@ class SignalHermesRouter:
             LOGGER.debug("control trigger failure details", exc_info=True)
             return {
                 "status": TurnOutcomeStatus.ERROR.value,
+                "job_id": job_id,
                 "synthetic_id": job_id,
                 "synthetic_kind": SyntheticTurnKind.SCHEDULED_JOB.value,
                 "error": exc.__class__.__name__,

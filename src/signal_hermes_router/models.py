@@ -143,6 +143,8 @@ class TurnOutcome:
         if self.route_state is not None:
             response["route_state"] = self.route_state.value
         if self.synthetic_id is not None:
+            if self.synthetic_kind == SyntheticTurnKind.SCHEDULED_JOB:
+                response["job_id"] = self.synthetic_id
             response["synthetic_id"] = self.synthetic_id
         if self.synthetic_kind is not None:
             response["synthetic_kind"] = self.synthetic_kind.value

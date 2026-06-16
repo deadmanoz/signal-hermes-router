@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import re
 import tempfile
@@ -367,6 +368,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(profile.prompts[0][0]["text"].startswith("[route_context:"))
             self.assertTrue(profile.prompts[0][1]["text"].startswith("[scheduled_event:"))
             self.assertIn('"id":"daily-agenda"', profile.prompts[0][1]["text"])
+            self.assertIn('"job_id":"daily-agenda"', profile.prompts[0][1]["text"])
             self.assertIn('"kind":"scheduled_job"', profile.prompts[0][1]["text"])
             self.assertEqual(profile.prompts[0][2]["text"], "Prepare the synthetic daily agenda.")
 
@@ -651,6 +653,49 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(profile.prompts), 2)
             self.assertEqual(len(signal.sends), 2)
 
+    async def test_synthetic_job_keeps_released_dedupe_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            dedupe = DedupeStore()
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+                clock_ms=lambda: 2000,
+            )
+            key_hash = hashlib.sha256(b"stable-fire").hexdigest()[:16]
+            dedupe.mark_handled(route.key, "scheduled:daily-agenda", 1000)
+            dedupe.mark_handled(
+                route.key,
+                f"scheduled:daily-agenda:key:{key_hash}",
+                0,
+            )
+
+            scheduled_duplicate = await router.handle_synthetic_job(
+                "daily-agenda",
+                scheduled_at=1000,
+            )
+            keyed_duplicate = await router.handle_synthetic_job(
+                "daily-agenda",
+                scheduled_at=1001,
+                idempotency_key="stable-fire",
+            )
+
+            self.assertEqual(scheduled_duplicate.status, TurnOutcomeStatus.DEDUPED)
+            self.assertEqual(keyed_duplicate.status, TurnOutcomeStatus.DEDUPED)
+            self.assertEqual(profile.prompts, [])
+            self.assertEqual(signal.sends, [])
+
     async def test_synthetic_send_failure_returns_error_and_marks_dedupe_handled(self) -> None:
         class FlakySignal(FakeSignal):
             def __init__(self) -> None:
@@ -910,6 +955,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(response["status"], "delivered")
             self.assertEqual(response["route_state"], "active")
+            self.assertEqual(response["job_id"], "daily-agenda")
             self.assertEqual(response["synthetic_id"], "daily-agenda")
             self.assertEqual(response["synthetic_kind"], "scheduled_job")
             response = await router._handle_control_line(
@@ -1004,6 +1050,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(response["status"], "error")
             self.assertEqual(response["error"], "RuntimeError")
+            self.assertEqual(response["job_id"], "daily-agenda")
             self.assertEqual(response["synthetic_id"], "daily-agenda")
             self.assertEqual(response["synthetic_kind"], "scheduled_job")
 
@@ -1231,7 +1278,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     router._signal_turn_input(route, make_event()).__class__(
                         route=route,
                         origin=TurnOrigin.SCHEDULED_JOB,
-                        dedupe_sender_id="synthetic:scheduled_job:job",
+                        dedupe_sender_id="scheduled:job",
                         dedupe_timestamp=1,
                         session=router._signal_turn_input(route, make_event()).session,
                     ),
