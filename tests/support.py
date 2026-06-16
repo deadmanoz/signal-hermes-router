@@ -14,6 +14,7 @@ from signal_hermes_router.config import (
     CircuitBreakerConfig,
     Route,
     RouterConfig,
+    SyntheticRouteNotification,
     SyntheticRouteJob,
 )
 from signal_hermes_router.dedupe import DedupeStore
@@ -129,6 +130,7 @@ def make_app(
     route_context: dict[str, Any] | None = None,
     routes: tuple[Route, ...] | None = None,
     scheduled_jobs: tuple[SyntheticRouteJob, ...] = (),
+    notifications: tuple[SyntheticRouteNotification, ...] = (),
     **router_overrides: Any,
 ) -> AppConfig:
     route = make_route(
@@ -143,6 +145,7 @@ def make_app(
         router=router_config_for_tmp(tmp, **router_overrides),
         routes=routes or (route,),
         scheduled_jobs=scheduled_jobs,
+        notifications=notifications,
     )
 
 

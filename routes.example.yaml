@@ -32,6 +32,7 @@ routes:
   #   permissions: []
 
 scheduled_jobs: []
+notifications: []
 
 # Example scheduled job. Keep real prompts and route names in private config.
 # scheduled_jobs:
@@ -39,4 +40,13 @@ scheduled_jobs: []
 #     route: "example-route"
 #     prompt: "Prepare the synthetic daily agenda for this route."
 #     description: "Synthetic public scheduled-job example."
+#     permissions: []
+
+# Example external notification. Scripts pass JSON payloads through
+# `signal-hermes-router notify-route`; they do not send Signal directly.
+# notifications:
+#   - id: "backup-report"
+#     route: "example-route"
+#     prompt: "Summarize the notification payload for this route."
+#     description: "Synthetic public notification example."
 #     permissions: []

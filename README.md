@@ -12,6 +12,8 @@ Hermes profiles own behaviour, skills, app access, and media interpretation. The
 signal-cli events  ------> signal-hermes-router -----> hermes -p A acp
 local scheduler    --+             |            \-----> hermes -p B acp
   trigger-job        |             \------------------> hermes -p C acp
+local script       --+
+  notify-route       |
   control.sock       |
                      \-------- Signal replies --------> signal-cli
 ```
@@ -20,7 +22,7 @@ This public tree is intentionally generic. Keep real Signal group IDs, phone num
 
 Media today flows inbound only - Signal attachments are normalised, stored on disk, and forwarded to Hermes as ACP content blocks, but replies back to Signal are text-only. A narrow router-owned outbound media contract (so a profile-side plugin - TTS audio, a generated image or chart, and so on - can hand the router a validated local attachment reference to deliver alongside the reply) is planned future work. Route delivery, chunking, retries, and audit logging will stay with the router; profiles won't call Signal directly.
 
-Scheduled synthetic route events let a trusted local scheduler trigger a configured route through the already-running router. The CLI sends a job ID to the router's local Unix control socket; the router then uses the same route state, session policy, permission allowlist, ACP supervision, Signal outbound chunking, retries, redaction, and audit behavior as an inbound Signal turn. The scheduler never sends Signal directly and never starts its own Hermes ACP session.
+Synthetic route events let trusted local automation trigger a configured route through the already-running router. A host scheduler can send a configured job ID with `trigger-job`; a local script can send a configured notification ID plus bounded JSON payload with `notify-route`. The router then uses the same route state, session policy, permission allowlist, ACP supervision, Signal outbound chunking, retries, redaction, and audit behavior as an inbound Signal turn. Automation never sends Signal directly and never starts its own Hermes ACP session.
 
 ## Why a router
 
@@ -97,6 +99,12 @@ If the private config enables `router.control` and the private routes file defin
 signal-hermes-router --config /path/to/private/config.yaml trigger-job daily-agenda --scheduled-at 1714521600000 --idempotency-key daily-agenda-1714521600000
 ```
 
+Configured notifications use the same control socket and route-owned delivery path:
+
+```bash
+signal-hermes-router --config /path/to/private/config.yaml notify-route backup-report --payload-file /path/to/private/payload.json --idempotency-key backup-report-1714521600000
+```
+
 ## Documentation
 
 - [docs/configuration.md](docs/configuration.md) - config schema, secret resolvers, route states, session policies
@@ -104,7 +112,7 @@ signal-hermes-router --config /path/to/private/config.yaml trigger-job daily-age
 - [docs/route-context.md](docs/route-context.md) - prompt-safe context keys, nonce delimiter, escaping
 - [docs/permissions.md](docs/permissions.md) - what the static ACP permission handler is (and isn't)
 - [docs/media.md](docs/media.md) - attachment storage layout, manifests, ACP content blocks
-- [docs/scheduled-synthetic-events.md](docs/scheduled-synthetic-events.md) - router-owned scheduler triggers through the local control socket
+- [docs/scheduled-synthetic-events.md](docs/scheduled-synthetic-events.md) - router-owned scheduler and notification triggers through the local control socket
 - [docs/hermes-gateway-tradeoffs.md](docs/hermes-gateway-tradeoffs.md) - what you give up (and gain) versus the built-in Hermes Signal gateway
 - [docs/profile-audit-checklist.md](docs/profile-audit-checklist.md) - pre-activation checklist template (use a copy in the private deployment repo)
 - [docs/releasing.md](docs/releasing.md) - versioning policy and release procedure

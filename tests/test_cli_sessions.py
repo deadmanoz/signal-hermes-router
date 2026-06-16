@@ -111,11 +111,18 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "non-negative"):
             cli_module.parse_scheduled_at("-1")
 
-    async def test_main_async_dispatches_trigger_job_and_rejects_unknown_command(self) -> None:
+    async def test_main_async_dispatches_control_commands_and_rejects_unknown_command(
+        self,
+    ) -> None:
         args = argparse.Namespace(command="trigger-job")
         with patch.object(cli_module, "_trigger_job", AsyncMock(return_value=0)) as trigger:
             self.assertEqual(await cli_module._main_async(args), 0)
         trigger.assert_awaited_once_with(args)
+
+        notify_args = argparse.Namespace(command="notify-route")
+        with patch.object(cli_module, "_notify_route", AsyncMock(return_value=0)) as notify:
+            self.assertEqual(await cli_module._main_async(notify_args), 0)
+        notify.assert_awaited_once_with(notify_args)
 
         with self.assertRaisesRegex(ValueError, "unknown command"):
             await cli_module._main_async(argparse.Namespace(command="unknown"))
@@ -164,6 +171,45 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
                         "job_id": "daily-agenda",
                         "scheduled_at": 1714521600000,
                         "idempotency_key": "stable-fire",
+                        "timeout": 1.5,
+                    }
+                ],
+            )
+
+    async def test_notify_route_via_control_socket_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "control.sock"
+            requests: list[dict] = []
+
+            async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                requests.append(json.loads((await reader.readline()).decode("utf-8")))
+                writer.write(b'{"status":"delivered"}\n')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_unix_server(handle, path=str(socket_path))
+            async with server:
+                response = await cli_module.notify_route_via_control_socket(
+                    socket_path,
+                    "backup-report",
+                    payload={"b": 2, "a": 1},
+                    idempotency_key="backup-fire",
+                    timeout=1.5,
+                    client_timeout=1.5,
+                )
+                server.close()
+                await server.wait_closed()
+
+            self.assertEqual(response, {"status": "delivered"})
+            self.assertEqual(
+                requests,
+                [
+                    {
+                        "command": "notify_route",
+                        "notification_id": "backup-report",
+                        "payload": {"a": 1, "b": 2},
+                        "idempotency_key": "backup-fire",
                         "timeout": 1.5,
                     }
                 ],
@@ -276,6 +322,61 @@ router:
                 patch("builtins.print"),
             ):
                 self.assertEqual(await cli_module._trigger_job(args), 1)
+
+    async def test_notify_route_uses_control_socket_validates_payload_and_exit_mapping(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            config.write_text(
+                """
+router:
+  control:
+    socket_path: private/control.sock
+    max_notification_payload_bytes: 64
+""",
+                encoding="utf-8",
+            )
+            payload_file = Path(tmp) / "payload.json"
+            payload_file.write_text('{"b":2,"a":1}', encoding="utf-8")
+            args = argparse.Namespace(
+                config=config,
+                control_socket=None,
+                notification_id="backup-report",
+                payload_file=payload_file,
+                idempotency_key="backup-fire",
+                timeout=1.5,
+                client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+            )
+
+            with (
+                patch.object(
+                    cli_module,
+                    "notify_route_via_control_socket",
+                    AsyncMock(return_value={"status": "busy"}),
+                ) as notify,
+                patch("builtins.print") as printed,
+            ):
+                code = await cli_module._notify_route(args)
+
+            self.assertEqual(code, 0)
+            notify.assert_awaited_once_with(
+                Path("private/control.sock"),
+                "backup-report",
+                payload={"b": 2, "a": 1},
+                idempotency_key="backup-fire",
+                timeout=1.5,
+                client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+            )
+            self.assertIn('"status": "busy"', printed.call_args.args[0])
+
+            payload_file.write_text('{"a":"' + "x" * 57 + '"}', encoding="utf-8")
+            with (
+                patch.object(cli_module, "notify_route_via_control_socket", AsyncMock()) as notify,
+                patch.object(cli_module.logging, "error"),
+            ):
+                self.assertEqual(await cli_module._notify_route(args), 1)
+            notify.assert_not_awaited()
 
     async def test_trigger_job_expands_configured_control_socket_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

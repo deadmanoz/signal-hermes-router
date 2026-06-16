@@ -12,6 +12,11 @@ from typing import Any
 
 from .config import load_app_config, load_router_config
 from .models import TurnOutcomeStatus
+from .payloads import (
+    NotificationPayloadError,
+    canonicalize_notification_payload,
+    encode_control_message,
+)
 from .router import SignalHermesRouter
 
 DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS = 300.0
@@ -36,6 +41,18 @@ def main(argv: list[str] | None = None) -> None:
         help="local control socket round-trip timeout in seconds",
     )
     trigger.add_argument("--control-socket", type=Path)
+    notify = subparsers.add_parser("notify-route", help="send a configured route notification")
+    notify.add_argument("notification_id")
+    notify.add_argument("--payload-file", type=Path, required=True)
+    notify.add_argument("--idempotency-key")
+    notify.add_argument("--timeout", type=float, help="router route-lock timeout in seconds")
+    notify.add_argument(
+        "--client-timeout",
+        type=float,
+        default=DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+        help="local control socket round-trip timeout in seconds",
+    )
+    notify.add_argument("--control-socket", type=Path)
     args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
     exit_code = asyncio.run(_main_async(args))
@@ -49,6 +66,8 @@ async def _main_async(args: argparse.Namespace) -> int:
         return 0
     if args.command == "trigger-job":
         return await _trigger_job(args)
+    if args.command == "notify-route":
+        return await _notify_route(args)
     raise ValueError(f"unknown command {args.command!r}")
 
 
@@ -99,6 +118,45 @@ async def _trigger_job(args: argparse.Namespace) -> int:
     return 1
 
 
+async def _notify_route(args: argparse.Namespace) -> int:
+    try:
+        router_config = load_router_config(args.config)
+        socket_path = (args.control_socket or router_config.control_socket_path).expanduser()
+        client_timeout = getattr(args, "client_timeout", DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS)
+        if client_timeout is not None and client_timeout < 0:
+            raise ValueError("--client-timeout must be non-negative")
+        raw_payload = json.loads(args.payload_file.read_text(encoding="utf-8"))
+        payload = canonicalize_notification_payload(
+            raw_payload,
+            max_bytes=router_config.control.max_notification_payload_bytes,
+        )
+        response = await notify_route_via_control_socket(
+            socket_path,
+            args.notification_id,
+            payload=payload.value,
+            idempotency_key=args.idempotency_key,
+            timeout=args.timeout,
+            client_timeout=client_timeout,
+        )
+    except (json.JSONDecodeError, NotificationPayloadError, OSError, ValueError) as exc:
+        logging.error("notify-route failed: %s", exc.__class__.__name__)
+        logging.debug("notify-route failure details", exc_info=True)
+        return 1
+    except Exception as exc:
+        logging.error("notify-route failed: %s", exc.__class__.__name__)
+        logging.debug("notify-route failure details", exc_info=True)
+        return 1
+    print(json.dumps(response, sort_keys=True))
+    if response.get("status") in {
+        TurnOutcomeStatus.DELIVERED.value,
+        TurnOutcomeStatus.DEDUPED.value,
+        TurnOutcomeStatus.BUSY.value,
+        TurnOutcomeStatus.SKIPPED.value,
+    }:
+        return 0
+    return 1
+
+
 async def trigger_job_via_control_socket(
     socket_path: Path,
     job_id: str,
@@ -108,17 +166,47 @@ async def trigger_job_via_control_socket(
     timeout: float | None = None,
     client_timeout: float | None = DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
+    request: dict[str, Any] = {"command": "trigger_job", "job_id": job_id}
+    if scheduled_at is not None:
+        request["scheduled_at"] = scheduled_at
+    if idempotency_key is not None:
+        request["idempotency_key"] = idempotency_key
+    if timeout is not None:
+        request["timeout"] = timeout
+    return await _control_round_trip(socket_path, request, client_timeout=client_timeout)
+
+
+async def notify_route_via_control_socket(
+    socket_path: Path,
+    notification_id: str,
+    *,
+    payload: dict[str, Any] | list[Any],
+    idempotency_key: str | None = None,
+    timeout: float | None = None,
+    client_timeout: float | None = DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "command": "notify_route",
+        "notification_id": notification_id,
+        "payload": payload,
+    }
+    if idempotency_key is not None:
+        request["idempotency_key"] = idempotency_key
+    if timeout is not None:
+        request["timeout"] = timeout
+    return await _control_round_trip(socket_path, request, client_timeout=client_timeout)
+
+
+async def _control_round_trip(
+    socket_path: Path,
+    request: dict[str, Any],
+    *,
+    client_timeout: float | None = DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
     async def round_trip() -> dict[str, Any]:
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
-        request: dict[str, Any] = {"command": "trigger_job", "job_id": job_id}
-        if scheduled_at is not None:
-            request["scheduled_at"] = scheduled_at
-        if idempotency_key is not None:
-            request["idempotency_key"] = idempotency_key
-        if timeout is not None:
-            request["timeout"] = timeout
         try:
-            writer.write(json.dumps(request, sort_keys=True).encode("utf-8") + b"\n")
+            writer.write(encode_control_message(request))
             await writer.drain()
             line = await reader.readline()
         finally:

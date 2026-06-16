@@ -53,8 +53,8 @@ from the router's perspective and is not created or chmodded by the router.
   (`signal_hermes_router.sessions`).
 - `router.control.socket_path` (default `router.work_root / "control.sock"`
   when control is enabled and no explicit path is set) - local Unix socket
-  used by `signal-hermes-router trigger-job` to ask the running router to
-  inject a configured scheduled synthetic turn.
+  used by `signal-hermes-router trigger-job` and `notify-route` to ask the
+  running router to inject a configured synthetic turn.
 - `router.signal_attachment_root` (default
   `~/.local/share/signal-cli/attachments`) - read-only path used to resolve
   signal-cli events that reference an attachment by ID instead of carrying
@@ -121,9 +121,10 @@ Required keys are listed first; optional keys carry their defaults.
   [session policy](#session-policies) values.
 - `state` (optional, default `shadow`) - one of the [route state](#route-states)
   values.
-- `name` (optional) - stable private selector used by `scheduled_jobs`.
+- `name` (optional) - stable private selector used by `scheduled_jobs` and
+  `notifications`.
   Must match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` and be unique when present.
-  Do not use `friendly_name` for scheduler selection.
+  Do not use `friendly_name` for synthetic route selection.
 - `route_context` (optional, default `{}`) - JSON-serialisable mapping of
   private route metadata. Only the code-controlled prompt-safe keys are sent
   to Hermes; the rest stay in `routes.yaml`. See [route context](route-context.md).
@@ -180,12 +181,43 @@ Scheduled turns use the selected route's state gate and session policy. A
 messages; a `persistent_sender` scheduled turn is keyed to a synthetic sender
 for that job; an `ephemeral` scheduled turn gets a fresh session.
 
+## External route notifications
+
+`notifications` is a top-level list in `routes.yaml`. A notification is trusted
+deployment config for a local script that already has a structured result to
+report. Scripts pass only a configured notification ID and a bounded JSON
+payload to the router; they do not send Signal, choose raw Signal targets, or
+start Hermes sessions themselves.
+
+```yaml
+notifications:
+  - id: "backup-report"
+    route: "agenda-route"
+    prompt: "Summarize the notification payload for this route."
+    description: "Optional operator note, not sent to Hermes."
+```
+
+Notification keys:
+
+- `id` (required) - safe token used by `notify-route`. Must match
+  `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` and be unique within `notifications`.
+- `route` (required) - a configured route `name`.
+- `prompt` (required) - trusted notification prompt text from private
+  deployment config. Empty prompts are rejected.
+- `description` (optional) - operator note. It is not sent to Hermes.
+- `permissions` (optional) - static ACP permission allowlist for this one
+  notification turn. When omitted, the route's normal `permissions` apply.
+
+Notification payloads must be JSON objects or arrays. The CLI and router both
+canonicalize the payload to compact JSON with sorted object keys before
+applying `router.control.max_notification_payload_bytes`.
+
 ## Router control socket
 
 `router.control` is disabled by default. When enabled, the running router
-serves a local Unix socket and accepts one JSON-lines command, `trigger_job`.
-The CLI uses that socket; it does not send Signal, start Hermes, or call ACP on
-its own.
+serves a local Unix socket and accepts JSON-lines control commands. The CLI
+uses that socket; it does not send Signal, start Hermes, or call ACP on its
+own.
 
 ```yaml
 router:
@@ -196,6 +228,8 @@ router:
     socket_path: "./private/work/control.sock"
     # 0 means acquire-or-return-busy immediately.
     route_lock_timeout_seconds: 0
+    # Compact JSON bytes after canonicalization. Default: 16384.
+    max_notification_payload_bytes: 16384
 ```
 
 The socket path must be under `router.work_root`. The socket parent is created
@@ -211,17 +245,27 @@ Use `trigger-job` from a host scheduler:
 signal-hermes-router --config /path/to/private/config.yaml trigger-job daily-agenda --scheduled-at 1714521600000 --idempotency-key daily-agenda-1714521600000
 ```
 
+Use `notify-route` from a local script:
+
+```bash
+signal-hermes-router --config /path/to/private/config.yaml notify-route backup-report --payload-file /path/to/private/payload.json --idempotency-key backup-report-1714521600000
+```
+
 `--scheduled-at` accepts either an epoch millisecond integer or a timezone-aware
 ISO 8601 timestamp. Naive datetimes are rejected. `--idempotency-key` is hashed
 before it is used in the dedupe identity. Reusing the same `--scheduled-at` or
 the same idempotency key dedupes repeated timer attempts for the same job fire.
 `--client-timeout` bounds the local control socket round trip and defaults to
-300 seconds.
+300 seconds. `notify-route` reads `--payload-file` as UTF-8 JSON, rejects
+non-object and non-array payloads, and applies the configured compact JSON byte
+limit before writing to the socket. The router repeats that validation and
+returns a JSON `payload_too_large` error for marginally over-limit requests
+that fit inside the control request headroom.
 
 CLI exit status is zero for `delivered`, `deduped`, `busy`, and expected
 `skipped` outcomes such as shadow or disabled routes. It is non-zero for an
-unavailable socket, malformed request or response, unknown job, config parse
-error, or router-reported `error`.
+unavailable socket, malformed request or response, unknown synthetic ID, config
+parse error, or router-reported `error`.
 
 ## Runtime size limits
 

@@ -23,5 +23,7 @@ router:
     enabled: false
     # Defaults to ./private/work/control.sock when enabled.
     socket_path: "./private/work/control.sock"
-    # 0 means trigger-job returns busy immediately if the route is in flight.
+    # 0 means synthetic control commands return busy immediately if the route is in flight.
     route_lock_timeout_seconds: 0
+    # Compact JSON bytes for notify-route payloads after canonicalization.
+    max_notification_payload_bytes: 16384

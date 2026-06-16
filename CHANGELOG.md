@@ -39,6 +39,7 @@
 - Shred unrouteable Signal events before parsing, dedupe, media storage, or ACP delivery.
 - Route explicitly allowlisted Signal direct messages to Hermes profiles.
 - Trigger scheduled synthetic route turns through the router-owned control socket.
+- Send configured external route notifications through the router-owned control socket.
 
 ## [0.1.1](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.0...v0.1.1) (2026-05-20)
 
