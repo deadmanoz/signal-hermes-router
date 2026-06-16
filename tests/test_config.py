@@ -652,6 +652,23 @@ router:
                 }
             )
 
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "finite JSON serializable",
+                ),
+            ):
+                parse_route(
+                    {
+                        "platform": "signal",
+                        "group_id": "GROUP",
+                        "profile": "profile",
+                        "route_context": {"purpose": value},
+                    }
+                )
+
     def test_profile_names_reject_path_shapes(self) -> None:
         for value in (
             None,

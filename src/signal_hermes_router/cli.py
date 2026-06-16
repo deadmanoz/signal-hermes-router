@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from .config import load_app_config, load_router_config
+from .config import DEFAULT_MAX_NOTIFICATION_PAYLOAD_BYTES, load_app_config, load_router_config
 from .models import TurnOutcomeStatus
 from .payloads import (
     NotificationPayloadError,
@@ -120,15 +120,20 @@ async def _trigger_job(args: argparse.Namespace) -> int:
 
 async def _notify_route(args: argparse.Namespace) -> int:
     try:
-        router_config = load_router_config(args.config)
-        socket_path = (args.control_socket or router_config.control_socket_path).expanduser()
+        if args.control_socket is not None:
+            socket_path = args.control_socket.expanduser()
+            max_payload_bytes = DEFAULT_MAX_NOTIFICATION_PAYLOAD_BYTES
+        else:
+            router_config = load_router_config(args.config)
+            socket_path = router_config.control_socket_path.expanduser()
+            max_payload_bytes = router_config.control.max_notification_payload_bytes
         client_timeout = getattr(args, "client_timeout", DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS)
         if client_timeout is not None and client_timeout < 0:
             raise ValueError("--client-timeout must be non-negative")
         raw_payload = json.loads(args.payload_file.read_text(encoding="utf-8"))
         payload = canonicalize_notification_payload(
             raw_payload,
-            max_bytes=router_config.control.max_notification_payload_bytes,
+            max_bytes=max_payload_bytes,
         )
         response = await notify_route_via_control_socket(
             socket_path,

@@ -370,6 +370,36 @@ router:
             )
             self.assertIn('"status": "busy"', printed.call_args.args[0])
 
+            override_args = argparse.Namespace(
+                config=Path(tmp) / "missing-config.yaml",
+                control_socket=Path("override/control.sock"),
+                notification_id="backup-report",
+                payload_file=payload_file,
+                idempotency_key=None,
+                timeout=None,
+                client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+            )
+            with (
+                patch.object(cli_module, "load_router_config", side_effect=AssertionError),
+                patch.object(
+                    cli_module,
+                    "notify_route_via_control_socket",
+                    AsyncMock(return_value={"status": "delivered"}),
+                ) as notify,
+                patch("builtins.print"),
+            ):
+                code = await cli_module._notify_route(override_args)
+
+            self.assertEqual(code, 0)
+            notify.assert_awaited_once_with(
+                Path("override/control.sock"),
+                "backup-report",
+                payload={"b": 2, "a": 1},
+                idempotency_key=None,
+                timeout=None,
+                client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+            )
+
             payload_file.write_text('{"a":"' + "x" * 57 + '"}', encoding="utf-8")
             with (
                 patch.object(cli_module, "notify_route_via_control_socket", AsyncMock()) as notify,

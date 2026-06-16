@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -11,6 +10,7 @@ from typing import Any, TypeVar
 from urllib.parse import urlparse
 
 from .models import ChatType, NormalizedEvent, RouteState, SessionPolicy, SyntheticTurnKind
+from .payloads import compact_json_dumps
 from .permissions import StaticPermissionPolicy
 from .secrets import resolve_secret_refs
 
@@ -459,9 +459,9 @@ def parse_route(raw: dict[str, Any]) -> Route:
         raise ValueError("route permission policy is allowlist-only; denylists are not supported")
     route_context = dict(raw.get("route_context") or {})
     try:
-        json.dumps(route_context, sort_keys=True)
-    except TypeError as exc:
-        raise ValueError("route_context must be JSON serializable") from exc
+        compact_json_dumps(route_context)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("route_context must be finite JSON serializable") from exc
     chat_type = ChatType(raw.get("chat_type", ChatType.GROUP))
     platform = str(raw["platform"])
     route_name = raw.get("name")
