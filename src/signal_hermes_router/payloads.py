@@ -33,7 +33,7 @@ def encode_control_message(value: dict[str, Any]) -> bytes:
 def canonicalize_notification_payload(
     value: Any,
     *,
-    max_bytes: int,
+    max_bytes: int | None,
 ) -> CanonicalNotificationPayload:
     if not isinstance(value, (dict, list)):
         raise NotificationPayloadError(
@@ -48,7 +48,7 @@ def canonicalize_notification_payload(
             "notification payload must be canonical JSON",
         ) from exc
     encoded = text.encode("utf-8")
-    if len(encoded) > max_bytes:
+    if max_bytes is not None and len(encoded) > max_bytes:
         raise NotificationPayloadError(
             "payload_too_large",
             f"notification payload exceeds {max_bytes} bytes after canonical JSON compaction",

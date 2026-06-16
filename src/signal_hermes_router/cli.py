@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from .config import DEFAULT_MAX_NOTIFICATION_PAYLOAD_BYTES, load_app_config, load_router_config
+from .config import load_app_config, load_router_config
 from .models import TurnOutcomeStatus
 from .payloads import (
     NotificationPayloadError,
@@ -122,7 +122,7 @@ async def _notify_route(args: argparse.Namespace) -> int:
     try:
         if args.control_socket is not None:
             socket_path = args.control_socket.expanduser()
-            max_payload_bytes = DEFAULT_MAX_NOTIFICATION_PAYLOAD_BYTES
+            max_payload_bytes = None
         else:
             router_config = load_router_config(args.config)
             socket_path = router_config.control_socket_path.expanduser()

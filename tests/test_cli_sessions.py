@@ -12,7 +12,12 @@ from unittest.mock import AsyncMock
 
 from signal_hermes_router import cli as cli_module
 from signal_hermes_router import sessions as sessions_module
-from signal_hermes_router.config import AppConfig, Route, RouterConfig
+from signal_hermes_router.config import (
+    DEFAULT_MAX_NOTIFICATION_PAYLOAD_BYTES,
+    AppConfig,
+    Route,
+    RouterConfig,
+)
 from signal_hermes_router.models import RouteState, SessionKeyInput, SessionPolicy
 from signal_hermes_router.permissions import StaticPermissionPolicy
 from signal_hermes_router.sessions import ProfileSupervisor, RoutedSession, SessionRegistry
@@ -399,6 +404,22 @@ router:
                 timeout=None,
                 client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
             )
+
+            large_value = "x" * (DEFAULT_MAX_NOTIFICATION_PAYLOAD_BYTES + 1)
+            payload_file.write_text(json.dumps({"a": large_value}), encoding="utf-8")
+            with (
+                patch.object(cli_module, "load_router_config", side_effect=AssertionError),
+                patch.object(
+                    cli_module,
+                    "notify_route_via_control_socket",
+                    AsyncMock(return_value={"status": "delivered"}),
+                ) as notify,
+                patch("builtins.print"),
+            ):
+                code = await cli_module._notify_route(override_args)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(notify.await_args.kwargs["payload"], {"a": large_value})
 
             payload_file.write_text('{"a":"' + "x" * 57 + '"}', encoding="utf-8")
             with (

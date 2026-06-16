@@ -1031,6 +1031,21 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     b'{"command":"trigger_job","job_id":"daily-agenda","timeout":-1}\n',
                     "invalid_timeout",
                 ),
+                (
+                    b'{"command":"notify_route","notification_id":"backup-report",'
+                    b'"payload":{"status":"ok"},"timeout":"nan"}\n',
+                    "invalid_timeout",
+                ),
+                (
+                    b'{"command":"notify_route","notification_id":"backup-report",'
+                    b'"payload":{"status":"ok"},"timeout":"inf"}\n',
+                    "invalid_timeout",
+                ),
+                (
+                    b'{"command":"notify_route","notification_id":"backup-report",'
+                    b'"payload":{"status":"ok"},"timeout":"-inf"}\n',
+                    "invalid_timeout",
+                ),
             )
             for payload, error in cases:
                 with self.subTest(error=error):

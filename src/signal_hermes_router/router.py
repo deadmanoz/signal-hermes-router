@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import socket
 import stat
 import time
@@ -977,7 +978,7 @@ def _parse_control_timeout(value: Any) -> tuple[float | None, str | None]:
         timeout = float(value)
     except (TypeError, ValueError):
         return None, "invalid_timeout"
-    if timeout < 0:
+    if not math.isfinite(timeout) or timeout < 0:
         return None, "invalid_timeout"
     return timeout, None
 
