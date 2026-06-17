@@ -15,11 +15,18 @@ from typing import Any
 from . import __version__
 from .models import TurnResult
 from .permissions import StaticPermissionPolicy
+from .preflight import (
+    PreflightProbeUnavailable,
+    ToolSurface,
+    tool_surface_from_agent_capabilities,
+    tool_surface_from_value,
+)
 from .private_fs import ensure_private_dir_tree
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_MAX_ACP_LINE_BYTES = 8 * 1024 * 1024
 DEFAULT_ACP_PROMPT_TIMEOUT_SECONDS = 300.0
+DEFAULT_ACP_TOOL_SURFACE_TIMEOUT_SECONDS = 30.0
 
 
 class JsonRpcError(RuntimeError):
@@ -98,12 +105,12 @@ class JsonRpcStdioPeer:
 
     async def request(
         self, method: str, params: dict[str, Any] | None = None, *, timeout: float = 300.0
-    ) -> dict[str, Any]:
+    ) -> Any:
         if not self.process or not self.process.stdin:
             raise RuntimeError("JSON-RPC peer is not started")
         request_id = next(self._ids)
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        future: asyncio.Future[Any] = loop.create_future()
         self._pending[request_id] = future
         payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
         try:
@@ -169,7 +176,7 @@ class JsonRpcStdioPeer:
         if "error" in payload:
             future.set_exception(JsonRpcError(payload["error"]))
         else:
-            future.set_result(payload.get("result") or {})
+            future.set_result(payload["result"] if "result" in payload else {})
 
     async def _handle_request(self, payload: dict[str, Any]) -> None:
         assert self.process and self.process.stdin
@@ -290,6 +297,26 @@ class ACPProfile:
         )
         self.peer.subscribe_session(session_id)
         return True
+
+    async def tool_surface(self) -> ToolSurface:
+        surface = tool_surface_from_agent_capabilities(self.profile, self.agent_capabilities)
+        if surface is not None:
+            return surface
+        if self.peer is None:
+            raise PreflightProbeUnavailable("probe_not_started")
+        try:
+            result = await self.peer.request(
+                "_tool_surface/list",
+                timeout=DEFAULT_ACP_TOOL_SURFACE_TIMEOUT_SECONDS,
+            )
+        except JsonRpcError as exc:
+            if exc.error.get("code") == -32601:
+                raise PreflightProbeUnavailable("probe_unsupported") from exc
+            raise
+        surface = tool_surface_from_value(self.profile, result, source="_tool_surface/list")
+        if surface is None:
+            raise PreflightProbeUnavailable("probe_empty")
+        return surface
 
     def set_permission_policy(self, session_id: str, policy: StaticPermissionPolicy) -> None:
         self.permission_policies[session_id] = policy

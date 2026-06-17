@@ -32,6 +32,7 @@ from signal_hermes_router.models import (
 )
 from signal_hermes_router.payloads import canonicalize_notification_payload, encode_control_message
 from signal_hermes_router.permissions import StaticPermissionPolicy
+from signal_hermes_router.preflight import ToolSurface
 from signal_hermes_router.router import SignalHermesRouter
 from tests.support import FakeProfile, FakeSignal, FakeSupervisor, make_app, make_event
 
@@ -920,6 +921,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 profile="profile",
                 session_policy=SessionPolicy.PERSISTENT_ROUTE,
                 state=RouteState.ACTIVE,
+                permission_policy=StaticPermissionPolicy.from_config([{"tool": "read_file"}]),
             )
             signal = FakeSignal()
             profile = FakeProfile()
@@ -949,6 +951,23 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 await router._handle_control_line(b'{"command":"missing"}\n'),
                 {"status": "error", "error": "unknown_command"},
             )
+            preflight = await router._handle_control_line(
+                b'{"command":"preflight_permissions","scope":{"active_only":true}}\n'
+            )
+            self.assertEqual(preflight["status"], "failed")
+            self.assertEqual(preflight["expected_permissions_count"], 1)
+            self.assertEqual(
+                preflight["probe_errors"],
+                [
+                    {
+                        "profile": "profile",
+                        "code": "probe_unsupported",
+                        "error": "probe_unsupported",
+                    }
+                ],
+            )
+            self.assertEqual(preflight["issues"][0]["code"], "probe_unsupported")
+            self.assertNotIn("group", json.dumps(preflight, sort_keys=True))
             response = await router._handle_control_line(
                 b'{"command":"trigger_job","job_id":"daily-agenda","scheduled_at":1000}\n'
             )
@@ -968,6 +987,121 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response["synthetic_id"], "backup-report")
             self.assertEqual(response["synthetic_kind"], "notification")
             self.assertEqual(signal.sends, [("group", "reply"), ("group", "reply")])
+
+    async def test_control_preflight_uses_profile_tool_surface(self) -> None:
+        class ToolSurfaceProfile(FakeProfile):
+            async def tool_surface(self) -> ToolSurface:
+                return ToolSurface.from_names(self.profile, ["read_file"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="EXAMPLE_GROUP",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                permission_policy=StaticPermissionPolicy.from_config(
+                    [{"tool": "read_file"}, {"tool": "web_search"}]
+                ),
+            )
+            profile = ToolSurfaceProfile()
+            app = make_synthetic_app(tmp, route)
+            router = SignalHermesRouter(
+                app,
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            response = await router._handle_control_line(
+                b'{"command":"preflight_permissions","scope":{"active_only":true}}\n'
+            )
+
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(response["probe_errors"], [])
+        self.assertEqual(response["missing_tools_count"], 1)
+        self.assertEqual(response["missing_tools"][0]["tool"], "web_search")
+        self.assertEqual(response["issues"][0]["code"], "missing_tool")
+        self.assertNotIn("EXAMPLE_GROUP", json.dumps(response, sort_keys=True))
+
+    async def test_control_preflight_reports_busy_profile_without_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="EXAMPLE_GROUP",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                permission_policy=StaticPermissionPolicy.from_config([{"tool": "read_file"}]),
+            )
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            lock = router._profile_lock("profile")
+            await lock.acquire()
+            try:
+                response = await router._handle_control_line(
+                    b'{"command":"preflight_permissions","scope":{"active_only":true}}\n'
+                )
+            finally:
+                lock.release()
+
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(
+            response["probe_errors"],
+            [
+                {
+                    "profile": "profile",
+                    "code": "probe_profile_busy",
+                    "error": "probe_profile_busy",
+                }
+            ],
+        )
+        self.assertEqual(response["issues"][0]["code"], "probe_profile_busy")
+
+    async def test_control_preflight_reports_supervisor_probe_failure_without_leaking(
+        self,
+    ) -> None:
+        class FailingSupervisor:
+            async def get_profile(self, _route: Route) -> FakeProfile:
+                raise RuntimeError("private-startup-token")
+
+            async def close(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="EXAMPLE_GROUP",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                permission_policy=StaticPermissionPolicy.from_config([{"tool": "read_file"}]),
+            )
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FailingSupervisor(),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            response = await router._handle_control_line(
+                b'{"command":"preflight_permissions","scope":{"active_only":true}}\n'
+            )
+
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(
+            response["probe_errors"],
+            [{"profile": "profile", "code": "probe_failed", "error": "RuntimeError"}],
+        )
+        self.assertEqual(response["issues"][0]["code"], "probe_failed")
+        self.assertNotIn("private-startup-token", json.dumps(response, sort_keys=True))
 
     async def test_control_line_rejects_invalid_request_fields_and_reports_exceptions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1045,6 +1179,10 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     b'{"command":"notify_route","notification_id":"backup-report",'
                     b'"payload":{"status":"ok"},"timeout":"-inf"}\n',
                     "invalid_timeout",
+                ),
+                (
+                    b'{"command":"preflight_permissions","scope":{"active_only":"yes"}}\n',
+                    "invalid_preflight_scope",
                 ),
             )
             for payload, error in cases:

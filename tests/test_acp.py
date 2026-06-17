@@ -19,6 +19,7 @@ from signal_hermes_router.acp import (
     default_hermes_command,
 )
 from signal_hermes_router.permissions import StaticPermissionPolicy
+from signal_hermes_router.preflight import PreflightProbeUnavailable
 from signal_hermes_router.sessions import SessionRegistry
 from tests.support import file_mode, read_file_allow_policy, started_acp_profile
 
@@ -185,6 +186,103 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client_info, {"name": "signal-hermes-router", "version": __version__})
         self.assertTrue(instances[0].closed)
 
+    async def test_acp_profile_tool_surface_reads_agent_capabilities_meta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = ACPProfile(profile="synthetic", work_root=Path(tmp))
+            profile.agent_capabilities = {
+                "_meta": {
+                    "toolSurface": {
+                        "tools": [
+                            "read_file",
+                            {"function": {"name": "web_search"}},
+                        ]
+                    }
+                }
+            }
+
+            surface = await profile.tool_surface()
+
+        self.assertEqual(surface.profile, "synthetic")
+        self.assertEqual(surface.tool_names, frozenset({"read_file", "web_search"}))
+        self.assertEqual(surface.source, "agent_capabilities_meta")
+
+    async def test_acp_profile_tool_surface_uses_optional_json_rpc_method(self) -> None:
+        class ToolSurfacePeer:
+            def __init__(self) -> None:
+                self.requests: list[tuple[str, float | None]] = []
+
+            async def request(self, method: str, *args, **kwargs):
+                self.requests.append((method, kwargs.get("timeout")))
+                return {"tools": [{"name": "read_file"}]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            peer = ToolSurfacePeer()
+            profile = ACPProfile(profile="synthetic", work_root=Path(tmp))
+            profile.peer = peer  # type: ignore[assignment]
+
+            surface = await profile.tool_surface()
+
+        self.assertEqual(surface.tool_names, frozenset({"read_file"}))
+        self.assertEqual(surface.source, "_tool_surface/list")
+        self.assertEqual(peer.requests, [("_tool_surface/list", 30.0)])
+
+    async def test_acp_profile_tool_surface_reports_unsupported_optional_method(self) -> None:
+        class UnsupportedPeer:
+            async def request(self, *_args, **_kwargs):
+                raise JsonRpcError({"code": -32601, "message": "method not found"})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = ACPProfile(profile="synthetic", work_root=Path(tmp))
+            profile.peer = UnsupportedPeer()  # type: ignore[assignment]
+
+            with self.assertRaisesRegex(PreflightProbeUnavailable, "probe_unsupported"):
+                await profile.tool_surface()
+
+    async def test_acp_profile_tool_surface_propagates_json_rpc_probe_errors(self) -> None:
+        class FailingPeer:
+            async def request(self, *_args, **_kwargs):
+                raise JsonRpcError({"code": -32603, "message": "internal error"})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = ACPProfile(profile="synthetic", work_root=Path(tmp))
+            profile.peer = FailingPeer()  # type: ignore[assignment]
+
+            with self.assertRaises(JsonRpcError):
+                await profile.tool_surface()
+
+    async def test_acp_profile_tool_surface_reports_not_started(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = ACPProfile(profile="synthetic", work_root=Path(tmp))
+
+            with self.assertRaisesRegex(PreflightProbeUnavailable, "probe_not_started"):
+                await profile.tool_surface()
+
+    async def test_acp_profile_tool_surface_reports_empty_probe_result(self) -> None:
+        class EmptyPeer:
+            async def request(self, *_args, **_kwargs):
+                return {"unexpected": "shape"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = ACPProfile(profile="synthetic", work_root=Path(tmp))
+            profile.peer = EmptyPeer()  # type: ignore[assignment]
+
+            with self.assertRaisesRegex(PreflightProbeUnavailable, "probe_empty"):
+                await profile.tool_surface()
+
+    async def test_acp_profile_tool_surface_accepts_explicit_empty_surface(self) -> None:
+        class EmptySurfacePeer:
+            async def request(self, *_args, **_kwargs):
+                return {"tools": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = ACPProfile(profile="synthetic", work_root=Path(tmp))
+            profile.peer = EmptySurfacePeer()  # type: ignore[assignment]
+
+            surface = await profile.tool_surface()
+
+        self.assertEqual(surface.tool_names, frozenset())
+        self.assertEqual(surface.source, "_tool_surface/list")
+
     async def test_json_rpc_timeout_cleans_pending_request(self) -> None:
         peer = JsonRpcStdioPeer(
             [
@@ -273,6 +371,15 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(JsonRpcError) as caught:
             await future
         self.assertEqual(caught.exception.error["message"], "synthetic")
+
+    async def test_json_rpc_response_preserves_falsey_result(self) -> None:
+        peer = JsonRpcStdioPeer(["unused"])
+        future = asyncio.get_running_loop().create_future()
+        peer._pending[7] = future
+
+        peer._handle_response({"jsonrpc": "2.0", "id": 7, "result": []})
+
+        self.assertEqual(await future, [])
 
     async def test_json_rpc_read_loop_routes_payloads_and_fails_pending_on_exit(self) -> None:
         stdin = FakeStdin()

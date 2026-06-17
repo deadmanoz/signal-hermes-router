@@ -17,9 +17,19 @@ from .payloads import (
     canonicalize_notification_payload,
     encode_control_message,
 )
+from .preflight import (
+    ProbeCallable,
+    PreflightScope,
+    format_preflight_report,
+    load_probe_contract,
+    parse_preflight_scope,
+    run_permission_preflight,
+    unavailable_tool_surface_probe,
+)
 from .router import SignalHermesRouter
 
 DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS = 300.0
+DEFAULT_CONTROL_RESPONSE_LIMIT_BYTES = 8 * 1024 * 1024
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -53,6 +63,23 @@ def main(argv: list[str] | None = None) -> None:
         help="local control socket round-trip timeout in seconds",
     )
     notify.add_argument("--control-socket", type=Path)
+    preflight = subparsers.add_parser(
+        "preflight-permissions",
+        help="compare route permission allowlists with ACP tool surfaces",
+    )
+    preflight.add_argument("--active-only", action="store_true")
+    preflight.add_argument("--route", action="append", default=[])
+    preflight.add_argument("--route-index", action="append", type=int, default=[])
+    preflight.add_argument("--profile", action="append", default=[])
+    preflight.add_argument("--probe-contract-file", type=Path)
+    preflight.add_argument("--json", action="store_true")
+    preflight.add_argument(
+        "--client-timeout",
+        type=float,
+        default=DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+        help="local control socket round-trip timeout in seconds",
+    )
+    preflight.add_argument("--control-socket", type=Path)
     args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
     exit_code = asyncio.run(_main_async(args))
@@ -68,6 +95,8 @@ async def _main_async(args: argparse.Namespace) -> int:
         return await _trigger_job(args)
     if args.command == "notify-route":
         return await _notify_route(args)
+    if args.command == "preflight-permissions":
+        return await _preflight_permissions(args)
     raise ValueError(f"unknown command {args.command!r}")
 
 
@@ -162,6 +191,109 @@ async def _notify_route(args: argparse.Namespace) -> int:
     return 1
 
 
+async def _preflight_permissions(args: argparse.Namespace) -> int:
+    try:
+        scope = _preflight_scope_from_args(args)
+        client_timeout = getattr(args, "client_timeout", DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS)
+        if client_timeout is not None and client_timeout < 0:
+            raise ValueError("--client-timeout must be non-negative")
+        if args.control_socket is not None:
+            if args.probe_contract_file is not None:
+                logging.warning(
+                    "--probe-contract-file is ignored when --control-socket is supplied"
+                )
+            response = await preflight_permissions_via_control_socket(
+                args.control_socket.expanduser(),
+                scope=scope,
+                client_timeout=client_timeout,
+            )
+            if args.json:
+                print(json.dumps(response, sort_keys=True))
+            else:
+                print(_format_preflight_response(response))
+            return 0 if response.get("status") == "ok" else 1
+        config = load_app_config(args.config, args.routes)
+        probe = (
+            _load_probe_contract_for_cli(args.probe_contract_file)
+            if args.probe_contract_file is not None
+            else unavailable_tool_surface_probe
+        )
+        report = await run_permission_preflight(config, probe, scope=scope)
+    except Exception as exc:
+        logging.error("preflight-permissions failed: %s", str(exc) or exc.__class__.__name__)
+        logging.debug("preflight-permissions failure details", exc_info=True)
+        return 1
+    if args.json:
+        print(json.dumps(report.to_dict(), sort_keys=True))
+    else:
+        print(format_preflight_report(report))
+    return 0 if report.ok else 1
+
+
+def _preflight_scope_from_args(args: argparse.Namespace) -> PreflightScope:
+    return parse_preflight_scope(
+        {
+            "active_only": args.active_only,
+            "route_names": args.route,
+            "route_indexes": args.route_index,
+            "profiles": args.profile,
+        }
+    )
+
+
+def _format_preflight_response(response: dict[str, Any]) -> str:
+    lines = [
+        f"Permission preflight: {response.get('status', 'unknown')}",
+        f"Profiles targeted: {len(response.get('checked_profiles') or [])}",
+        "Configured permission tool entries: "
+        f"{response.get('expected_permissions_count', len(response.get('expected_permissions') or []))}",
+        f"Missing tool entries: {response.get('missing_tools_count', len(response.get('missing_tools') or []))}",
+    ]
+    probe_errors = response.get("probe_errors") or []
+    if probe_errors:
+        lines.append("Probe errors:")
+        for error in probe_errors:
+            if not isinstance(error, dict):
+                continue
+            lines.append(f"- {error.get('profile')}: {error.get('error') or error.get('code')}")
+    scope_errors = response.get("scope_errors") or []
+    if scope_errors:
+        lines.append("Scope errors:")
+        for error in scope_errors:
+            if not isinstance(error, dict):
+                continue
+            lines.append(f"- {error.get('error') or error.get('code')}")
+    missing_tools = response.get("missing_tools") or []
+    if missing_tools:
+        lines.append("Missing tools:")
+        for tool in missing_tools:
+            if not isinstance(tool, dict):
+                continue
+            source = tool.get("source_kind")
+            if tool.get("source_id") is not None:
+                source = f"{source}:{tool['source_id']}"
+            lines.append(
+                f"- {tool.get('route_ref')} {tool.get('profile')} {source} {tool.get('tool')}"
+            )
+    return "\n".join(lines)
+
+
+def _load_probe_contract_for_cli(path: Path) -> ProbeCallable:
+    try:
+        return load_probe_contract(path)
+    except FileNotFoundError as exc:
+        raise ValueError(f"probe contract file not found: {path}") from exc
+    except OSError as exc:
+        detail = exc.strerror or str(exc) or exc.__class__.__name__
+        raise ValueError(f"probe contract file could not be read: {path}: {detail}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"probe contract file is invalid JSON: {path}: line {exc.lineno} column {exc.colno}"
+        ) from exc
+    except ValueError as exc:
+        raise ValueError(f"probe contract file is invalid: {path}: {exc}") from exc
+
+
 async def trigger_job_via_control_socket(
     socket_path: Path,
     job_id: str,
@@ -202,18 +334,41 @@ async def notify_route_via_control_socket(
     return await _control_round_trip(socket_path, request, client_timeout=client_timeout)
 
 
+async def preflight_permissions_via_control_socket(
+    socket_path: Path,
+    *,
+    scope: PreflightScope,
+    client_timeout: float | None = DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "command": "preflight_permissions",
+        "scope": scope.to_dict(),
+    }
+    return await _control_round_trip(socket_path, request, client_timeout=client_timeout)
+
+
 async def _control_round_trip(
     socket_path: Path,
     request: dict[str, Any],
     *,
     client_timeout: float | None = DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+    response_limit_bytes: int = DEFAULT_CONTROL_RESPONSE_LIMIT_BYTES,
 ) -> dict[str, Any]:
     async def round_trip() -> dict[str, Any]:
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        reader, writer = await asyncio.open_unix_connection(
+            str(socket_path),
+            limit=response_limit_bytes,
+        )
         try:
             writer.write(encode_control_message(request))
             await writer.drain()
-            line = await reader.readline()
+            try:
+                line = await reader.readline()
+            except ValueError as exc:
+                raise RuntimeError(
+                    "control socket response exceeded "
+                    f"{response_limit_bytes} byte client read limit"
+                ) from exc
         finally:
             writer.close()
             with suppress(Exception, asyncio.CancelledError):

@@ -42,6 +42,12 @@ from .payloads import (
     encode_control_message,
 )
 from .permissions import StaticPermissionPolicy
+from .preflight import (
+    PreflightProbeUnavailable,
+    ToolSurface,
+    parse_preflight_scope,
+    run_permission_preflight,
+)
 from .private_fs import ensure_private_dir, validate_path_component
 from .redaction import Redactor
 from .sessions import ProfileSupervisor, SessionRegistry
@@ -50,6 +56,7 @@ from .signal import SignalHttpClient
 LOGGER = logging.getLogger(__name__)
 
 SYNTHETIC_DEDUPE_TIMESTAMP_SENTINEL = 0
+PREFLIGHT_PROFILE_LOCK_TIMEOUT_SECONDS = 0.0
 _MISSING = object()
 
 
@@ -777,6 +784,8 @@ class SignalHermesRouter:
             return await self._handle_trigger_job_control(payload)
         if command == "notify_route":
             return await self._handle_notify_route_control(payload)
+        if command == "preflight_permissions":
+            return await self._handle_preflight_permissions_control(payload)
         return {"status": TurnOutcomeStatus.ERROR.value, "error": "unknown_command"}
 
     async def _handle_trigger_job_control(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -856,6 +865,52 @@ class SignalHermesRouter:
                 "error": exc.__class__.__name__,
             }
         return outcome.to_control_response()
+
+    async def _handle_preflight_permissions_control(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            scope = parse_preflight_scope(payload.get("scope"))
+        except ValueError:
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_preflight_scope"}
+        report = await run_permission_preflight(
+            self.config,
+            self._probe_profile_tool_surface,
+            scope=scope,
+        )
+        return report.to_dict()
+
+    async def _probe_profile_tool_surface(self, profile: str) -> ToolSurface:
+        route = self._representative_route_for_profile(profile)
+        if route is None:
+            raise PreflightProbeUnavailable("probe_profile_missing")
+        profile_lock = self._profile_lock(profile)
+        if not await self._acquire_route_lock(
+            profile_lock,
+            PREFLIGHT_PROFILE_LOCK_TIMEOUT_SECONDS,
+        ):
+            raise PreflightProbeUnavailable("probe_profile_busy")
+        try:
+            managed_profile = await self.supervisor.get_profile(route)
+        finally:
+            profile_lock.release()
+        # ACP request IDs let this read-only probe run alongside later turns without
+        # holding the profile lock for the full tool-surface timeout.
+        probe = getattr(managed_profile, "tool_surface", None)
+        if not callable(probe):
+            raise PreflightProbeUnavailable("probe_unsupported")
+        return await probe()
+
+    def _representative_route_for_profile(self, profile: str) -> Route | None:
+        fallback = None
+        for route in self.config.routes:
+            if route.profile != profile:
+                continue
+            if route.state == RouteState.ACTIVE:
+                return route
+            if fallback is None and route.state == RouteState.SHADOW:
+                fallback = route
+        return fallback
 
     async def _close_control_server(self) -> None:
         server = self._control_server

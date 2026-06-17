@@ -20,6 +20,7 @@ from signal_hermes_router.config import (
 )
 from signal_hermes_router.models import RouteState, SessionKeyInput, SessionPolicy
 from signal_hermes_router.permissions import StaticPermissionPolicy
+from signal_hermes_router.preflight import PreflightScope
 from signal_hermes_router.sessions import ProfileSupervisor, RoutedSession, SessionRegistry
 from tests.support import make_event, make_route
 
@@ -129,6 +130,15 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await cli_module._main_async(notify_args), 0)
         notify.assert_awaited_once_with(notify_args)
 
+        preflight_args = argparse.Namespace(command="preflight-permissions")
+        with patch.object(
+            cli_module,
+            "_preflight_permissions",
+            AsyncMock(return_value=0),
+        ) as preflight:
+            self.assertEqual(await cli_module._main_async(preflight_args), 0)
+        preflight.assert_awaited_once_with(preflight_args)
+
         with self.assertRaisesRegex(ValueError, "unknown command"):
             await cli_module._main_async(argparse.Namespace(command="unknown"))
 
@@ -220,6 +230,77 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
+    async def test_preflight_permissions_via_control_socket_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "control.sock"
+            requests: list[dict] = []
+
+            async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                requests.append(json.loads((await reader.readline()).decode("utf-8")))
+                writer.write(b'{"status":"ok","missing_tools":[]}\n')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_unix_server(handle, path=str(socket_path))
+            async with server:
+                response = await cli_module.preflight_permissions_via_control_socket(
+                    socket_path,
+                    scope=PreflightScope(
+                        active_only=True,
+                        route_names=("example-route",),
+                        route_indexes=(0,),
+                        profiles=("profile",),
+                    ),
+                    client_timeout=1.5,
+                )
+                server.close()
+                await server.wait_closed()
+
+            self.assertEqual(response, {"status": "ok", "missing_tools": []})
+            self.assertEqual(
+                requests,
+                [
+                    {
+                        "command": "preflight_permissions",
+                        "scope": {
+                            "active_only": True,
+                            "route_names": ["example-route"],
+                            "route_indexes": [0],
+                            "profiles": ["profile"],
+                        },
+                    }
+                ],
+            )
+
+    async def test_preflight_permissions_via_control_socket_accepts_large_response(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "control.sock"
+            large_text = "x" * (70 * 1024)
+
+            async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                await reader.readline()
+                writer.write(json.dumps({"status": "ok", "padding": large_text}).encode("utf-8"))
+                writer.write(b"\n")
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_unix_server(handle, path=str(socket_path))
+            async with server:
+                response = await cli_module.preflight_permissions_via_control_socket(
+                    socket_path,
+                    scope=PreflightScope(active_only=True),
+                    client_timeout=1.5,
+                )
+                server.close()
+                await server.wait_closed()
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["padding"], large_text)
+
     async def test_trigger_job_via_control_socket_rejects_bad_responses(self) -> None:
         async def run_server(body: bytes) -> Path:
             socket_path = Path(tempfile.mkdtemp()) / "control.sock"
@@ -247,6 +328,53 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
                 await cli_module.trigger_job_via_control_socket(list_socket, "daily-agenda")
         finally:
             for server in servers:
+                server.close()
+                await server.wait_closed()
+
+    async def test_control_round_trip_accepts_no_client_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "control.sock"
+
+            async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                await reader.readline()
+                writer.write(b'{"status":"ok"}\n')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_unix_server(handle, path=str(socket_path))
+            async with server:
+                response = await cli_module._control_round_trip(
+                    socket_path,
+                    {"command": "preflight_permissions"},
+                    client_timeout=None,
+                )
+                server.close()
+                await server.wait_closed()
+
+        self.assertEqual(response, {"status": "ok"})
+
+    async def test_control_round_trip_reports_response_size_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "control.sock"
+            response_body = json.dumps({"status": "ok", "padding": "x" * 256}).encode("utf-8")
+
+            async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                await reader.readline()
+                writer.write(response_body + b"\n")
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_unix_server(handle, path=str(socket_path))
+            async with server:
+                with self.assertRaisesRegex(RuntimeError, "response exceeded 64 byte"):
+                    await cli_module._control_round_trip(
+                        socket_path,
+                        {"command": "preflight_permissions"},
+                        client_timeout=1.5,
+                        response_limit_bytes=64,
+                    )
                 server.close()
                 await server.wait_closed()
 
@@ -428,6 +556,238 @@ router:
             ):
                 self.assertEqual(await cli_module._notify_route(args), 1)
             notify.assert_not_awaited()
+
+    async def test_preflight_permissions_uses_probe_contract_and_exit_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            routes = Path(tmp) / "routes.yaml"
+            contract = Path(tmp) / "probe-contract.json"
+            config.write_text("router:\n  work_root: private/work\n", encoding="utf-8")
+            routes.write_text(
+                """
+routes:
+  - name: example-route
+    platform: signal
+    group_id: private-group
+    profile: example-profile
+    state: active
+    permissions:
+      - tool: read_file
+      - tool: web_search
+""",
+                encoding="utf-8",
+            )
+            contract.write_text(
+                json.dumps({"profiles": {"example-profile": ["read_file", "web_search"]}}),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                config=config,
+                routes=routes,
+                active_only=True,
+                route=["example-route"],
+                route_index=[],
+                profile=[],
+                probe_contract_file=contract,
+                json=True,
+                control_socket=None,
+                client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+            )
+
+            with patch("builtins.print") as printed:
+                code = await cli_module._preflight_permissions(args)
+
+            self.assertEqual(code, 0)
+            report = json.loads(printed.call_args.args[0])
+            self.assertEqual(report["status"], "ok")
+            self.assertEqual(report["missing_tools"], [])
+            self.assertNotIn("private-group", printed.call_args.args[0])
+
+            contract.write_text(
+                json.dumps({"profiles": {"example-profile": ["read_file"]}}),
+                encoding="utf-8",
+            )
+            with patch("builtins.print") as printed:
+                code = await cli_module._preflight_permissions(args)
+
+            self.assertEqual(code, 1)
+            report = json.loads(printed.call_args.args[0])
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["missing_tools"][0]["tool"], "web_search")
+            self.assertNotIn("private-group", printed.call_args.args[0])
+
+            args.route_index = [-1]
+            with (
+                patch("builtins.print") as printed,
+                patch.object(cli_module.logging, "error") as logged_error,
+            ):
+                code = await cli_module._preflight_permissions(args)
+
+            self.assertEqual(code, 1)
+            printed.assert_not_called()
+            logged_error.assert_called()
+
+            args.route_index = []
+            args.client_timeout = -1
+            with (
+                patch("builtins.print") as printed,
+                patch.object(cli_module.logging, "error") as logged_error,
+            ):
+                code = await cli_module._preflight_permissions(args)
+
+            self.assertEqual(code, 1)
+            printed.assert_not_called()
+            self.assertIn("--client-timeout", logged_error.call_args.args[1])
+
+            args.client_timeout = cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS
+            args.probe_contract_file = Path(tmp) / "missing-contract.json"
+            with (
+                patch("builtins.print") as printed,
+                patch.object(cli_module.logging, "error") as logged_error,
+            ):
+                code = await cli_module._preflight_permissions(args)
+
+            self.assertEqual(code, 1)
+            printed.assert_not_called()
+            self.assertIn("probe contract file not found", logged_error.call_args.args[1])
+
+            args.probe_contract_file = contract
+            contract.write_text("{bad json", encoding="utf-8")
+            with (
+                patch("builtins.print") as printed,
+                patch.object(cli_module.logging, "error") as logged_error,
+            ):
+                code = await cli_module._preflight_permissions(args)
+
+            self.assertEqual(code, 1)
+            printed.assert_not_called()
+            self.assertIn("invalid JSON", logged_error.call_args.args[1])
+            self.assertIn("line 1 column 2", logged_error.call_args.args[1])
+
+            contract.write_text(
+                json.dumps({"profiles": {"example-profile": {"tools": ["read_file", 7]}}}),
+                encoding="utf-8",
+            )
+            with (
+                patch("builtins.print") as printed,
+                patch.object(cli_module.logging, "error") as logged_error,
+            ):
+                code = await cli_module._preflight_permissions(args)
+
+            self.assertEqual(code, 1)
+            printed.assert_not_called()
+            self.assertIn("probe contract file is invalid", logged_error.call_args.args[1])
+
+    async def test_preflight_permissions_without_probe_contract_reports_blocked_probe(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            routes = Path(tmp) / "routes.yaml"
+            config.write_text("router:\n  work_root: private/work\n", encoding="utf-8")
+            routes.write_text(
+                """
+routes:
+  - name: example-route
+    platform: signal
+    group_id: private-group
+    profile: example-profile
+    state: active
+    permissions:
+      - tool: read_file
+""",
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                config=config,
+                routes=routes,
+                active_only=True,
+                route=[],
+                route_index=[],
+                profile=[],
+                probe_contract_file=None,
+                json=True,
+                control_socket=None,
+                client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+            )
+
+            with patch("builtins.print") as printed:
+                code = await cli_module._preflight_permissions(args)
+
+        self.assertEqual(code, 1)
+        report = json.loads(printed.call_args.args[0])
+        self.assertEqual(
+            report["probe_errors"],
+            [
+                {
+                    "profile": "example-profile",
+                    "code": "probe_contract_required",
+                    "error": "probe_contract_required",
+                }
+            ],
+        )
+        self.assertEqual(report["issues"][0]["code"], "probe_contract_required")
+        self.assertNotIn("private-group", printed.call_args.args[0])
+
+    async def test_preflight_permissions_control_socket_honors_text_output(self) -> None:
+        args = argparse.Namespace(
+            config=Path("config.yaml"),
+            routes=Path("routes.yaml"),
+            active_only=True,
+            route=[],
+            route_index=[],
+            profile=[],
+            probe_contract_file=Path("ignored-contract.json"),
+            json=False,
+            control_socket=Path("control.sock"),
+            client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+        )
+        response = {
+            "status": "failed",
+            "checked_profiles": ["example-profile"],
+            "expected_permissions_count": 1,
+            "missing_tools_count": 1,
+            "missing_tools": [
+                {
+                    "route_ref": "route:example",
+                    "profile": "example-profile",
+                    "source_kind": "route",
+                    "tool": "web_search",
+                }
+            ],
+            "probe_errors": [
+                {
+                    "profile": "example-profile",
+                    "code": "probe_unsupported",
+                    "error": "probe_unsupported",
+                }
+            ],
+            "scope_errors": [
+                {
+                    "code": "scope_matched_no_routes",
+                    "error": "preflight scope did not match any route",
+                }
+            ],
+        }
+        with (
+            patch.object(
+                cli_module,
+                "preflight_permissions_via_control_socket",
+                AsyncMock(return_value=response),
+            ),
+            patch.object(cli_module.logging, "warning") as logged_warning,
+            patch("builtins.print") as printed,
+        ):
+            code = await cli_module._preflight_permissions(args)
+
+        self.assertEqual(code, 1)
+        output = printed.call_args.args[0]
+        self.assertIn("Permission preflight: failed", output)
+        self.assertIn("Profiles targeted: 1", output)
+        self.assertIn("example-profile: probe_unsupported", output)
+        self.assertIn("preflight scope did not match any route", output)
+        self.assertIn("route:example example-profile route web_search", output)
+        logged_warning.assert_called_once()
 
     async def test_trigger_job_expands_configured_control_socket_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
