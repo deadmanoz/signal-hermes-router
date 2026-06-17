@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.6...v0.1.7) (2026-06-17)
+
+
+### Features
+
+* **preflight:** validate route permission tool surfaces
+
 ## [0.1.6](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.5...v0.1.6) (2026-06-16)
 
 
