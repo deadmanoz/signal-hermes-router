@@ -372,6 +372,15 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
             await future
         self.assertEqual(caught.exception.error["message"], "synthetic")
 
+    async def test_json_rpc_response_preserves_falsey_result(self) -> None:
+        peer = JsonRpcStdioPeer(["unused"])
+        future = asyncio.get_running_loop().create_future()
+        peer._pending[7] = future
+
+        peer._handle_response({"jsonrpc": "2.0", "id": 7, "result": []})
+
+        self.assertEqual(await future, [])
+
     async def test_json_rpc_read_loop_routes_payloads_and_fails_pending_on_exit(self) -> None:
         stdin = FakeStdin()
         peer = JsonRpcStdioPeer(["unused"])

@@ -105,12 +105,12 @@ class JsonRpcStdioPeer:
 
     async def request(
         self, method: str, params: dict[str, Any] | None = None, *, timeout: float = 300.0
-    ) -> dict[str, Any]:
+    ) -> Any:
         if not self.process or not self.process.stdin:
             raise RuntimeError("JSON-RPC peer is not started")
         request_id = next(self._ids)
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        future: asyncio.Future[Any] = loop.create_future()
         self._pending[request_id] = future
         payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
         try:
@@ -176,7 +176,7 @@ class JsonRpcStdioPeer:
         if "error" in payload:
             future.set_exception(JsonRpcError(payload["error"]))
         else:
-            future.set_result(payload.get("result") or {})
+            future.set_result(payload["result"] if "result" in payload else {})
 
     async def _handle_request(self, payload: dict[str, Any]) -> None:
         assert self.process and self.process.stdin
