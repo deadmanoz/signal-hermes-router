@@ -105,12 +105,26 @@ Configured notifications use the same control socket and route-owned delivery pa
 signal-hermes-router --config /path/to/private/config.yaml notify-route backup-report --payload-file /path/to/private/payload.json --idempotency-key backup-report-1714521600000
 ```
 
+Before activating routes or changing allowlists, run a permission preflight
+against a private recorded ACP tool-surface contract or the running router:
+
+```bash
+signal-hermes-router --config /path/to/private/config.yaml --routes /path/to/private/routes.yaml preflight-permissions --active-only --probe-contract-file /path/to/private/probe-contract.json --json
+signal-hermes-router --config /path/to/private/config.yaml preflight-permissions --active-only --control-socket /path/to/private/control.sock --json
+```
+
+The control-socket form uses the running router's normal ACP supervisor. Probing
+an idle profile can start that profile's ACP subprocess, and supervisor
+cooldowns or startup failures are reported as probe errors. If a profile is
+already handling a turn when preflight starts probing it, live preflight reports
+that profile as busy instead of waiting behind the turn.
+
 ## Documentation
 
 - [docs/configuration.md](docs/configuration.md) - config schema, secret resolvers, route states, session policies
 - [docs/deployment.md](docs/deployment.md) - generic code sync procedure for private deployments
 - [docs/route-context.md](docs/route-context.md) - prompt-safe context keys, nonce delimiter, escaping
-- [docs/permissions.md](docs/permissions.md) - what the static ACP permission handler is (and isn't)
+- [docs/permissions.md](docs/permissions.md) - what the static ACP permission handler and permission preflight are (and aren't)
 - [docs/media.md](docs/media.md) - attachment storage layout, manifests, ACP content blocks
 - [docs/scheduled-synthetic-events.md](docs/scheduled-synthetic-events.md) - router-owned scheduler and notification triggers through the local control socket
 - [docs/hermes-gateway-tradeoffs.md](docs/hermes-gateway-tradeoffs.md) - what you give up (and gain) versus the built-in Hermes Signal gateway

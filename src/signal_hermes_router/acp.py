@@ -15,11 +15,18 @@ from typing import Any
 from . import __version__
 from .models import TurnResult
 from .permissions import StaticPermissionPolicy
+from .preflight import (
+    PreflightProbeUnavailable,
+    ToolSurface,
+    tool_surface_from_agent_capabilities,
+    tool_surface_from_value,
+)
 from .private_fs import ensure_private_dir_tree
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_MAX_ACP_LINE_BYTES = 8 * 1024 * 1024
 DEFAULT_ACP_PROMPT_TIMEOUT_SECONDS = 300.0
+DEFAULT_ACP_TOOL_SURFACE_TIMEOUT_SECONDS = 30.0
 
 
 class JsonRpcError(RuntimeError):
@@ -290,6 +297,26 @@ class ACPProfile:
         )
         self.peer.subscribe_session(session_id)
         return True
+
+    async def tool_surface(self) -> ToolSurface:
+        surface = tool_surface_from_agent_capabilities(self.profile, self.agent_capabilities)
+        if surface is not None:
+            return surface
+        if self.peer is None:
+            raise PreflightProbeUnavailable("probe_not_started")
+        try:
+            result = await self.peer.request(
+                "_tool_surface/list",
+                timeout=DEFAULT_ACP_TOOL_SURFACE_TIMEOUT_SECONDS,
+            )
+        except JsonRpcError as exc:
+            if exc.error.get("code") == -32601:
+                raise PreflightProbeUnavailable("probe_unsupported") from exc
+            raise
+        surface = tool_surface_from_value(self.profile, result, source="_tool_surface/list")
+        if surface is None:
+            raise PreflightProbeUnavailable("probe_empty")
+        return surface
 
     def set_permission_policy(self, session_id: str, policy: StaticPermissionPolicy) -> None:
         self.permission_policies[session_id] = policy

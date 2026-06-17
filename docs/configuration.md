@@ -251,6 +251,19 @@ Use `notify-route` from a local script:
 signal-hermes-router --config /path/to/private/config.yaml notify-route backup-report --payload-file /path/to/private/payload.json --idempotency-key backup-report-1714521600000
 ```
 
+Use `preflight-permissions` before route activation or allowlist changes:
+
+```bash
+signal-hermes-router --config /path/to/private/config.yaml --routes /path/to/private/routes.yaml preflight-permissions --active-only --probe-contract-file /path/to/private/probe-contract.json --json
+```
+
+To inspect profiles through the running router's normal ACP supervisor, target
+the control socket instead of supplying a recorded contract:
+
+```bash
+signal-hermes-router --config /path/to/private/config.yaml preflight-permissions --active-only --control-socket /path/to/private/control.sock --json
+```
+
 `--scheduled-at` accepts either an epoch millisecond integer or a timezone-aware
 ISO 8601 timestamp. Naive datetimes are rejected. `--idempotency-key` is hashed
 before it is used in the dedupe identity. Reusing the same `--scheduled-at` or
@@ -262,10 +275,28 @@ limit before writing to the socket. The router repeats that validation and
 returns a JSON `payload_too_large` error for marginally over-limit requests
 that fit inside the control request headroom.
 
+`preflight-permissions` compares configured permission tool names against a
+recorded ACP tool-surface contract in offline mode, or against structured
+tool-surface data from profiles managed by the running router when invoked
+through the control socket. The live path uses the router's normal
+`ProfileSupervisor`, so probing an idle profile can start that profile's ACP
+subprocess and supervisor cooldowns still apply. If a profile is already
+handling a turn when preflight starts probing it, live preflight reports
+`probe_profile_busy` instead of waiting behind that turn. Live profile
+inspection reads `agentCapabilities._meta` first and then tries the optional
+JSON-RPC extension method `_tool_surface/list`. Agents that expose neither
+source report `probe_unsupported`.
+
+Reports use only `route:<name>` or `routes[<index>]` references, profile names,
+source IDs, and tool names. They do not report raw Signal IDs, direct sender
+IDs, route keys, secrets, or permission argument predicates.
+
 CLI exit status is zero for `delivered`, `deduped`, `busy`, and expected
 `skipped` outcomes such as shadow or disabled routes. It is non-zero for an
 unavailable socket, malformed request or response, unknown synthetic ID, config
 parse error, or router-reported `error`.
+For `preflight-permissions`, exit status is zero only when the report status is
+`ok`.
 
 ## Runtime size limits
 

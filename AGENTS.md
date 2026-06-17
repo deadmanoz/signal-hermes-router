@@ -4,18 +4,27 @@ Transport router that owns one Signal account and fans Signal groups out to inde
 
 ## Scope discipline
 
-The router does exactly four things, and only these four. Anything outside this scope — agent behaviour, model decisions, profile-side policy, skills, media interpretation — belongs in a Hermes profile, not here.
+The router does exactly four runtime things, and only these four. Anything outside this scope — agent behaviour, model decisions, profile-side policy, skills, media interpretation — belongs in a Hermes profile, not here.
 
 1. **Transport in** — consume Signal events from upstream `signal-cli` over HTTP/SSE, normalise, dedupe, store attachments to disk, and accept configured local synthetic turns through the private control socket.
 2. **Route** — map a Signal group to a Hermes profile; supervise one `hermes -p <profile> acp` subprocess per active profile; call `session/new` or `session/resume` per the route's session policy.
 3. **Speak ACP** — JSON-RPC over stdio: `initialize`, `session/new`, `session/resume` (when the profile advertises it), `session/prompt`, and the *required* client-side `session/request_permission` handler. The router also registers reject-all handlers for the `fs/*` and `terminal/*` client methods (matching the zero `clientCapabilities` it advertises) so capability-ignoring agents fail loudly.
 4. **Transport out** — send the agent's reply text back to Signal via `signal-cli` JSON-RPC.
 
-If a proposed change does not fall into one of those four buckets, push back before implementing.
+Operator/deployment preflight tooling is also in scope when it validates those
+router-owned runtime contracts without duplicating Hermes behaviour. Permission
+preflight may inspect configured route allowlists and compare tool names with a
+recorded or live ACP tool-surface contract, but it must not implement tools,
+skills, prompts, transcription, OCR, web search, or model policy.
+
+If a proposed runtime change does not fall into one of those four buckets, push
+back before implementing. If a proposed operator tool does not validate those
+runtime contracts, push back before implementing.
 
 ### Common misreadings to push back on
 
 - **`permissions.py` is not a security-policy authority.** It exists *only* because ACP forces the client to answer `session/request_permission` or the agent blocks. The static allowlist is the "answer ahead of time from config, don't prompt the operator over Signal mid-turn" choice. Profile safety is owned by the Hermes profile config and the pre-activation audit checklist.
+- **Permission preflight validates wiring, not capability policy.** It may report that a configured allowlist names tools missing from a profile's ACP surface. It must not infer whether a route should have a tool, invent missing tools, or inspect private argument values in public output.
 - **The route-context preamble is routing payload, not prompt engineering.** It tells the profile which route/group this turn belongs to. The prompt-safe key allowlist (`signal_hermes_router.context.PROMPT_SAFE_CONTEXT_KEYS`) is code-controlled by design — never make it config-driven.
 - **No agent behaviour.** No tool implementations, no model prompts, no skills, no transcription/OCR/summarisation. Those belong in Hermes profiles.
 
@@ -34,7 +43,7 @@ signal-cli daemon → signal.py (HTTP/SSE client)
                   → events.py (normalise to NormalizedEvent)
                   → dedupe.py (sqlite route-scoped event claims)
                   → router.py (route-state gate → media → prompt → reply)
-local automation → cli.py/control socket (trigger-job, notify-route)
+local automation → cli.py/control socket (trigger-job, notify-route, preflight-permissions)
                   → router.py (same route-state/session/reply path)
                        │
                        ├─ media.py       attachment fetch + per-route storage (write_attachment, MediaManifest)
@@ -46,7 +55,7 @@ local automation → cli.py/control socket (trigger-job, notify-route)
                             └─ signal.py     send_group (reply path)
 ```
 
-Cross-cutting: `models.py` (shared dataclasses/enums: `NormalizedEvent`, `MediaManifest`, `TurnResult`, `SessionPolicy`, `RouteState`, `SyntheticTurnKind`), `payloads.py` (compact control JSON and notification payload canonicalization), `mime.py` (content-type normalisation + extension mapping shared by `media.py` and `context.py`), `private_fs.py` (0700/0600 perm enforcement on the router-managed roots `media_root`/`work_root` and the files written under them, including the dedupe DB), `redaction.py` (log redaction), `circuit.py` (per-route circuit breaker), `secrets.py` (`file://`/`env://`/`op://`/`systemd-credential://` resolvers), `config.py`, and `cli.py`.
+Cross-cutting: `models.py` (shared dataclasses/enums: `NormalizedEvent`, `MediaManifest`, `TurnResult`, `SessionPolicy`, `RouteState`, `SyntheticTurnKind`), `payloads.py` (compact control JSON and notification payload canonicalization), `preflight.py` (permission allowlist/tool-surface reporting with safe route refs), `mime.py` (content-type normalisation + extension mapping shared by `media.py` and `context.py`), `private_fs.py` (0700/0600 perm enforcement on the router-managed roots `media_root`/`work_root` and the files written under them, including the dedupe DB), `redaction.py` (log redaction), `circuit.py` (per-route circuit breaker), `secrets.py` (`file://`/`env://`/`op://`/`systemd-credential://` resolvers), `config.py`, and `cli.py`.
 
 ## Commands
 
@@ -74,4 +83,4 @@ Conventional commits (`type(scope): description`), scope = module name (e.g. `fe
 
 ## Documentation
 
-User-facing operational docs live under [docs/](docs/). The [profile audit checklist](docs/profile-audit-checklist.md) must be filled out (in the *private* deployment repo) before a route moves to `active`.
+User-facing operational docs live under [docs/](docs/). The [profile audit checklist](docs/profile-audit-checklist.md) must be filled out (in the *private* deployment repo) before a route moves to `active`, including the permission preflight report when route allowlists or profile tool surfaces change.
