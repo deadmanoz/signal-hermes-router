@@ -15,7 +15,7 @@ from signal_hermes_router.context import (
     render_scheduled_event,
 )
 from signal_hermes_router.media import safe_filename, write_attachment
-from signal_hermes_router.models import SignalAttachment
+from signal_hermes_router.models import MediaManifest, SignalAttachment
 from tests.support import file_mode
 
 
@@ -184,7 +184,151 @@ class MediaTests(unittest.TestCase):
             blocks = build_prompt_blocks(route_context={}, user_text="", manifests=[manifest])
             self.assertIn("attachment_manifest:", blocks[1]["text"])
             self.assertNotIn("canonical_path", blocks[1]["text"])
+            self.assertNotIn("tool_path", blocks[1]["text"])
             self.assertNotIn(str(Path(tmp).resolve()), blocks[1]["text"])
+
+    def test_prompt_manifest_includes_tool_path_when_route_opts_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = write_attachment(
+                media_root=Path(tmp),
+                platform="signal",
+                timestamp=1714521600000,
+                attachment=SignalAttachment(
+                    content_type="application/pdf",
+                    filename="note.pdf",
+                    body=b"%PDF synthetic",
+                ),
+                group_ref="group_ref",
+                sender_ref="sender_ref",
+            )
+            blocks = build_prompt_blocks(
+                route_context={"attachment_tool_paths": True},
+                user_text="",
+                manifests=[manifest],
+            )
+            self.assertEqual(len(blocks), 2)
+            self.assertIn("attachment_manifest:", blocks[1]["text"])
+            self.assertIn(f"tool_path: {manifest.canonical_path}", blocks[1]["text"])
+            self.assertNotIn("canonical_path", blocks[1]["text"])
+
+    def test_prompt_image_opt_in_emits_resource_link_and_tool_path_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = write_attachment(
+                media_root=Path(tmp),
+                platform="signal",
+                timestamp=1714521600000,
+                attachment=SignalAttachment(
+                    content_type="image/png",
+                    filename="photo.png",
+                    body=b"not really png",
+                ),
+                group_ref="group_ref",
+                sender_ref="sender_ref",
+            )
+            blocks = build_prompt_blocks(
+                route_context={"attachment_tool_paths": True},
+                user_text="",
+                manifests=[manifest],
+            )
+            # route_context preamble + resource_link + tool_path manifest = 3 blocks.
+            self.assertEqual(len(blocks), 3)
+            self.assertEqual(blocks[1]["type"], "resource_link")
+            self.assertEqual(blocks[2]["type"], "text")
+            self.assertIn("attachment_manifest:", blocks[2]["text"])
+            self.assertIn(f"tool_path: {manifest.canonical_path}", blocks[2]["text"])
+            self.assertNotIn("canonical_path", blocks[2]["text"])
+
+    def test_prompt_image_without_opt_in_emits_only_resource_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = write_attachment(
+                media_root=Path(tmp),
+                platform="signal",
+                timestamp=1714521600000,
+                attachment=SignalAttachment(
+                    content_type="image/png",
+                    filename="photo.png",
+                    body=b"not really png",
+                ),
+                group_ref="group_ref",
+                sender_ref="sender_ref",
+            )
+            blocks = build_prompt_blocks(route_context={}, user_text="", manifests=[manifest])
+            # route_context preamble + resource_link only; no extra manifest block.
+            self.assertEqual(len(blocks), 2)
+            self.assertEqual(blocks[1]["type"], "resource_link")
+
+    def test_prompt_missing_stored_file_with_opt_in_omits_tool_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp).resolve() / "signal" / "2024" / "05" / "deadbeef" / "gone.png"
+            manifest = MediaManifest(
+                display_filename="gone.png",
+                canonical_path=missing,
+                content_type="image/png",
+                size=4,
+                sha256="0" * 64,
+                group_ref="group_ref",
+                sender_ref="sender_ref",
+                signal_timestamp=1714521600000,
+            )
+            blocks = build_prompt_blocks(
+                route_context={"attachment_tool_paths": True},
+                user_text="",
+                manifests=[manifest],
+            )
+            # Missing stored file falls through to a manifest block (no resource_link)
+            # and must not carry tool_path.
+            self.assertEqual(len(blocks), 2)
+            self.assertEqual(blocks[1]["type"], "text")
+            self.assertIn("attachment_manifest:", blocks[1]["text"])
+            self.assertNotIn("tool_path", blocks[1]["text"])
+            self.assertNotIn("canonical_path", blocks[1]["text"])
+
+    def test_prompt_opt_in_key_never_enters_route_context_preamble(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = write_attachment(
+                media_root=Path(tmp),
+                platform="signal",
+                timestamp=1714521600000,
+                attachment=SignalAttachment(
+                    content_type="application/pdf",
+                    filename="note.pdf",
+                    body=b"%PDF synthetic",
+                ),
+                group_ref="group_ref",
+                sender_ref="sender_ref",
+            )
+            blocks = build_prompt_blocks(
+                route_context={"attachment_tool_paths": True, "purpose": "x"},
+                user_text="",
+                manifests=[manifest],
+            )
+            self.assertTrue(blocks[0]["text"].startswith("[route_context:"))
+            self.assertNotIn("attachment_tool_paths", blocks[0]["text"])
+            self.assertIn('"purpose":"x"', blocks[0]["text"])
+
+    def test_prompt_truthy_string_opt_in_does_not_expose_tool_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = write_attachment(
+                media_root=Path(tmp),
+                platform="signal",
+                timestamp=1714521600000,
+                attachment=SignalAttachment(
+                    content_type="application/pdf",
+                    filename="note.pdf",
+                    body=b"%PDF synthetic",
+                ),
+                group_ref="group_ref",
+                sender_ref="sender_ref",
+            )
+            # A quoted YAML "false" is a truthy string; strict identity must reject it.
+            blocks = build_prompt_blocks(
+                route_context={"attachment_tool_paths": "false"},
+                user_text="",
+                manifests=[manifest],
+            )
+            self.assertEqual(len(blocks), 2)
+            self.assertIn("attachment_manifest:", blocks[1]["text"])
+            self.assertNotIn("tool_path", blocks[1]["text"])
 
     def test_write_attachment_rejects_oversize_body_and_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

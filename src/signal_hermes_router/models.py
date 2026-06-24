@@ -98,8 +98,8 @@ class MediaManifest:
             "signal_timestamp": self.signal_timestamp,
         }
 
-    def to_prompt_dict(self) -> dict[str, Any]:
-        return {
+    def to_prompt_dict(self, *, include_tool_path: bool = False) -> dict[str, Any]:
+        prompt_dict: dict[str, Any] = {
             "display_filename": self.display_filename,
             "content_type": self.content_type,
             "size": self.size,
@@ -108,10 +108,16 @@ class MediaManifest:
             "sender_ref": self.sender_ref,
             "signal_timestamp": self.signal_timestamp,
         }
+        # Opt-in only: expose the router-managed stored path under tool_path so
+        # profile-side tools can operate on the exact file. The canonical_path
+        # key itself stays omitted from the prompt in every path.
+        if include_tool_path:
+            prompt_dict["tool_path"] = str(self.canonical_path)
+        return prompt_dict
 
-    def to_text(self) -> str:
+    def to_text(self, *, include_tool_path: bool = False) -> str:
         lines = ["attachment_manifest:"]
-        for key, value in self.to_prompt_dict().items():
+        for key, value in self.to_prompt_dict(include_tool_path=include_tool_path).items():
             lines.append(f"  {key}: {value}")
         return "\n".join(lines)
 

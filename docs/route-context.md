@@ -15,6 +15,19 @@ The set of prompt-visible keys is deliberately code-controlled in `signal_hermes
 
 Adding a new prompt-safe key exposes that value to the LLM prompt preamble and should be reviewed like any other prompt-injection-adjacent surface. **Do not make the prompt-safe key set deployment-configurable.**
 
+## Router-consumed switches
+
+Some `route_context` keys are read by the router to shape transport behaviour and
+are **never** serialised into the prompt preamble. They are deliberately kept out
+of `PROMPT_SAFE_CONTEXT_KEYS`.
+
+- `attachment_tool_paths` (boolean): when set to an explicit `true`, the router
+  exposes the stored attachment path as a `tool_path` field inside prompt-visible
+  attachment manifests (see [media.md](media.md)). The check is strict boolean
+  identity, so truthy non-boolean values such as the string `"false"` do **not**
+  opt in. Do not add this key to `PROMPT_SAFE_CONTEXT_KEYS`; it is router-consumed,
+  not prompt-emitted, and the key name itself never appears in the preamble.
+
 ## Nonce and escaping
 
 The nonce changes per turn (`signal_hermes_router.context.new_context_nonce`). User text is sent as a separate ACP content block, and route-context delimiter lookalikes in user text are escaped (`signal_hermes_router.context.escape_user_text`) before delivery.

@@ -64,8 +64,8 @@ def image_block(path: Path, content_type: str | None = None) -> dict[str, str]:
     }
 
 
-def manifest_block(manifest: MediaManifest) -> dict[str, str]:
-    return text_block(manifest.to_text())
+def manifest_block(manifest: MediaManifest, *, include_tool_path: bool = False) -> dict[str, str]:
+    return text_block(manifest.to_text(include_tool_path=include_tool_path))
 
 
 def build_prompt_blocks(
@@ -74,14 +74,29 @@ def build_prompt_blocks(
     user_text: str,
     manifests: list[MediaManifest] | None = None,
 ) -> list[dict[str, str]]:
+    # Router-consumed opt-in. Strict boolean identity (not bool(...)): route_context
+    # carries arbitrary JSON-serialisable values without per-key validation, so a
+    # quoted YAML value like "false" is a truthy string. Exposing the stored
+    # attachment path must require an explicit boolean true. This key is deliberately
+    # NOT in PROMPT_SAFE_CONTEXT_KEYS, so it never reaches the preamble.
+    include_tool_path = route_context.get("attachment_tool_paths") is True
     blocks: list[dict[str, str]] = [render_route_context(context_for_prompt(route_context))]
     if user_text:
         blocks.append(text_block(escape_prompt_text(user_text)))
     for manifest in manifests or []:
-        if is_image_content_type(manifest.content_type) and os.path.exists(manifest.canonical_path):
+        file_exists = os.path.exists(manifest.canonical_path)
+        if is_image_content_type(manifest.content_type) and file_exists:
             blocks.append(image_block(manifest.canonical_path, manifest.content_type))
+            # Images keep their resource_link; when opted in, also emit a manifest
+            # block carrying tool_path so profile tools get the exact stored path.
+            if include_tool_path:
+                blocks.append(manifest_block(manifest, include_tool_path=True))
         else:
-            blocks.append(manifest_block(manifest))
+            # tool_path only when opted in AND the stored file is present (a missing
+            # file has nothing to operate on).
+            blocks.append(
+                manifest_block(manifest, include_tool_path=include_tool_path and file_exists)
+            )
     return blocks
 
 
