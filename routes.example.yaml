@@ -9,6 +9,11 @@ routes:
     route_context:
       purpose: "Synthetic public example route."
       route_alias: "example"
+      # Opt-in (off by default). When set to an explicit boolean true, prompt
+      # attachment manifests expose the router-managed stored path as `tool_path`
+      # so the profile's tools can operate on the exact stored file. Router-consumed
+      # only; never serialised into the prompt preamble.
+      # attachment_tool_paths: true
     permissions:
       - tool: "read_file"
         arguments:

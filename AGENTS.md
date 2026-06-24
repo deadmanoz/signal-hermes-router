@@ -27,6 +27,7 @@ runtime contracts, push back before implementing.
 - **Permission preflight validates wiring, not capability policy.** It may report that a configured allowlist names tools missing from a profile's ACP surface. It must not infer whether a route should have a tool, invent missing tools, or inspect private argument values in public output.
 - **The route-context preamble is routing payload, not prompt engineering.** It tells the profile which route/group this turn belongs to. The prompt-safe key allowlist (`signal_hermes_router.context.PROMPT_SAFE_CONTEXT_KEYS`) is code-controlled by design — never make it config-driven.
 - **No agent behaviour.** No tool implementations, no model prompts, no skills, no transcription/OCR/summarisation. Those belong in Hermes profiles.
+- **Exposing attachment `tool_path` is transport metadata, not agent behaviour.** The opt-in `route_context.attachment_tool_paths` switch only tells the router to surface the stored file path it already manages; what a profile's tools do with that path is profile behaviour.
 
 ## Public/private boundary
 
