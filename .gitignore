@@ -21,6 +21,7 @@ dist/
 
 # Private deployment state must not be committed here.
 private/
+/*.local.md
 config.yaml
 routes.yaml
 *.db
