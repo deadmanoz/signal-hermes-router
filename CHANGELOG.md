@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.9](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.8...v0.1.9) (2026-06-24)
+
+
+### Bug Fixes
+
+* **deploy:** preserve deployment-local operator state during service-tree syncs ([#18](https://github.com/deadmanoz/signal-hermes-router/issues/18))
+
 ## [0.1.8](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.7...v0.1.8) (2026-06-24)
 
 
