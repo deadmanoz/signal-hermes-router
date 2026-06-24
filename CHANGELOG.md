@@ -53,6 +53,7 @@
 
 ### Bug Fixes
 
+- Preserve deployment-local operator notes and private artefacts during service-tree syncs.
 - Surface unknown and exception Signal shreds in logs without private payloads.
 - Preserve scheduled synthetic job dedupe and control-response compatibility while adding route notifications.
 

@@ -9,12 +9,14 @@ Sync this public source tree to a remote service directory.
 
 The remote virtualenv is deliberately protected. It may contain deployment-local
 tools such as the Hermes CLI that are not part of this package's uv.lock.
+Root-level *.local.md files and private/ are also preserved as deployment-local
+operator state.
 USAGE
 }
 
-dry_run=()
+rsync_args=(-av --delete)
 if [[ "${1:-}" == "--dry-run" ]]; then
-  dry_run=(--dry-run)
+  rsync_args+=(--dry-run)
   shift
 fi
 
@@ -38,8 +40,10 @@ fi
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
-rsync -av --delete "${dry_run[@]}" \
+rsync "${rsync_args[@]}" \
   --filter=':- .gitignore' \
+  --exclude='/*.local.md' \
+  --exclude='/private/' \
   --exclude='/.venv/' \
   --exclude='/.git/' \
   --exclude='/.claude/' \

@@ -35,6 +35,8 @@ This tree is **intentionally generic and intended to be publishable**. It must c
 
 The canonical config/route files in this repo are `config.example.yaml` and `routes.example.yaml` — edit these. Their non-example counterparts (`config.yaml`, `routes.yaml`) belong to the private deployment repo and must never be committed here.
 
+Root-level `*.local.md` files and `/private/` are deployment-local operator state. The deploy helper preserves them during `rsync --delete` source syncs, and they must not be committed.
+
 If you see a real-looking identifier in `config.example.yaml`, `routes.example.yaml`, `tests/`, or `tests/fixtures/`, treat it as a leak.
 
 ## Architecture map
