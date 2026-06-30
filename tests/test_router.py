@@ -672,6 +672,38 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.error_code, "attachment_too_large")
         self.assertFalse((app.router.media_root / ".outbound").exists())
 
+    async def test_freeze_outbound_attachment_cleans_copy_when_frozen_name_fails_validation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            app = make_synthetic_app(tmp, route)
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png.gz")
+            attachment = validate_outbound_attachments(
+                [str(image)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )[0]
+            router = SignalHermesRouter(
+                app,
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertRaises(OutboundAttachmentError) as raised:
+                router._freeze_outbound_attachments((attachment,))
+
+            self.assertEqual(raised.exception.error_code, "attachment_not_image")
+            self.assertFalse((app.router.media_root / ".outbound").exists())
+
     async def test_freeze_outbound_attachment_reports_source_removed_after_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = Route(

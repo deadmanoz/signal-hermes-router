@@ -587,18 +587,24 @@ class SignalHermesRouter:
                         f"attachment exceeds {self.config.router.max_attachment_bytes} bytes",
                     )
                 write_private_bytes(destination, body)
+                frozen.append(
+                    OutboundAttachment(
+                        path=destination.resolve(),
+                        content_type=validated.content_type,
+                        size=len(body),
+                        owned_by_router=True,
+                    )
+                )
                 frozen_validated = validate_outbound_attachments(
                     [str(destination)],
                     media_root=media_root,
                     max_bytes=self.config.router.max_attachment_bytes,
                 )[0]
-                frozen.append(
-                    OutboundAttachment(
-                        path=frozen_validated.path,
-                        content_type=frozen_validated.content_type,
-                        size=frozen_validated.size,
-                        owned_by_router=True,
-                    )
+                frozen[-1] = OutboundAttachment(
+                    path=frozen_validated.path,
+                    content_type=frozen_validated.content_type,
+                    size=frozen_validated.size,
+                    owned_by_router=True,
                 )
         except Exception:
             self._cleanup_owned_outbound_attachments(tuple(frozen))
