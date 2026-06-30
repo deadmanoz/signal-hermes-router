@@ -70,6 +70,7 @@
 - Route explicitly allowlisted Signal direct messages to Hermes profiles.
 - Trigger scheduled synthetic route turns through the router-owned control socket.
 - Send configured external route notifications through the router-owned control socket.
+- Send one router-validated image attachment with configured external route notifications.
 - Preflight route permission allowlists against recorded or live structured ACP tool surfaces.
 - Expose stored attachment paths as `tool_path` in prompt manifests when a route opts in via `route_context.attachment_tool_paths`, so profile tools can operate on the exact stored file.
 

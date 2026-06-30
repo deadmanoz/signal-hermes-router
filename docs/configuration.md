@@ -251,6 +251,13 @@ Use `notify-route` from a local script:
 signal-hermes-router --config /path/to/private/config.yaml notify-route backup-report --payload-file /path/to/private/payload.json --idempotency-key backup-report-1714521600000
 ```
 
+To include one trusted image with a configured notification, stage it under
+`router.media_root` and pass its absolute path:
+
+```bash
+signal-hermes-router --config /path/to/private/config.yaml notify-route camera-person --payload-file /path/to/private/payload.json --attachment /path/to/private/media/camera/person.png --idempotency-key camera-person-1714521600000
+```
+
 Use `preflight-permissions` before route activation or allowlist changes:
 
 ```bash
@@ -274,6 +281,16 @@ non-object and non-array payloads, and applies the configured compact JSON byte
 limit before writing to the socket. The router repeats that validation and
 returns a JSON `payload_too_large` error for marginally over-limit requests
 that fit inside the control request headroom.
+
+`notify-route --attachment` accepts one image path. The router rejects
+non-arrays from the control socket, multiple paths, non-string or relative
+paths, paths that escape `router.media_root`, missing paths, non-files,
+oversize files, and paths whose filename does not infer an `image/*` content
+type. MIME gating is filename-based through Python's `mimetypes`; stage PNG,
+JPEG, GIF, or WebP files rather than relying on magic-byte sniffing or platform
+HEIC mappings. The producer, router, and signal-cli daemon must run as the same
+UID so signal-cli can traverse the router's `0700` media tree and read the
+staged file.
 
 `preflight-permissions` compares configured permission tool names against a
 recorded ACP tool-surface contract in offline mode, or against structured
@@ -410,6 +427,11 @@ All four operational replies (`maintenance_reply`, `failure_reply`,
 `busy_notice`, and assistant replies from Hermes) flow through the same
 canary prefix and chunking pipeline as ordinary assistant text - see
 [Runtime size limits](#runtime-size-limits) above.
+
+Notification image attachments are attached only to the first Signal reply
+chunk. If Hermes returns empty text for an attachment-bearing notification, the
+router sends `Image attached.` through the same canary prefix and chunking
+pipeline.
 
 ## Inbound discard and observability
 

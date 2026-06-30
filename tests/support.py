@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import stat
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -153,15 +153,31 @@ class FakeSignal:
     def __init__(self) -> None:
         self.sends: list[tuple[str, str]] = []
         self.direct_sends: list[tuple[str, str]] = []
+        self.send_attachments: list[tuple[str, tuple[str, ...]]] = []
+        self.direct_send_attachments: list[tuple[str, tuple[str, ...]]] = []
         self.typing: list[tuple[str, bool]] = []
         self.direct_typing: list[tuple[str, bool]] = []
 
-    async def send_group(self, group_id: str, message: str) -> dict[str, int]:
+    async def send_group(
+        self,
+        group_id: str,
+        message: str,
+        *,
+        attachments: Sequence[str] = (),
+    ) -> dict[str, int]:
         self.sends.append((group_id, message))
+        self.send_attachments.append((group_id, tuple(attachments)))
         return {"timestamp": 1}
 
-    async def send_direct(self, recipient: str, message: str) -> dict[str, int]:
+    async def send_direct(
+        self,
+        recipient: str,
+        message: str,
+        *,
+        attachments: Sequence[str] = (),
+    ) -> dict[str, int]:
         self.direct_sends.append((recipient, message))
+        self.direct_send_attachments.append((recipient, tuple(attachments)))
         return {"timestamp": 1}
 
     async def send_typing(self, group_id: str, enabled: bool) -> dict[str, int]:

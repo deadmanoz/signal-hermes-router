@@ -9,6 +9,7 @@ import socket
 import stat
 import time
 import uuid
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ from .models import (
     ChatType,
     MediaManifest,
     NormalizedEvent,
+    OutboundAttachment,
     RouteState,
     SessionKeyInput,
     SessionPolicy,
@@ -35,6 +37,7 @@ from .models import (
     TurnResult,
 )
 from .outbound import chunk_for_signal_bytes, prepare_outgoing_message
+from .outbound_media import OutboundAttachmentError, validate_outbound_attachments
 from .payloads import (
     CanonicalNotificationPayload,
     NotificationPayloadError,
@@ -57,6 +60,7 @@ LOGGER = logging.getLogger(__name__)
 
 SYNTHETIC_DEDUPE_TIMESTAMP_SENTINEL = 0
 PREFLIGHT_PROFILE_LOCK_TIMEOUT_SECONDS = 0.0
+ATTACHMENT_ONLY_FALLBACK_TEXT = "Image attached."
 _MISSING = object()
 
 
@@ -72,6 +76,7 @@ class RoutedTurnInput:
     synthetic: SyntheticRouteDefinition | None = None
     synthetic_prompt: str | None = None
     synthetic_payload: CanonicalNotificationPayload | None = None
+    outbound_attachments: tuple[OutboundAttachment, ...] = ()
     scheduled_at_ms: int | None = None
     triggered_at_ms: int | None = None
     permission_policy: StaticPermissionPolicy | None = None
@@ -232,6 +237,7 @@ class SignalHermesRouter:
         notification_id: str,
         payload: CanonicalNotificationPayload,
         *,
+        outbound_attachments: tuple[OutboundAttachment, ...] = (),
         idempotency_key: str | None = None,
         route_lock_timeout: float | None = None,
     ) -> TurnOutcome:
@@ -249,6 +255,7 @@ class SignalHermesRouter:
             idempotency_key=idempotency_key,
             route_lock_timeout=route_lock_timeout,
             payload=payload,
+            outbound_attachments=outbound_attachments,
         )
 
     async def _handle_synthetic_definition(
@@ -259,6 +266,7 @@ class SignalHermesRouter:
         idempotency_key: str | None = None,
         route_lock_timeout: float | None = None,
         payload: CanonicalNotificationPayload | None = None,
+        outbound_attachments: tuple[OutboundAttachment, ...] = (),
     ) -> TurnOutcome:
         route = self.config.find_route_by_name(synthetic.route_name)
         if route is None:
@@ -275,6 +283,7 @@ class SignalHermesRouter:
             scheduled_at,
             idempotency_key,
             payload,
+            outbound_attachments,
         )
         timeout = (
             self.config.router.control.route_lock_timeout_seconds
@@ -382,7 +391,15 @@ class SignalHermesRouter:
                 # Stop the busy-notice task immediately so it cannot fire
                 # while a long chunked reply is still being sent.
                 await self._stop_busy_notice(turn_done, notice_task)
-                if result.text and not await self._send_once(route, result.text):
+                reply_text = result.text
+                outbound_attachments = turn.outbound_attachments
+                if outbound_attachments and not reply_text:
+                    reply_text = ATTACHMENT_ONLY_FALLBACK_TEXT
+                if reply_text and not await self._send_once(
+                    route,
+                    reply_text,
+                    attachments=outbound_attachments,
+                ):
                     handled = True
                     return TurnOutcome(
                         TurnOutcomeStatus.ERROR,
@@ -392,7 +409,7 @@ class SignalHermesRouter:
                         reply_sent=False,
                         **self._synthetic_outcome_fields(turn),
                     )
-                reply_sent = bool(result.text)
+                reply_sent = bool(reply_text)
                 self.circuit.record_success(route.key)
                 handled = True
                 return TurnOutcome(
@@ -496,6 +513,7 @@ class SignalHermesRouter:
         scheduled_at: int | None,
         idempotency_key: str | None,
         payload: CanonicalNotificationPayload | None = None,
+        outbound_attachments: tuple[OutboundAttachment, ...] = (),
     ) -> RoutedTurnInput:
         triggered_at_ms = self._clock_ms()
         dedupe_sender_id, dedupe_timestamp = self._synthetic_dedupe_identity(
@@ -520,6 +538,7 @@ class SignalHermesRouter:
             synthetic=synthetic,
             synthetic_prompt=synthetic.prompt,
             synthetic_payload=payload,
+            outbound_attachments=outbound_attachments,
             scheduled_at_ms=scheduled_at,
             triggered_at_ms=triggered_at_ms,
             permission_policy=synthetic.permission_policy or route.permission_policy,
@@ -653,7 +672,13 @@ class SignalHermesRouter:
             signal_id=signal_id,
         )
 
-    async def _send_once(self, route: Route, message: str) -> bool:
+    async def _send_once(
+        self,
+        route: Route,
+        message: str,
+        *,
+        attachments: Sequence[OutboundAttachment] = (),
+    ) -> bool:
         message = prepare_outgoing_message(
             route,
             message,
@@ -670,13 +695,29 @@ class SignalHermesRouter:
                 self.redactor.ref("route", route.key),
                 total,
             )
+        attachment_paths = tuple(str(attachment.path) for attachment in attachments)
         index = 0
         try:
             for index, chunk in enumerate(chunks, 1):
+                chunk_attachments = attachment_paths if index == 1 else ()
                 if route.chat_type == ChatType.DIRECT:
-                    await self.signal.send_direct(_direct_recipient(route), chunk)
+                    if chunk_attachments:
+                        await self.signal.send_direct(
+                            _direct_recipient(route),
+                            chunk,
+                            attachments=chunk_attachments,
+                        )
+                    else:
+                        await self.signal.send_direct(_direct_recipient(route), chunk)
                 else:
-                    await self.signal.send_group(_group_id(route), chunk)
+                    if chunk_attachments:
+                        await self.signal.send_group(
+                            _group_id(route),
+                            chunk,
+                            attachments=chunk_attachments,
+                        )
+                    else:
+                        await self.signal.send_group(_group_id(route), chunk)
         except Exception as exc:
             LOGGER.error(
                 "failed Signal reply chunk %d/%d for %s: %s",
@@ -838,6 +879,14 @@ class SignalHermesRouter:
             )
         except NotificationPayloadError as exc:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": exc.error_code}
+        try:
+            outbound_attachments = validate_outbound_attachments(
+                payload.get("attachments", []),
+                media_root=Path(self.config.router.media_root),
+                max_bytes=self.config.router.max_attachment_bytes,
+            )
+        except OutboundAttachmentError as exc:
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": exc.error_code}
         idempotency_key, error = _parse_control_idempotency_key(payload.get("idempotency_key"))
         if error is not None:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": error}
@@ -848,6 +897,7 @@ class SignalHermesRouter:
             outcome = await self.handle_notification(
                 notification_id,
                 notification_payload,
+                outbound_attachments=outbound_attachments,
                 idempotency_key=idempotency_key,
                 route_lock_timeout=timeout,
             )
