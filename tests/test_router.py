@@ -36,7 +36,10 @@ from signal_hermes_router.permissions import StaticPermissionPolicy
 from signal_hermes_router.preflight import ToolSurface
 from signal_hermes_router.private_fs import ensure_private_dir_tree, write_private_bytes
 from signal_hermes_router.router import SignalHermesRouter
-from signal_hermes_router.outbound_media import OutboundAttachmentError, validate_outbound_attachments
+from signal_hermes_router.outbound_media import (
+    OutboundAttachmentError,
+    validate_outbound_attachments,
+)
 from tests.support import FakeProfile, FakeSignal, FakeSupervisor, make_app, make_event
 
 
