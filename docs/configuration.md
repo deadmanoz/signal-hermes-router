@@ -285,12 +285,19 @@ that fit inside the control request headroom.
 `notify-route --attachment` accepts one image path. The router rejects
 non-arrays from the control socket, multiple paths, non-string or relative
 paths, paths that escape `router.media_root`, missing paths, non-files,
-oversize files, and paths whose filename does not infer an `image/*` content
-type. MIME gating is filename-based through Python's `mimetypes`; stage PNG,
-JPEG, GIF, or WebP files rather than relying on magic-byte sniffing or platform
-HEIC mappings. The producer, router, and signal-cli daemon must run as the same
-UID so signal-cli can traverse the router's `0700` media tree and read the
-staged file.
+oversize files, non-private file or parent modes, and paths whose filename
+does not infer an `image/*` content type. MIME gating is filename-based through
+Python's `mimetypes`; stage PNG, JPEG, GIF, or WebP files rather than relying
+on magic-byte sniffing or platform HEIC mappings. The producer must stage
+images under `router.media_root` using `0700` directories and `0600` files.
+
+Before the ACP turn runs, the router copies each accepted image to a private
+router-owned `.outbound` artifact under `router.media_root`. Signal-cli sees
+that frozen path, not the producer's original path, and the router deletes the
+frozen artifact after the send attempt. Attachment sends require a loopback
+`router.signal_base_url` because signal-cli must read the same filesystem path;
+remote signal-cli base URLs are rejected for attachment-bearing notifications
+even when `allow_remote_signal_base_url` permits text-only routing.
 
 `preflight-permissions` compares configured permission tool names against a
 recorded ACP tool-surface contract in offline mode, or against structured

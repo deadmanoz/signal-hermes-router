@@ -127,6 +127,7 @@ class OutboundAttachment:
     path: Path
     content_type: str
     size: int
+    owned_by_router: bool = False
 
 
 @dataclass(frozen=True)

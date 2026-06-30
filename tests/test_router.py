@@ -8,6 +8,7 @@ import re
 import tempfile
 import time
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,8 +34,9 @@ from signal_hermes_router.models import (
 from signal_hermes_router.payloads import canonicalize_notification_payload, encode_control_message
 from signal_hermes_router.permissions import StaticPermissionPolicy
 from signal_hermes_router.preflight import ToolSurface
+from signal_hermes_router.private_fs import ensure_private_dir_tree, write_private_bytes
 from signal_hermes_router.router import SignalHermesRouter
-from signal_hermes_router.outbound_media import validate_outbound_attachments
+from signal_hermes_router.outbound_media import OutboundAttachmentError, validate_outbound_attachments
 from tests.support import FakeProfile, FakeSignal, FakeSupervisor, make_app, make_event
 
 
@@ -88,6 +90,7 @@ def make_synthetic_app(
     *,
     control: RouterControlConfig | None = None,
     notifications: tuple[SyntheticRouteNotification, ...] = (),
+    **router_overrides,
 ) -> AppConfig:
     return AppConfig(
         router=RouterConfig(
@@ -96,6 +99,7 @@ def make_synthetic_app(
             signal_attachment_root=Path(tmp) / "signal-attachments",
             work_root=Path(tmp) / "work",
             control=control or RouterControlConfig(),
+            **router_overrides,
         ),
         routes=(route,),
         scheduled_jobs=(
@@ -112,11 +116,24 @@ def make_synthetic_app(
 
 def write_png(path: Path, body: bytes = b"png") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(body)
+    parts = path.parts
+    if "media" in parts:
+        index = len(parts) - 1 - list(reversed(parts)).index("media")
+        root = Path(*parts[: index + 1])
+    else:
+        root = path.parent
+    ensure_private_dir_tree(root, path.parent)
+    write_private_bytes(path, body)
     return path
 
 
 class RouterTests(unittest.IsolatedAsyncioTestCase):
+    def assertFrozenAttachmentPath(self, raw_path: str, media_root: Path) -> None:
+        path = Path(raw_path)
+        self.assertEqual(path.name, "attachment.png")
+        path.relative_to((media_root / ".outbound").resolve())
+        self.assertFalse(path.exists())
+
     async def test_default_runtime_dependencies_can_be_constructed_and_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             router = SignalHermesRouter(make_app(tmp, RouteState.ACTIVE))
@@ -481,7 +498,77 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
         self.assertEqual(signal.sends, [("group", "person detected")])
-        self.assertEqual(signal.send_attachments, [("group", (str(image.resolve()),))])
+        self.assertEqual(signal.send_attachments[0][0], "group")
+        self.assertFrozenAttachmentPath(signal.send_attachments[0][1][0], app.router.media_root)
+
+    async def test_notification_attachment_freezes_bytes_before_prompt_delay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png", b"old")
+
+            class MutatingProfile(FakeProfile):
+                async def prompt(self, session_id: str, blocks: list[dict]) -> TurnResult:
+                    write_png(image, b"new")
+                    return await super().prompt(session_id, blocks)
+
+            class ReadingSignal(FakeSignal):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.attachment_bodies: list[bytes] = []
+
+                async def send_group(
+                    self,
+                    group_id: str,
+                    message: str,
+                    *,
+                    attachments: Sequence[str] = (),
+                ) -> dict[str, int]:
+                    self.attachment_bodies.extend(Path(path).read_bytes() for path in attachments)
+                    return await super().send_group(group_id, message, attachments=attachments)
+
+            signal = ReadingSignal()
+            profile = MutatingProfile()
+            profile.reply_text = "person detected"
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            attachments = validate_outbound_attachments(
+                [str(image)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            outcome = await router.handle_notification(
+                "camera-person",
+                canonicalize_notification_payload({"camera": "front"}, max_bytes=1024),
+                outbound_attachments=attachments,
+            )
+            mutated_source_body = image.read_bytes()
+
+        self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+        self.assertEqual(signal.attachment_bodies, [b"old"])
+        self.assertEqual(mutated_source_body, b"new")
 
     async def test_notification_attachment_uses_fallback_when_reply_text_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -529,7 +616,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
         self.assertTrue(outcome.reply_sent)
         self.assertEqual(signal.sends, [("group", "Image attached.")])
-        self.assertEqual(signal.send_attachments, [("group", (str(image.resolve()),))])
+        self.assertEqual(signal.send_attachments[0][0], "group")
+        self.assertFrozenAttachmentPath(signal.send_attachments[0][1][0], app.router.media_root)
 
     async def test_notification_attachment_uses_fallback_when_reply_text_is_whitespace(
         self,
@@ -579,7 +667,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
         self.assertTrue(outcome.reply_sent)
         self.assertEqual(signal.sends, [("group", "Image attached.")])
-        self.assertEqual(signal.send_attachments, [("group", (str(image.resolve()),))])
+        self.assertEqual(signal.send_attachments[0][0], "group")
+        self.assertFrozenAttachmentPath(signal.send_attachments[0][1][0], app.router.media_root)
 
     async def test_direct_notification_sends_validated_attachment_with_reply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -628,9 +717,10 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
         self.assertEqual(signal.direct_sends, [("sender-uuid", "person detected")])
-        self.assertEqual(
-            signal.direct_send_attachments,
-            [("sender-uuid", (str(image.resolve()),))],
+        self.assertEqual(signal.direct_send_attachments[0][0], "sender-uuid")
+        self.assertFrozenAttachmentPath(
+            signal.direct_send_attachments[0][1][0],
+            app.router.media_root,
         )
 
     async def test_chunked_notification_attachment_is_sent_only_on_first_chunk(self) -> None:
@@ -677,7 +767,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertGreater(len(signal.sends), 1)
-        self.assertEqual(signal.send_attachments[0], ("group", (str(image.resolve()),)))
+        self.assertEqual(signal.send_attachments[0][0], "group")
+        self.assertFrozenAttachmentPath(signal.send_attachments[0][1][0], app.router.media_root)
         for _, attached_paths in signal.send_attachments[1:]:
             self.assertEqual(attached_paths, ())
 
@@ -767,7 +858,65 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["status"], "delivered")
         self.assertEqual(signal.sends, [("group", "person detected")])
-        self.assertEqual(signal.send_attachments, [("group", (str(image.resolve()),))])
+        self.assertEqual(signal.send_attachments[0][0], "group")
+        self.assertFrozenAttachmentPath(signal.send_attachments[0][1][0], app.router.media_root)
+
+    async def test_notify_route_rejects_attachment_with_remote_signal_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+                signal_base_url="http://signal.example:8080",
+                allow_remote_signal_base_url=True,
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            response = await router._handle_control_line(
+                encode_control_message(
+                    {
+                        "command": "notify_route",
+                        "notification_id": "camera-person",
+                        "payload": {"camera": "front"},
+                        "attachments": [str(image)],
+                    }
+                )
+            )
+
+        self.assertEqual(
+            response,
+            {
+                "status": "error",
+                "route_state": "active",
+                "synthetic_id": "camera-person",
+                "synthetic_kind": "notification",
+                "error": "attachment_signal_daemon_not_local",
+            },
+        )
+        self.assertEqual(profile.prompts, [])
+        self.assertEqual(signal.sends, [])
 
     async def test_notify_route_idempotent_retry_dedupes_before_attachment_validation(
         self,
@@ -817,6 +966,69 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delivered["status"], "delivered")
         self.assertEqual(retried["status"], "deduped")
         self.assertEqual(signal.sends, [("group", "person detected")])
+
+    async def test_notify_route_rechecks_idempotency_after_attachment_validation_race(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            notification = SyntheticRouteNotification(
+                id="camera-person",
+                route_name="camera-route",
+                prompt="Summarize the camera alert.",
+            )
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(notification,),
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            idempotency_key = "camera-person-1"
+            dedupe_sender_id, dedupe_timestamp = router._synthetic_dedupe_identity(
+                notification.namespace,
+                scheduled_at=None,
+                idempotency_key=idempotency_key,
+                triggered_at_ms=0,
+            )
+            self.assertTrue(router.dedupe.claim(route.key, dedupe_sender_id, dedupe_timestamp))
+
+            def fail_after_original_completes(*_args, **_kwargs):
+                router.dedupe.mark_handled(route.key, dedupe_sender_id, dedupe_timestamp)
+                raise OutboundAttachmentError("attachment_not_found", "rotated away")
+
+            with patch(
+                "signal_hermes_router.router.validate_outbound_attachments",
+                side_effect=fail_after_original_completes,
+            ):
+                response = await router._handle_control_line(
+                    encode_control_message(
+                        {
+                            "command": "notify_route",
+                            "notification_id": "camera-person",
+                            "payload": {"camera": "front"},
+                            "attachments": [str(Path(tmp) / "media" / "camera" / "missing.png")],
+                            "idempotency_key": idempotency_key,
+                        }
+                    )
+                )
+
+        self.assertEqual(response["status"], "deduped")
+        self.assertEqual(profile.prompts, [])
+        self.assertEqual(signal.sends, [])
 
     async def test_notify_route_in_flight_idempotency_does_not_short_circuit_as_deduped(
         self,

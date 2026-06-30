@@ -3,12 +3,14 @@ from __future__ import annotations
 import mimetypes
 import os
 import stat
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .mime import content_type_for_path
 from .models import OutboundAttachment
-from .private_fs import resolve_under_root
+from .private_fs import PRIVATE_FILE_MODE, resolve_under_root
 
 ALLOWED_OUTBOUND_IMAGE_CONTENT_TYPES = frozenset(
     {
@@ -26,6 +28,19 @@ class OutboundAttachmentError(ValueError):
     def __init__(self, error_code: str, message: str) -> None:
         super().__init__(message)
         self.error_code = error_code
+
+
+def signal_base_url_supports_local_attachment_paths(base_url: str) -> bool:
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    hostname = parsed.hostname.lower()
+    if hostname == "localhost":
+        return True
+    try:
+        return ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 def validate_outbound_attachments(
@@ -91,6 +106,7 @@ def validate_outbound_attachments(
             "attachment_not_file",
             "attachment path must be a regular file",
         )
+    _validate_private_attachment_modes(media_root.expanduser(), resolved, file_stat)
     if not os.access(resolved, os.R_OK):
         raise OutboundAttachmentError(
             "attachment_not_readable",
@@ -108,3 +124,50 @@ def validate_outbound_attachments(
             "attachment must have an image content type",
         )
     return (OutboundAttachment(path=resolved, content_type=content_type, size=file_stat.st_size),)
+
+
+def _validate_private_attachment_modes(
+    media_root: Path,
+    resolved: Path,
+    file_stat: os.stat_result,
+) -> None:
+    root = media_root.resolve(strict=False)
+    try:
+        relative_parent = resolved.parent.relative_to(root)
+    except ValueError as exc:  # pragma: no cover - resolve_under_root guards this first
+        raise OutboundAttachmentError(
+            "attachment_path_escaped_root",
+            "attachment path must be under media_root",
+        ) from exc
+
+    checked_dirs: list[Path] = []
+    current = root
+    checked_dirs.append(current)
+    for part in relative_parent.parts:
+        current /= part
+        checked_dirs.append(current)
+
+    for directory in checked_dirs:
+        try:
+            directory_stat = directory.stat()
+        except OSError as exc:
+            raise OutboundAttachmentError(
+                "attachment_not_private",
+                "attachment parent directories must be inspectable",
+            ) from exc
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise OutboundAttachmentError(
+                "attachment_not_private",
+                "attachment parents must be directories",
+            )
+        if stat.S_IMODE(directory_stat.st_mode) & 0o077:
+            raise OutboundAttachmentError(
+                "attachment_not_private",
+                "attachment parent directories must not be group/world accessible",
+            )
+
+    if stat.S_IMODE(file_stat.st_mode) & 0o077:
+        raise OutboundAttachmentError(
+            "attachment_not_private",
+            f"attachment file must be private like mode {PRIVATE_FILE_MODE:o}",
+        )

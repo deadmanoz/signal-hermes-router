@@ -105,11 +105,11 @@ signal-hermes-router --config /path/to/private/config.yaml notify-route camera-p
 
 `--attachment` is control metadata, not part of the canonical notification
 payload JSON. The path must be absolute after `~` expansion, must resolve under
-`router.media_root`, must point to a regular readable image file, and must fit
-within `router.max_attachment_bytes`. Relative paths are rejected instead of
-being resolved against the router daemon's current working directory. The
-producer, router, and signal-cli daemon must run as the same UID because the
-router-managed media tree is private (`0700` directories and `0600` files).
+`router.media_root`, must point to a regular readable private image file, and
+must fit within `router.max_attachment_bytes`. Relative paths are rejected
+instead of being resolved against the router daemon's current working
+directory. The producer must stage images with `0700` parent directories and
+`0600` file modes because the router-managed media tree is private.
 
 Only one outbound notification attachment is supported. It is delivered with
 the first Signal reply chunk only; later chunks are text-only. If Hermes returns
@@ -117,6 +117,12 @@ empty reply text for an attachment-bearing notification, the router sends the
 fallback text `Image attached.` with the image. Unit tests verify the router's
 request shape; live delivery is only proven after a smoke send through a real
 signal-cli daemon to an operator-approved target.
+
+The router freezes accepted images into a private `.outbound` send artifact
+before the ACP turn runs, so producers may rotate their original staged file
+after the control request is accepted. Attachment sends require a loopback
+signal-cli daemon sharing the same filesystem path. Remote signal-cli base URLs
+are supported only for text-only notifications.
 
 ## Prompt Shape
 

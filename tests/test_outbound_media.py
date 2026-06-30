@@ -8,11 +8,19 @@ from signal_hermes_router.outbound_media import (
     OutboundAttachmentError,
     validate_outbound_attachments,
 )
+from signal_hermes_router.private_fs import ensure_private_dir_tree, write_private_bytes
 
 
 def write_file(path: Path, body: bytes = b"body") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(body)
+    parts = path.parts
+    if "media" in parts:
+        index = len(parts) - 1 - list(reversed(parts)).index("media")
+        root = Path(*parts[: index + 1])
+    else:
+        root = path.parent
+    ensure_private_dir_tree(root, path.parent)
+    write_private_bytes(path, body)
     return path
 
 
@@ -114,6 +122,21 @@ class OutboundMediaTests(unittest.TestCase):
                 validate_outbound_attachments([str(text)], media_root=media_root, max_bytes=1024)
 
         self.assertEqual(raised.exception.error_code, "attachment_not_image")
+
+    def test_validate_outbound_attachment_rejects_public_file_or_parent_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            media_root = Path(tmp) / "media"
+            image = write_file(media_root / "alerts" / "person.png")
+            image.chmod(0o644)
+            with self.assertRaises(OutboundAttachmentError) as raised:
+                validate_outbound_attachments([str(image)], media_root=media_root, max_bytes=1024)
+            self.assertEqual(raised.exception.error_code, "attachment_not_private")
+
+            image.chmod(0o600)
+            image.parent.chmod(0o755)
+            with self.assertRaises(OutboundAttachmentError) as raised:
+                validate_outbound_attachments([str(image)], media_root=media_root, max_bytes=1024)
+            self.assertEqual(raised.exception.error_code, "attachment_not_private")
 
     def test_validate_outbound_attachment_rejects_svg(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

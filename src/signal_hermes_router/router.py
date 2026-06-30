@@ -37,7 +37,11 @@ from .models import (
     TurnResult,
 )
 from .outbound import chunk_for_signal_bytes, prepare_outgoing_message
-from .outbound_media import OutboundAttachmentError, validate_outbound_attachments
+from .outbound_media import (
+    OutboundAttachmentError,
+    signal_base_url_supports_local_attachment_paths,
+    validate_outbound_attachments,
+)
 from .payloads import (
     CanonicalNotificationPayload,
     NotificationPayloadError,
@@ -51,7 +55,12 @@ from .preflight import (
     parse_preflight_scope,
     run_permission_preflight,
 )
-from .private_fs import ensure_private_dir, validate_path_component
+from .private_fs import (
+    ensure_private_dir,
+    ensure_private_dir_tree,
+    validate_path_component,
+    write_private_bytes,
+)
 from .redaction import Redactor
 from .sessions import ProfileSupervisor, SessionRegistry
 from .signal import SignalHttpClient
@@ -277,31 +286,57 @@ class SignalHermesRouter:
                 synthetic_kind=synthetic.kind,
             )
         self.redactor.add(route.key, route.group_id, route.sender_id, route.sender_number)
-        turn = self._synthetic_turn_input(
-            synthetic,
-            route,
-            scheduled_at,
-            idempotency_key,
-            payload,
-            outbound_attachments,
-        )
-        timeout = (
-            self.config.router.control.route_lock_timeout_seconds
-            if route_lock_timeout is None
-            else route_lock_timeout
-        )
-        lock = self._route_lock(route)
-        if not await self._acquire_route_lock(lock, timeout):
+        frozen_attachments: tuple[OutboundAttachment, ...] = ()
+        if outbound_attachments and not signal_base_url_supports_local_attachment_paths(
+            self.config.router.signal_base_url
+        ):
             return TurnOutcome(
-                TurnOutcomeStatus.BUSY,
+                TurnOutcomeStatus.ERROR,
                 route_state=self.route_state_overrides.get(route.key, route.state),
+                error="attachment_signal_daemon_not_local",
                 synthetic_id=synthetic.id,
                 synthetic_kind=synthetic.kind,
             )
         try:
-            profile_lock = self._profile_lock(route.profile)
-            profile_lock_acquired = await self._acquire_route_lock(profile_lock, timeout)
-            if not profile_lock_acquired:
+            frozen_attachments = self._freeze_outbound_attachments(outbound_attachments)
+        except OutboundAttachmentError as exc:
+            if idempotency_key:
+                dedupe_sender_id, dedupe_timestamp = self._synthetic_dedupe_identity(
+                    synthetic.namespace,
+                    scheduled_at=scheduled_at,
+                    idempotency_key=idempotency_key,
+                    triggered_at_ms=0,
+                )
+                if self.dedupe.is_handled(route.key, dedupe_sender_id, dedupe_timestamp):
+                    return TurnOutcome(
+                        TurnOutcomeStatus.DEDUPED,
+                        route_state=self.route_state_overrides.get(route.key, route.state),
+                        synthetic_id=synthetic.id,
+                        synthetic_kind=synthetic.kind,
+                    )
+            return TurnOutcome(
+                TurnOutcomeStatus.ERROR,
+                route_state=self.route_state_overrides.get(route.key, route.state),
+                error=exc.error_code,
+                synthetic_id=synthetic.id,
+                synthetic_kind=synthetic.kind,
+            )
+        try:
+            turn = self._synthetic_turn_input(
+                synthetic,
+                route,
+                scheduled_at,
+                idempotency_key,
+                payload,
+                frozen_attachments,
+            )
+            timeout = (
+                self.config.router.control.route_lock_timeout_seconds
+                if route_lock_timeout is None
+                else route_lock_timeout
+            )
+            lock = self._route_lock(route)
+            if not await self._acquire_route_lock(lock, timeout):
                 return TurnOutcome(
                     TurnOutcomeStatus.BUSY,
                     route_state=self.route_state_overrides.get(route.key, route.state),
@@ -309,11 +344,23 @@ class SignalHermesRouter:
                     synthetic_kind=synthetic.kind,
                 )
             try:
-                return await self._run_turn(turn)
+                profile_lock = self._profile_lock(route.profile)
+                profile_lock_acquired = await self._acquire_route_lock(profile_lock, timeout)
+                if not profile_lock_acquired:
+                    return TurnOutcome(
+                        TurnOutcomeStatus.BUSY,
+                        route_state=self.route_state_overrides.get(route.key, route.state),
+                        synthetic_id=synthetic.id,
+                        synthetic_kind=synthetic.kind,
+                    )
+                try:
+                    return await self._run_turn(turn)
+                finally:
+                    profile_lock.release()
             finally:
-                profile_lock.release()
+                lock.release()
         finally:
-            lock.release()
+            self._cleanup_owned_outbound_attachments(frozen_attachments)
 
     async def _run_turn(self, turn: RoutedTurnInput) -> TurnOutcome:
         route = turn.route
@@ -491,6 +538,88 @@ class SignalHermesRouter:
             else:
                 for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
                     self.dedupe.release(route.key, dedupe_sender_id, dedupe_timestamp)
+
+    def _freeze_outbound_attachments(
+        self,
+        attachments: Sequence[OutboundAttachment],
+    ) -> tuple[OutboundAttachment, ...]:
+        if not attachments:
+            return ()
+        media_root = Path(self.config.router.media_root).expanduser()
+        frozen: list[OutboundAttachment] = []
+        try:
+            for attachment in attachments:
+                if attachment.owned_by_router:
+                    frozen.append(attachment)
+                    continue
+                validated = validate_outbound_attachments(
+                    [str(attachment.path)],
+                    media_root=media_root,
+                    max_bytes=self.config.router.max_attachment_bytes,
+                )[0]
+                send_dir = ensure_private_dir_tree(
+                    media_root,
+                    media_root / ".outbound" / uuid.uuid4().hex,
+                )
+                suffix = validated.path.suffix.lower()
+                destination = send_dir / f"attachment{suffix}"
+                try:
+                    with validated.path.open("rb") as handle:
+                        body = handle.read(self.config.router.max_attachment_bytes + 1)
+                except FileNotFoundError as exc:
+                    raise OutboundAttachmentError(
+                        "attachment_not_found",
+                        "attachment path does not exist",
+                    ) from exc
+                except PermissionError as exc:
+                    raise OutboundAttachmentError(
+                        "attachment_not_readable",
+                        "attachment path is not readable",
+                    ) from exc
+                except OSError as exc:
+                    raise OutboundAttachmentError(
+                        "attachment_not_found",
+                        "attachment path could not be read",
+                    ) from exc
+                if len(body) > self.config.router.max_attachment_bytes:
+                    raise OutboundAttachmentError(
+                        "attachment_too_large",
+                        f"attachment exceeds {self.config.router.max_attachment_bytes} bytes",
+                    )
+                write_private_bytes(destination, body)
+                frozen_validated = validate_outbound_attachments(
+                    [str(destination)],
+                    media_root=media_root,
+                    max_bytes=self.config.router.max_attachment_bytes,
+                )[0]
+                frozen.append(
+                    OutboundAttachment(
+                        path=frozen_validated.path,
+                        content_type=frozen_validated.content_type,
+                        size=frozen_validated.size,
+                        owned_by_router=True,
+                    )
+                )
+        except Exception:
+            self._cleanup_owned_outbound_attachments(tuple(frozen))
+            raise
+        return tuple(frozen)
+
+    def _cleanup_owned_outbound_attachments(
+        self,
+        attachments: Sequence[OutboundAttachment],
+    ) -> None:
+        media_root = Path(self.config.router.media_root).expanduser()
+        outbound_root = media_root / ".outbound"
+        for attachment in attachments:
+            if not attachment.owned_by_router:
+                continue
+            with suppress(FileNotFoundError):
+                attachment.path.unlink()
+            with suppress(OSError):
+                attachment.path.parent.rmdir()
+        with suppress(OSError):
+            outbound_root.rmdir()
 
     def _signal_turn_input(self, route: Route, event: NormalizedEvent) -> RoutedTurnInput:
         return RoutedTurnInput(
@@ -898,6 +1027,12 @@ class SignalHermesRouter:
                 max_bytes=self.config.router.max_attachment_bytes,
             )
         except OutboundAttachmentError as exc:
+            deduped_response = self._deduped_notification_control_response(
+                notification_id,
+                idempotency_key,
+            )
+            if deduped_response is not None:
+                return deduped_response
             return {"status": TurnOutcomeStatus.ERROR.value, "error": exc.error_code}
         try:
             outcome = await self.handle_notification(
