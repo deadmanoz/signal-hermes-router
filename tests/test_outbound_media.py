@@ -6,6 +6,7 @@ from pathlib import Path
 
 from signal_hermes_router.outbound_media import (
     OutboundAttachmentError,
+    signal_base_url_supports_local_attachment_paths,
     validate_outbound_attachments,
 )
 from signal_hermes_router.private_fs import ensure_private_dir_tree, write_private_bytes
@@ -25,6 +26,26 @@ def write_file(path: Path, body: bytes = b"body") -> Path:
 
 
 class OutboundMediaTests(unittest.TestCase):
+    def test_signal_base_url_supports_only_local_http_hosts(self) -> None:
+        supported = (
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "https://[::1]:8080",
+        )
+        unsupported = (
+            "unix:///run/signal-cli.sock",
+            "ftp://localhost:8080",
+            "http://signal.example:8080",
+            "http://" + "192.0.2.50" + ":8080",
+        )
+
+        for url in supported:
+            with self.subTest(url=url):
+                self.assertTrue(signal_base_url_supports_local_attachment_paths(url))
+        for url in unsupported:
+            with self.subTest(url=url):
+                self.assertFalse(signal_base_url_supports_local_attachment_paths(url))
+
     def test_validate_outbound_attachment_accepts_one_image_under_media_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             media_root = Path(tmp) / "media"
