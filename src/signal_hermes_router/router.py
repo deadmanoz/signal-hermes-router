@@ -393,7 +393,7 @@ class SignalHermesRouter:
                 await self._stop_busy_notice(turn_done, notice_task)
                 reply_text = result.text
                 outbound_attachments = turn.outbound_attachments
-                if outbound_attachments and not reply_text:
+                if outbound_attachments and not reply_text.strip():
                     reply_text = ATTACHMENT_ONLY_FALLBACK_TEXT
                 if reply_text and not await self._send_once(
                     route,

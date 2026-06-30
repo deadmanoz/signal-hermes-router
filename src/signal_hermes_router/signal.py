@@ -75,7 +75,7 @@ class SignalHttpClient:
         *,
         attachments: Sequence[str] = (),
     ) -> dict[str, Any]:
-        params = {"groupId": group_id, "message": message}
+        params: dict[str, Any] = {"groupId": group_id, "message": message}
         if attachments:
             params["attachments"] = list(attachments)
         return await self._send(params)
@@ -87,7 +87,7 @@ class SignalHttpClient:
         *,
         attachments: Sequence[str] = (),
     ) -> dict[str, Any]:
-        params = {"recipient": [recipient], "message": message}
+        params: dict[str, Any] = {"recipient": [recipient], "message": message}
         if attachments:
             params["attachments"] = list(attachments)
         return await self._send(params)

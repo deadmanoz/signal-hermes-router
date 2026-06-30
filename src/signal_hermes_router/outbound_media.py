@@ -5,9 +5,18 @@ import stat
 from pathlib import Path
 from typing import Any
 
-from .mime import content_type_for_path, is_image_content_type
+from .mime import content_type_for_path
 from .models import OutboundAttachment
 from .private_fs import resolve_under_root
+
+ALLOWED_OUTBOUND_IMAGE_CONTENT_TYPES = frozenset(
+    {
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    }
+)
 
 
 class OutboundAttachmentError(ValueError):
@@ -90,7 +99,7 @@ def validate_outbound_attachments(
             f"attachment exceeds {max_bytes} bytes",
         )
     content_type = content_type_for_path(resolved)
-    if not is_image_content_type(content_type):
+    if content_type not in ALLOWED_OUTBOUND_IMAGE_CONTENT_TYPES:
         raise OutboundAttachmentError(
             "attachment_not_image",
             "attachment must have an image content type",

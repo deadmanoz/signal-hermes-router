@@ -531,6 +531,108 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signal.sends, [("group", "Image attached.")])
         self.assertEqual(signal.send_attachments, [("group", (str(image.resolve()),))])
 
+    async def test_notification_attachment_uses_fallback_when_reply_text_is_whitespace(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = "   "
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            attachments = validate_outbound_attachments(
+                [str(image)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            outcome = await router.handle_notification(
+                "camera-person",
+                canonicalize_notification_payload({"camera": "front"}, max_bytes=1024),
+                outbound_attachments=attachments,
+            )
+
+        self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+        self.assertTrue(outcome.reply_sent)
+        self.assertEqual(signal.sends, [("group", "Image attached.")])
+        self.assertEqual(signal.send_attachments, [("group", (str(image.resolve()),))])
+
+    async def test_direct_notification_sends_validated_attachment_with_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-direct",
+                chat_type=ChatType.DIRECT,
+                sender_id="sender-uuid",
+                sender_number="+00000000000",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_SENDER,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = "person detected"
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-direct",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            attachments = validate_outbound_attachments(
+                [str(image)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            outcome = await router.handle_notification(
+                "camera-person",
+                canonicalize_notification_payload({"camera": "front"}, max_bytes=1024),
+                outbound_attachments=attachments,
+            )
+
+        self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+        self.assertEqual(signal.direct_sends, [("sender-uuid", "person detected")])
+        self.assertEqual(
+            signal.direct_send_attachments,
+            [("sender-uuid", (str(image.resolve()),))],
+        )
+
     async def test_chunked_notification_attachment_is_sent_only_on_first_chunk(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = Route(

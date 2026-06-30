@@ -115,6 +115,15 @@ class OutboundMediaTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.error_code, "attachment_not_image")
 
+    def test_validate_outbound_attachment_rejects_svg(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            media_root = Path(tmp) / "media"
+            svg = write_file(media_root / "image.svg", b"<svg></svg>")
+            with self.assertRaises(OutboundAttachmentError) as raised:
+                validate_outbound_attachments([str(svg)], media_root=media_root, max_bytes=1024)
+
+        self.assertEqual(raised.exception.error_code, "attachment_not_image")
+
 
 if __name__ == "__main__":
     unittest.main()
