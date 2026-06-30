@@ -669,8 +669,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             ):
                 router._freeze_outbound_attachments((first_attachment, second_attachment))
 
-        self.assertEqual(raised.exception.error_code, "attachment_too_large")
-        self.assertFalse((app.router.media_root / ".outbound").exists())
+            self.assertEqual(raised.exception.error_code, "attachment_too_large")
+            self.assertFalse((app.router.media_root / ".outbound").exists())
 
     async def test_freeze_outbound_attachment_cleans_copy_when_frozen_name_fails_validation(
         self,
@@ -755,7 +755,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             ):
                 router._freeze_outbound_attachments((attachment,))
 
-        self.assertEqual(raised.exception.error_code, "attachment_not_found")
+            self.assertEqual(raised.exception.error_code, "attachment_not_found")
+            self.assertFalse((app.router.media_root / ".outbound").exists())
 
     async def test_freeze_outbound_attachment_reports_source_permission_error_after_validation(
         self,
@@ -795,7 +796,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             ):
                 router._freeze_outbound_attachments((attachment,))
 
-        self.assertEqual(raised.exception.error_code, "attachment_not_readable")
+            self.assertEqual(raised.exception.error_code, "attachment_not_readable")
+            self.assertFalse((app.router.media_root / ".outbound").exists())
 
     async def test_notification_attachment_uses_fallback_when_reply_text_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1035,7 +1037,65 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             response,
-            {"status": "error", "error": "attachment_path_not_absolute"},
+            {
+                "status": "error",
+                "route_state": "active",
+                "synthetic_id": "camera-person",
+                "synthetic_kind": "notification",
+                "error": "attachment_path_not_absolute",
+            },
+        )
+        self.assertEqual(profile.prompts, [])
+        self.assertEqual(signal.sends, [])
+
+    async def test_notify_route_state_gate_skips_before_reading_unused_attachment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.DISABLED,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    notifications=(
+                        SyntheticRouteNotification(
+                            id="camera-person",
+                            route_name="camera-route",
+                            prompt="Summarize the camera alert.",
+                        ),
+                    ),
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            response = await router._handle_control_line(
+                encode_control_message(
+                    {
+                        "command": "notify_route",
+                        "notification_id": "camera-person",
+                        "payload": {"camera": "front"},
+                        "attachments": [str(Path(tmp) / "media" / "camera" / "missing.png")],
+                    }
+                )
+            )
+
+        self.assertEqual(
+            response,
+            {
+                "status": "skipped",
+                "route_state": "disabled",
+                "synthetic_id": "camera-person",
+                "synthetic_kind": "notification",
+            },
         )
         self.assertEqual(profile.prompts, [])
         self.assertEqual(signal.sends, [])
@@ -1297,6 +1357,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(router.dedupe.claim(route.key, dedupe_sender_id, dedupe_timestamp))
             lock = router._route_lock(route)
             await lock.acquire()
+            image.unlink()
             try:
                 response = await router._handle_control_line(
                     encode_control_message(
