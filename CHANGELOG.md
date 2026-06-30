@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.11](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.10...v0.1.11) (2026-06-30)
+
+
+### Documentation
+
+* **changelog:** make Release Please the single owner of CHANGELOG.md ([#22](https://github.com/deadmanoz/signal-hermes-router/issues/22))
+
 ## [0.1.10](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.9...v0.1.10) (2026-06-30)
 
 
