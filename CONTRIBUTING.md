@@ -40,4 +40,4 @@ they are not the tested application deployment set.
 
 ## Versioning and releases
 
-This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html); pre-1.0 minor bumps may include breaking changes. See [docs/releasing.md](docs/releasing.md) for the full policy and release procedure, and add changelog entries under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md) when your change warrants one.
+This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html); pre-1.0 minor bumps may include breaking changes. See [docs/releasing.md](docs/releasing.md) for the full policy and release procedure. Release Please owns [CHANGELOG.md](CHANGELOG.md): it generates each entry from the Conventional Commit (squash) titles that land on `main`, so do not hand-edit the changelog or add an `[Unreleased]` section. Make your change describe itself through a clear `type(scope): description` title instead.
