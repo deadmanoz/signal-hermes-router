@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.10](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.9...v0.1.10) (2026-06-30)
+
+
+### Features
+
+* **router:** deliver notification image attachments ([ce420e2](https://github.com/deadmanoz/signal-hermes-router/commit/ce420e203686c3e8962238a9bbfee444dd59b3f2))
+
 ## [0.1.9](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.8...v0.1.9) (2026-06-24)
 
 
