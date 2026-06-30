@@ -63,6 +63,7 @@
 - Preserve deployment-local operator notes and private artefacts during service-tree syncs.
 - Surface unknown and exception Signal shreds in logs without private payloads.
 - Preserve scheduled synthetic job dedupe and control-response compatibility while adding route notifications.
+- Preserve notify-route attachment bytes before lock waits while avoiding unused media reads on skipped and duplicate requests.
 
 ### Features
 

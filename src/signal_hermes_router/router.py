@@ -11,7 +11,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -300,17 +300,62 @@ class SignalHermesRouter:
             else route_lock_timeout
         )
         lock = self._route_lock(route)
-        if not await self._acquire_route_lock(lock, timeout):
-            return TurnOutcome(
-                TurnOutcomeStatus.BUSY,
-                route_state=self.route_state_overrides.get(route.key, route.state),
-                synthetic_id=synthetic.id,
-                synthetic_kind=synthetic.kind,
-            )
+        profile_lock = self._profile_lock(route.profile)
+        frozen_attachments: tuple[OutboundAttachment, ...] = ()
         try:
-            profile_lock = self._profile_lock(route.profile)
-            profile_lock_acquired = await self._acquire_route_lock(profile_lock, timeout)
-            if not profile_lock_acquired:
+            if outbound_attachments:
+                if self._turn_dedupe_has_status(turn, "handled"):
+                    return TurnOutcome(
+                        TurnOutcomeStatus.DEDUPED,
+                        route_state=self.route_state_overrides.get(route.key, route.state),
+                        synthetic_id=synthetic.id,
+                        synthetic_kind=synthetic.kind,
+                    )
+                if not self._turn_dedupe_has_status(turn, "processing"):
+                    self._maybe_clear_breaker_override(route)
+                    state = self.route_state_overrides.get(route.key, route.state)
+                    if state == RouteState.ACTIVE:
+                        if timeout <= 0 and (lock.locked() or profile_lock.locked()):
+                            return TurnOutcome(
+                                TurnOutcomeStatus.BUSY,
+                                route_state=state,
+                                synthetic_id=synthetic.id,
+                                synthetic_kind=synthetic.kind,
+                            )
+                        if not signal_base_url_supports_local_attachment_paths(
+                            self.config.router.signal_base_url
+                        ):
+                            return TurnOutcome(
+                                TurnOutcomeStatus.ERROR,
+                                route_state=state,
+                                error="attachment_signal_daemon_not_local",
+                                synthetic_id=synthetic.id,
+                                synthetic_kind=synthetic.kind,
+                            )
+                        try:
+                            frozen_attachments = self._freeze_outbound_attachments(
+                                outbound_attachments
+                            )
+                        except OutboundAttachmentError as exc:
+                            if self._turn_dedupe_has_status(turn, "handled"):
+                                return TurnOutcome(
+                                    TurnOutcomeStatus.DEDUPED,
+                                    route_state=self.route_state_overrides.get(
+                                        route.key, route.state
+                                    ),
+                                    synthetic_id=synthetic.id,
+                                    synthetic_kind=synthetic.kind,
+                                )
+                            return TurnOutcome(
+                                TurnOutcomeStatus.ERROR,
+                                route_state=state,
+                                error=exc.error_code,
+                                synthetic_id=synthetic.id,
+                                synthetic_kind=synthetic.kind,
+                            )
+                        turn = replace(turn, outbound_attachments=frozen_attachments)
+
+            if not await self._acquire_route_lock(lock, timeout):
                 return TurnOutcome(
                     TurnOutcomeStatus.BUSY,
                     route_state=self.route_state_overrides.get(route.key, route.state),
@@ -318,17 +363,26 @@ class SignalHermesRouter:
                     synthetic_kind=synthetic.kind,
                 )
             try:
-                return await self._run_turn(turn)
+                profile_lock_acquired = await self._acquire_route_lock(profile_lock, timeout)
+                if not profile_lock_acquired:
+                    return TurnOutcome(
+                        TurnOutcomeStatus.BUSY,
+                        route_state=self.route_state_overrides.get(route.key, route.state),
+                        synthetic_id=synthetic.id,
+                        synthetic_kind=synthetic.kind,
+                    )
+                try:
+                    return await self._run_turn(turn)
+                finally:
+                    profile_lock.release()
             finally:
-                profile_lock.release()
+                lock.release()
         finally:
-            lock.release()
+            self._cleanup_owned_outbound_attachments(frozen_attachments)
 
     async def _run_turn(self, turn: RoutedTurnInput) -> TurnOutcome:
         route = turn.route
-        dedupe_identities = [(turn.dedupe_sender_id, turn.dedupe_timestamp)]
-        if turn.secondary_dedupe is not None:
-            dedupe_identities.append(turn.secondary_dedupe)
+        dedupe_identities = self._turn_dedupe_identities(turn)
         claimed_dedupe: list[tuple[str, int]] = []
         for dedupe_sender_id, dedupe_timestamp in dedupe_identities:
             if not self.dedupe.claim(route.key, dedupe_sender_id, dedupe_timestamp):
@@ -528,12 +582,23 @@ class SignalHermesRouter:
                 for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
                     self.dedupe.release(route.key, dedupe_sender_id, dedupe_timestamp)
 
+    @staticmethod
+    def _turn_dedupe_identities(turn: RoutedTurnInput) -> tuple[tuple[str, int], ...]:
+        identities = [(turn.dedupe_sender_id, turn.dedupe_timestamp)]
+        if turn.secondary_dedupe is not None:
+            identities.append(turn.secondary_dedupe)
+        return tuple(identities)
+
+    def _turn_dedupe_has_status(self, turn: RoutedTurnInput, status: str) -> bool:
+        return any(
+            self.dedupe.status(turn.route.key, dedupe_sender_id, dedupe_timestamp) == status
+            for dedupe_sender_id, dedupe_timestamp in self._turn_dedupe_identities(turn)
+        )
+
     def _freeze_outbound_attachments(
         self,
         attachments: Any,
     ) -> tuple[OutboundAttachment, ...]:
-        if not attachments:
-            return ()
         media_root = Path(self.config.router.media_root).expanduser()
         if isinstance(attachments, list | tuple) and all(
             isinstance(attachment, OutboundAttachment) for attachment in attachments
@@ -545,6 +610,8 @@ class SignalHermesRouter:
                 media_root=media_root,
                 max_bytes=self.config.router.max_attachment_bytes,
             )
+        if not attachment_requests:
+            return ()
         frozen: list[OutboundAttachment] = []
         send_dirs: list[Path] = []
         try:

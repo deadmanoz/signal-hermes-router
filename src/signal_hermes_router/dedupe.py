@@ -70,6 +70,18 @@ class DedupeStore:
             )
             return cursor.fetchone() is not None
 
+    def status(self, route_key: str, source_uuid: str, timestamp: int) -> str | None:
+        with self._lock:
+            cursor = self._db.execute(
+                "SELECT status FROM dedupe_events "
+                "WHERE route_key = ? AND source_uuid = ? AND timestamp = ?",
+                (route_key, source_uuid, int(timestamp)),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return str(row[0])
+
     def mark_handled(self, route_key: str, source_uuid: str, timestamp: int) -> None:
         with self._lock:
             cursor = self._db.execute(
