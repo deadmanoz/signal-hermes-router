@@ -941,7 +941,7 @@ class SignalHermesRouter:
             idempotency_key=idempotency_key,
             triggered_at_ms=0,
         )
-        if not self.dedupe.contains(route.key, dedupe_sender_id, dedupe_timestamp):
+        if not self.dedupe.is_handled(route.key, dedupe_sender_id, dedupe_timestamp):
             return None
         return TurnOutcome(
             TurnOutcomeStatus.DEDUPED,

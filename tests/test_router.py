@@ -818,6 +818,65 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retried["status"], "deduped")
         self.assertEqual(signal.sends, [("group", "person detected")])
 
+    async def test_notify_route_in_flight_idempotency_does_not_short_circuit_as_deduped(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            notification = SyntheticRouteNotification(
+                id="camera-person",
+                route_name="camera-route",
+                prompt="Summarize the camera alert.",
+            )
+            signal = FakeSignal()
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(notification,),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            idempotency_key = "camera-person-1"
+            dedupe_sender_id, dedupe_timestamp = router._synthetic_dedupe_identity(
+                notification.namespace,
+                scheduled_at=None,
+                idempotency_key=idempotency_key,
+                triggered_at_ms=0,
+            )
+            self.assertTrue(router.dedupe.claim(route.key, dedupe_sender_id, dedupe_timestamp))
+            lock = router._route_lock(route)
+            await lock.acquire()
+            try:
+                response = await router._handle_control_line(
+                    encode_control_message(
+                        {
+                            "command": "notify_route",
+                            "notification_id": "camera-person",
+                            "payload": {"camera": "front"},
+                            "attachments": [str(image)],
+                            "idempotency_key": idempotency_key,
+                            "timeout": 0,
+                        }
+                    )
+                )
+            finally:
+                lock.release()
+
+        self.assertEqual(response["status"], "busy")
+        self.assertEqual(signal.sends, [])
+
     async def test_active_direct_synthetic_job_replies_directly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = make_direct_route()
