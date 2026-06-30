@@ -879,6 +879,18 @@ class SignalHermesRouter:
             )
         except NotificationPayloadError as exc:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": exc.error_code}
+        idempotency_key, error = _parse_control_idempotency_key(payload.get("idempotency_key"))
+        if error is not None:
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": error}
+        timeout, error = _parse_control_timeout(payload.get("timeout"))
+        if error is not None:
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": error}
+        deduped_response = self._deduped_notification_control_response(
+            notification_id,
+            idempotency_key,
+        )
+        if deduped_response is not None:
+            return deduped_response
         try:
             outbound_attachments = validate_outbound_attachments(
                 payload.get("attachments", []),
@@ -887,12 +899,6 @@ class SignalHermesRouter:
             )
         except OutboundAttachmentError as exc:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": exc.error_code}
-        idempotency_key, error = _parse_control_idempotency_key(payload.get("idempotency_key"))
-        if error is not None:
-            return {"status": TurnOutcomeStatus.ERROR.value, "error": error}
-        timeout, error = _parse_control_timeout(payload.get("timeout"))
-        if error is not None:
-            return {"status": TurnOutcomeStatus.ERROR.value, "error": error}
         try:
             outcome = await self.handle_notification(
                 notification_id,
@@ -915,6 +921,34 @@ class SignalHermesRouter:
                 "error": exc.__class__.__name__,
             }
         return outcome.to_control_response()
+
+    def _deduped_notification_control_response(
+        self,
+        notification_id: str,
+        idempotency_key: str | None,
+    ) -> dict[str, Any] | None:
+        if not idempotency_key:
+            return None
+        notification = self.config.find_notification(notification_id)
+        if notification is None:
+            return None
+        route = self.config.find_route_by_name(notification.route_name)
+        if route is None:
+            return None
+        dedupe_sender_id, dedupe_timestamp = self._synthetic_dedupe_identity(
+            notification.namespace,
+            scheduled_at=None,
+            idempotency_key=idempotency_key,
+            triggered_at_ms=0,
+        )
+        if not self.dedupe.contains(route.key, dedupe_sender_id, dedupe_timestamp):
+            return None
+        return TurnOutcome(
+            TurnOutcomeStatus.DEDUPED,
+            route_state=self.route_state_overrides.get(route.key, route.state),
+            synthetic_id=notification.id,
+            synthetic_kind=notification.kind,
+        ).to_control_response()
 
     async def _handle_preflight_permissions_control(
         self, payload: dict[str, Any]
