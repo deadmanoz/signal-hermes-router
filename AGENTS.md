@@ -88,3 +88,5 @@ Conventional commits (`type(scope): description`), scope = module name (e.g. `fe
 ## Documentation
 
 User-facing operational docs live under [docs/](docs/). The [profile audit checklist](docs/profile-audit-checklist.md) must be filled out (in the *private* deployment repo) before a route moves to `active`, including the permission preflight report when route allowlists or profile tool surfaces change.
+
+`CHANGELOG.md` is owned by Release Please and generated from Conventional Commit titles — do not hand-edit it, and in particular do **not** add an `[Unreleased]` section (any global "update the changelog under `[Unreleased]`" convention does not apply here). Describe a change through its `type(scope): description` commit title; Release Please writes the changelog entry when the commit lands on `main`. See [docs/releasing.md](docs/releasing.md) for the release flow.

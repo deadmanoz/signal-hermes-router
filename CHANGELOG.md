@@ -63,25 +63,6 @@
 
 * **router:** shred unrouteable Signal events ([#3](https://github.com/deadmanoz/signal-hermes-router/issues/3))
 
-## [Unreleased]
-
-### Bug Fixes
-
-- Preserve deployment-local operator notes and private artefacts during service-tree syncs.
-- Surface unknown and exception Signal shreds in logs without private payloads.
-- Preserve scheduled synthetic job dedupe and control-response compatibility while adding route notifications.
-- Preserve notify-route attachment bytes before lock waits while avoiding unused media reads on skipped and duplicate requests.
-
-### Features
-
-- Shred unrouteable Signal events before parsing, dedupe, media storage, or ACP delivery.
-- Route explicitly allowlisted Signal direct messages to Hermes profiles.
-- Trigger scheduled synthetic route turns through the router-owned control socket.
-- Send configured external route notifications through the router-owned control socket.
-- Send one router-validated, private, frozen image attachment with configured external route notifications.
-- Preflight route permission allowlists against recorded or live structured ACP tool surfaces.
-- Expose stored attachment paths as `tool_path` in prompt manifests when a route opts in via `route_context.attachment_tool_paths`, so profile tools can operate on the exact stored file.
-
 ## [0.1.1](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.0...v0.1.1) (2026-05-20)
 
 ### Miscellaneous Chores
