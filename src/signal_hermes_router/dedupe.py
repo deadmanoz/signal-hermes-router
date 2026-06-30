@@ -61,6 +61,27 @@ class DedupeStore:
             except sqlite3.IntegrityError:
                 return False
 
+    def is_handled(self, route_key: str, source_uuid: str, timestamp: int) -> bool:
+        with self._lock:
+            cursor = self._db.execute(
+                "SELECT 1 FROM dedupe_events "
+                "WHERE route_key = ? AND source_uuid = ? AND timestamp = ? AND status = 'handled'",
+                (route_key, source_uuid, int(timestamp)),
+            )
+            return cursor.fetchone() is not None
+
+    def status(self, route_key: str, source_uuid: str, timestamp: int) -> str | None:
+        with self._lock:
+            cursor = self._db.execute(
+                "SELECT status FROM dedupe_events "
+                "WHERE route_key = ? AND source_uuid = ? AND timestamp = ?",
+                (route_key, source_uuid, int(timestamp)),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return str(row[0])
+
     def mark_handled(self, route_key: str, source_uuid: str, timestamp: int) -> None:
         with self._lock:
             cursor = self._db.execute(

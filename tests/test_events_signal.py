@@ -460,6 +460,42 @@ class SignalHttpTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_send_rpc_shape_includes_attachments_when_present(self) -> None:
+        requests: list[dict] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            payload = json.loads(request.content.decode("utf-8"))
+            requests.append(payload)
+            return httpx.Response(
+                200, json={"jsonrpc": "2.0", "id": payload["id"], "result": {"timestamp": 1}}
+            )
+
+        client = SignalHttpClient("http://test", transport=httpx.MockTransport(handler))
+        try:
+            await client.send_group("group-id", "reply", attachments=("/private/media/a.png",))
+            await client.send_direct("sender-uuid", "direct", attachments=("/private/media/b.png",))
+        finally:
+            await client.close()
+
+        self.assertEqual(requests[0]["method"], "send")
+        self.assertEqual(
+            requests[0]["params"],
+            {
+                "groupId": "group-id",
+                "message": "reply",
+                "attachments": ["/private/media/a.png"],
+            },
+        )
+        self.assertEqual(requests[1]["method"], "send")
+        self.assertEqual(
+            requests[1]["params"],
+            {
+                "recipient": ["sender-uuid"],
+                "message": "direct",
+                "attachments": ["/private/media/b.png"],
+            },
+        )
+
     async def test_rpc_error_payload_raises(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
             payload = json.loads(request.content.decode("utf-8"))

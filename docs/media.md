@@ -48,6 +48,39 @@ When `route_context.attachment_tool_paths` is enabled, images that resolve to a 
 
 Router core does not transcribe, OCR, or summarise media. That is profile behaviour.
 
+## Outbound notification images
+
+Configured `notify-route` notification turns can carry one trusted local image
+with `--attachment PATH`. The path is top-level control metadata, separate from
+the canonical notification payload JSON sent to Hermes.
+
+The path must be absolute after `~` expansion, must resolve under
+`router.media_root`, must be a regular readable private file, must fit within
+`router.max_attachment_bytes`, and must infer an `image/*` content type from
+its filename. The image gate is extension-based through Python's `mimetypes`;
+stage PNG, JPEG, GIF, or WebP images for predictable behavior. This spike does
+not sniff file magic bytes and does not guarantee HEIC recognition on every
+platform. The router rejects staged images when the file or any parent
+directory under `media_root` has group/world permission bits.
+
+Because signal-cli reads the attachment path from its daemon process, the
+producer that stages the file, the router, and the signal-cli daemon must run
+as the same UID that owns `media_root`. The router keeps that tree private with
+`0700` directories and `0600` files. Attachment sends are supported only when
+`router.signal_base_url` points at a loopback signal-cli daemon with access to
+the same filesystem path. Remote signal-cli base URLs can still handle text
+notifications, but attachment-bearing notifications are rejected.
+
+After validation, the router copies the image to a private router-owned
+`.outbound` artifact under `media_root` before waiting on route locks or ACP.
+Signal-cli receives that frozen path, not the producer's original path, and the
+router removes the frozen artifact after the send attempt.
+
+Outbound notification images are sent with the first Signal reply chunk only.
+Later chunks remain text-only. If Hermes returns empty text for an
+attachment-bearing notification, the router sends the fallback text
+`Image attached.` with the image.
+
 ## Attachment-by-ID resolution
 
 When signal-cli events reference an attachment by ID instead of carrying inline bytes, the router resolves the ID under `signal_attachment_root`, defaulting to `~/.local/share/signal-cli/attachments`.

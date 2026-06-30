@@ -9,7 +9,7 @@ The router does exactly four runtime things, and only these four. Anything outsi
 1. **Transport in** — consume Signal events from upstream `signal-cli` over HTTP/SSE, normalise, dedupe, store attachments to disk, and accept configured local synthetic turns through the private control socket.
 2. **Route** — map a Signal group to a Hermes profile; supervise one `hermes -p <profile> acp` subprocess per active profile; call `session/new` or `session/resume` per the route's session policy.
 3. **Speak ACP** — JSON-RPC over stdio: `initialize`, `session/new`, `session/resume` (when the profile advertises it), `session/prompt`, and the *required* client-side `session/request_permission` handler. The router also registers reject-all handlers for the `fs/*` and `terminal/*` client methods (matching the zero `clientCapabilities` it advertises) so capability-ignoring agents fail loudly.
-4. **Transport out** — send the agent's reply text back to Signal via `signal-cli` JSON-RPC.
+4. **Transport out** — send the agent's reply text and router-validated notification image attachments back to Signal via `signal-cli` JSON-RPC.
 
 Operator/deployment preflight tooling is also in scope when it validates those
 router-owned runtime contracts without duplicating Hermes behaviour. Permission
@@ -50,15 +50,16 @@ local automation → cli.py/control socket (trigger-job, notify-route, preflight
                   → router.py (same route-state/session/reply path)
                        │
                        ├─ media.py       attachment fetch + per-route storage (write_attachment, MediaManifest)
+                       ├─ outbound_media.py  validate notify-route outbound image attachments
                        ├─ context.py     build_prompt_blocks/build_synthetic_prompt_blocks (route-context preamble + escaped text + media/payload blocks)
                        ├─ sessions.py    ProfileSupervisor (one hermes subprocess per profile) + SessionRegistry (per session-policy)
                        │   └─ acp.py    JsonRpcStdioPeer ↔ `hermes -p <profile> acp`
                        │       └─ permissions.py   answers session/request_permission from static config
                        └─ outbound.py    prepare_outgoing_message + chunk_for_signal_bytes
-                            └─ signal.py     send_group (reply path)
+                            └─ signal.py     send_group/send_direct (reply + attachment path)
 ```
 
-Cross-cutting: `models.py` (shared dataclasses/enums: `NormalizedEvent`, `MediaManifest`, `TurnResult`, `SessionPolicy`, `RouteState`, `SyntheticTurnKind`), `payloads.py` (compact control JSON and notification payload canonicalization), `preflight.py` (permission allowlist/tool-surface reporting with safe route refs), `mime.py` (content-type normalisation + extension mapping shared by `media.py` and `context.py`), `private_fs.py` (0700/0600 perm enforcement on the router-managed roots `media_root`/`work_root` and the files written under them, including the dedupe DB), `redaction.py` (log redaction), `circuit.py` (per-route circuit breaker), `secrets.py` (`file://`/`env://`/`op://`/`systemd-credential://` resolvers), `config.py`, and `cli.py`.
+Cross-cutting: `models.py` (shared dataclasses/enums: `NormalizedEvent`, `MediaManifest`, `OutboundAttachment`, `TurnResult`, `SessionPolicy`, `RouteState`, `SyntheticTurnKind`), `payloads.py` (compact control JSON and notification payload canonicalization), `preflight.py` (permission allowlist/tool-surface reporting with safe route refs), `mime.py` (content-type normalisation + extension mapping shared by `media.py`, `outbound_media.py`, and `context.py`), `private_fs.py` (0700/0600 perm enforcement on the router-managed roots `media_root`/`work_root` and the files written under them, including the dedupe DB), `redaction.py` (log redaction), `circuit.py` (per-route circuit breaker), `secrets.py` (`file://`/`env://`/`op://`/`systemd-credential://` resolvers), `config.py`, and `cli.py`.
 
 ## Commands
 

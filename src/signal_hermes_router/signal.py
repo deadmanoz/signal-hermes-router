@@ -5,7 +5,7 @@ import json
 import logging
 import random
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import httpx
@@ -68,12 +68,28 @@ class SignalHttpClient:
         response = await self._client.get("/api/v1/check")
         return response.status_code == 200
 
-    async def send_group(self, group_id: str, message: str) -> dict[str, Any]:
-        params = {"groupId": group_id, "message": message}
+    async def send_group(
+        self,
+        group_id: str,
+        message: str,
+        *,
+        attachments: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"groupId": group_id, "message": message}
+        if attachments:
+            params["attachments"] = list(attachments)
         return await self._send(params)
 
-    async def send_direct(self, recipient: str, message: str) -> dict[str, Any]:
-        params = {"recipient": [recipient], "message": message}
+    async def send_direct(
+        self,
+        recipient: str,
+        message: str,
+        *,
+        attachments: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"recipient": [recipient], "message": message}
+        if attachments:
+            params["attachments"] = list(attachments)
         return await self._send(params)
 
     async def _send(self, params: dict[str, Any]) -> dict[str, Any]:

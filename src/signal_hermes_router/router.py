@@ -9,8 +9,9 @@ import socket
 import stat
 import time
 import uuid
+from collections.abc import Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -24,6 +25,7 @@ from .models import (
     ChatType,
     MediaManifest,
     NormalizedEvent,
+    OutboundAttachment,
     RouteState,
     SessionKeyInput,
     SessionPolicy,
@@ -35,6 +37,11 @@ from .models import (
     TurnResult,
 )
 from .outbound import chunk_for_signal_bytes, prepare_outgoing_message
+from .outbound_media import (
+    OutboundAttachmentError,
+    signal_base_url_supports_local_attachment_paths,
+    validate_outbound_attachments,
+)
 from .payloads import (
     CanonicalNotificationPayload,
     NotificationPayloadError,
@@ -48,7 +55,12 @@ from .preflight import (
     parse_preflight_scope,
     run_permission_preflight,
 )
-from .private_fs import ensure_private_dir, validate_path_component
+from .private_fs import (
+    ensure_private_dir,
+    ensure_private_dir_tree,
+    validate_path_component,
+    write_private_bytes,
+)
 from .redaction import Redactor
 from .sessions import ProfileSupervisor, SessionRegistry
 from .signal import SignalHttpClient
@@ -57,6 +69,7 @@ LOGGER = logging.getLogger(__name__)
 
 SYNTHETIC_DEDUPE_TIMESTAMP_SENTINEL = 0
 PREFLIGHT_PROFILE_LOCK_TIMEOUT_SECONDS = 0.0
+ATTACHMENT_ONLY_FALLBACK_TEXT = "Image attached."
 _MISSING = object()
 
 
@@ -72,6 +85,7 @@ class RoutedTurnInput:
     synthetic: SyntheticRouteDefinition | None = None
     synthetic_prompt: str | None = None
     synthetic_payload: CanonicalNotificationPayload | None = None
+    outbound_attachments: Any = ()
     scheduled_at_ms: int | None = None
     triggered_at_ms: int | None = None
     permission_policy: StaticPermissionPolicy | None = None
@@ -232,6 +246,7 @@ class SignalHermesRouter:
         notification_id: str,
         payload: CanonicalNotificationPayload,
         *,
+        outbound_attachments: Any = (),
         idempotency_key: str | None = None,
         route_lock_timeout: float | None = None,
     ) -> TurnOutcome:
@@ -249,6 +264,7 @@ class SignalHermesRouter:
             idempotency_key=idempotency_key,
             route_lock_timeout=route_lock_timeout,
             payload=payload,
+            outbound_attachments=outbound_attachments,
         )
 
     async def _handle_synthetic_definition(
@@ -259,6 +275,7 @@ class SignalHermesRouter:
         idempotency_key: str | None = None,
         route_lock_timeout: float | None = None,
         payload: CanonicalNotificationPayload | None = None,
+        outbound_attachments: Any = (),
     ) -> TurnOutcome:
         route = self.config.find_route_by_name(synthetic.route_name)
         if route is None:
@@ -275,6 +292,7 @@ class SignalHermesRouter:
             scheduled_at,
             idempotency_key,
             payload,
+            outbound_attachments,
         )
         timeout = (
             self.config.router.control.route_lock_timeout_seconds
@@ -282,17 +300,62 @@ class SignalHermesRouter:
             else route_lock_timeout
         )
         lock = self._route_lock(route)
-        if not await self._acquire_route_lock(lock, timeout):
-            return TurnOutcome(
-                TurnOutcomeStatus.BUSY,
-                route_state=self.route_state_overrides.get(route.key, route.state),
-                synthetic_id=synthetic.id,
-                synthetic_kind=synthetic.kind,
-            )
+        profile_lock = self._profile_lock(route.profile)
+        frozen_attachments: tuple[OutboundAttachment, ...] = ()
         try:
-            profile_lock = self._profile_lock(route.profile)
-            profile_lock_acquired = await self._acquire_route_lock(profile_lock, timeout)
-            if not profile_lock_acquired:
+            if outbound_attachments:
+                if self._turn_dedupe_has_status(turn, "handled"):
+                    return TurnOutcome(
+                        TurnOutcomeStatus.DEDUPED,
+                        route_state=self.route_state_overrides.get(route.key, route.state),
+                        synthetic_id=synthetic.id,
+                        synthetic_kind=synthetic.kind,
+                    )
+                if not self._turn_dedupe_has_status(turn, "processing"):
+                    self._maybe_clear_breaker_override(route)
+                    state = self.route_state_overrides.get(route.key, route.state)
+                    if state == RouteState.ACTIVE:
+                        if timeout <= 0 and (lock.locked() or profile_lock.locked()):
+                            return TurnOutcome(
+                                TurnOutcomeStatus.BUSY,
+                                route_state=state,
+                                synthetic_id=synthetic.id,
+                                synthetic_kind=synthetic.kind,
+                            )
+                        if not signal_base_url_supports_local_attachment_paths(
+                            self.config.router.signal_base_url
+                        ):
+                            return TurnOutcome(
+                                TurnOutcomeStatus.ERROR,
+                                route_state=state,
+                                error="attachment_signal_daemon_not_local",
+                                synthetic_id=synthetic.id,
+                                synthetic_kind=synthetic.kind,
+                            )
+                        try:
+                            frozen_attachments = self._freeze_outbound_attachments(
+                                outbound_attachments
+                            )
+                        except OutboundAttachmentError as exc:
+                            if self._turn_dedupe_has_status(turn, "handled"):
+                                return TurnOutcome(
+                                    TurnOutcomeStatus.DEDUPED,
+                                    route_state=self.route_state_overrides.get(
+                                        route.key, route.state
+                                    ),
+                                    synthetic_id=synthetic.id,
+                                    synthetic_kind=synthetic.kind,
+                                )
+                            return TurnOutcome(
+                                TurnOutcomeStatus.ERROR,
+                                route_state=state,
+                                error=exc.error_code,
+                                synthetic_id=synthetic.id,
+                                synthetic_kind=synthetic.kind,
+                            )
+                        turn = replace(turn, outbound_attachments=frozen_attachments)
+
+            if not await self._acquire_route_lock(lock, timeout):
                 return TurnOutcome(
                     TurnOutcomeStatus.BUSY,
                     route_state=self.route_state_overrides.get(route.key, route.state),
@@ -300,17 +363,26 @@ class SignalHermesRouter:
                     synthetic_kind=synthetic.kind,
                 )
             try:
-                return await self._run_turn(turn)
+                profile_lock_acquired = await self._acquire_route_lock(profile_lock, timeout)
+                if not profile_lock_acquired:
+                    return TurnOutcome(
+                        TurnOutcomeStatus.BUSY,
+                        route_state=self.route_state_overrides.get(route.key, route.state),
+                        synthetic_id=synthetic.id,
+                        synthetic_kind=synthetic.kind,
+                    )
+                try:
+                    return await self._run_turn(turn)
+                finally:
+                    profile_lock.release()
             finally:
-                profile_lock.release()
+                lock.release()
         finally:
-            lock.release()
+            self._cleanup_owned_outbound_attachments(frozen_attachments)
 
     async def _run_turn(self, turn: RoutedTurnInput) -> TurnOutcome:
         route = turn.route
-        dedupe_identities = [(turn.dedupe_sender_id, turn.dedupe_timestamp)]
-        if turn.secondary_dedupe is not None:
-            dedupe_identities.append(turn.secondary_dedupe)
+        dedupe_identities = self._turn_dedupe_identities(turn)
         claimed_dedupe: list[tuple[str, int]] = []
         for dedupe_sender_id, dedupe_timestamp in dedupe_identities:
             if not self.dedupe.claim(route.key, dedupe_sender_id, dedupe_timestamp):
@@ -367,106 +439,141 @@ class SignalHermesRouter:
                     **self._synthetic_outcome_fields(turn),
                 )
 
-            blocks = self._build_turn_prompt_blocks(turn, manifests)
-            permission_policy = turn.permission_policy or route.permission_policy
-            session = await self.sessions.get(
-                route,
-                turn.session,
-                permission_policy=permission_policy,
-            )
-            await self._typing(route, True)
-            turn_done = asyncio.Event()
-            notice_task = asyncio.create_task(self._long_running_notice(route, turn_done))
+            frozen_attachments: tuple[OutboundAttachment, ...] = ()
             try:
-                result = await session.profile.prompt(session.session_id, blocks)
-                # Stop the busy-notice task immediately so it cannot fire
-                # while a long chunked reply is still being sent.
-                await self._stop_busy_notice(turn_done, notice_task)
-                if result.text and not await self._send_once(route, result.text):
+                if (
+                    turn.outbound_attachments
+                    and not signal_base_url_supports_local_attachment_paths(
+                        self.config.router.signal_base_url
+                    )
+                ):
+                    return TurnOutcome(
+                        TurnOutcomeStatus.ERROR,
+                        route_state=state,
+                        error="attachment_signal_daemon_not_local",
+                        **self._synthetic_outcome_fields(turn),
+                    )
+                try:
+                    frozen_attachments = self._freeze_outbound_attachments(
+                        turn.outbound_attachments
+                    )
+                except OutboundAttachmentError as exc:
+                    return TurnOutcome(
+                        TurnOutcomeStatus.ERROR,
+                        route_state=state,
+                        error=exc.error_code,
+                        **self._synthetic_outcome_fields(turn),
+                    )
+
+                blocks = self._build_turn_prompt_blocks(turn, manifests)
+                permission_policy = turn.permission_policy or route.permission_policy
+                session = await self.sessions.get(
+                    route,
+                    turn.session,
+                    permission_policy=permission_policy,
+                )
+                await self._typing(route, True)
+                turn_done = asyncio.Event()
+                notice_task = asyncio.create_task(self._long_running_notice(route, turn_done))
+                try:
+                    result = await session.profile.prompt(session.session_id, blocks)
+                    # Stop the busy-notice task immediately so it cannot fire
+                    # while a long chunked reply is still being sent.
+                    await self._stop_busy_notice(turn_done, notice_task)
+                    reply_text = result.text
+                    if frozen_attachments and not reply_text.strip():
+                        reply_text = ATTACHMENT_ONLY_FALLBACK_TEXT
+                    if reply_text and not await self._send_once(
+                        route,
+                        reply_text,
+                        attachments=frozen_attachments,
+                    ):
+                        handled = True
+                        return TurnOutcome(
+                            TurnOutcomeStatus.ERROR,
+                            route_state=state,
+                            result=result,
+                            error="signal_send_failed",
+                            reply_sent=False,
+                            **self._synthetic_outcome_fields(turn),
+                        )
+                    reply_sent = bool(reply_text)
+                    self.circuit.record_success(route.key)
+                    handled = True
+                    return TurnOutcome(
+                        TurnOutcomeStatus.DELIVERED,
+                        route_state=state,
+                        result=result,
+                        reply_sent=reply_sent,
+                        **self._synthetic_outcome_fields(turn),
+                    )
+                except Exception as exc:
+                    # Stop the busy-notice task BEFORE the failure reply / recovery,
+                    # otherwise a slow restart_profile + replace_after_restart can
+                    # let the notice fire after the user already received the
+                    # failure_reply.
+                    await self._stop_busy_notice(turn_done, notice_task)
+                    LOGGER.error(
+                        "Hermes turn failed for %s: %s",
+                        self.redactor.ref("route", route.key),
+                        self.redactor.redact(exc.__class__.__name__),
+                    )
+                    LOGGER.debug("Hermes turn failure details", exc_info=True)
+                    # Record the breaker hit and pick the user-facing reply
+                    # BEFORE attempting subprocess recovery. If restart or
+                    # replace_after_restart fails (e.g. binary missing, profile
+                    # broken, cooldown), the user still gets a reply and the
+                    # breaker still moves; recovery is best-effort for the
+                    # next event.
+                    trip = self.circuit.record_failure(route.key)
+                    if trip:
+                        self.route_state_overrides[route.key] = RouteState.MAINTENANCE
+                        self._trip_times[route.key] = time.monotonic()
+                        LOGGER.error(
+                            "route %s tripped circuit breaker after %s failures",
+                            self.redactor.ref("route", route.key),
+                            trip.failures,
+                        )
+                        reply_text = route.maintenance_reply or self.config.router.maintenance_reply
+                    else:
+                        reply_text = route.failure_reply or self.config.router.failure_reply
+                    await self._send_once(route, reply_text)
+                    try:
+                        await self.supervisor.restart_profile(route.profile)
+                        if route.session_policy != SessionPolicy.EPHEMERAL:
+                            session = await self.sessions.replace_after_restart(
+                                route,
+                                turn.session,
+                                session,
+                                permission_policy=permission_policy,
+                            )
+                    except Exception as recovery_exc:
+                        LOGGER.warning(
+                            "Hermes recovery failed for %s: %s; route will retry on next event",
+                            self.redactor.ref("route", route.key),
+                            self.redactor.redact(recovery_exc.__class__.__name__),
+                        )
+                        LOGGER.debug("Hermes recovery failure details", exc_info=True)
                     handled = True
                     return TurnOutcome(
                         TurnOutcomeStatus.ERROR,
                         route_state=state,
-                        result=result,
-                        error="signal_send_failed",
-                        reply_sent=False,
+                        error=exc.__class__.__name__,
                         **self._synthetic_outcome_fields(turn),
                     )
-                reply_sent = bool(result.text)
-                self.circuit.record_success(route.key)
-                handled = True
-                return TurnOutcome(
-                    TurnOutcomeStatus.DELIVERED,
-                    route_state=state,
-                    result=result,
-                    reply_sent=reply_sent,
-                    **self._synthetic_outcome_fields(turn),
-                )
-            except Exception as exc:
-                # Stop the busy-notice task BEFORE the failure reply / recovery,
-                # otherwise a slow restart_profile + replace_after_restart can
-                # let the notice fire after the user already received the
-                # failure_reply.
-                await self._stop_busy_notice(turn_done, notice_task)
-                LOGGER.error(
-                    "Hermes turn failed for %s: %s",
-                    self.redactor.ref("route", route.key),
-                    self.redactor.redact(exc.__class__.__name__),
-                )
-                LOGGER.debug("Hermes turn failure details", exc_info=True)
-                # Record the breaker hit and pick the user-facing reply
-                # BEFORE attempting subprocess recovery. If restart or
-                # replace_after_restart fails (e.g. binary missing, profile
-                # broken, cooldown), the user still gets a reply and the
-                # breaker still moves; recovery is best-effort for the
-                # next event.
-                trip = self.circuit.record_failure(route.key)
-                if trip:
-                    self.route_state_overrides[route.key] = RouteState.MAINTENANCE
-                    self._trip_times[route.key] = time.monotonic()
-                    LOGGER.error(
-                        "route %s tripped circuit breaker after %s failures",
-                        self.redactor.ref("route", route.key),
-                        trip.failures,
-                    )
-                    reply_text = route.maintenance_reply or self.config.router.maintenance_reply
-                else:
-                    reply_text = route.failure_reply or self.config.router.failure_reply
-                await self._send_once(route, reply_text)
-                try:
-                    await self.supervisor.restart_profile(route.profile)
-                    if route.session_policy != SessionPolicy.EPHEMERAL:
-                        session = await self.sessions.replace_after_restart(
-                            route,
-                            turn.session,
-                            session,
-                            permission_policy=permission_policy,
+                finally:
+                    # Defensive backup for cancellation paths that skip the
+                    # try/except branches. Idempotent: no-op if already stopped.
+                    await self._stop_busy_notice(turn_done, notice_task)
+                    await self._typing(route, False)
+                    if turn.synthetic is not None and turn.synthetic.permission_policy is not None:
+                        session.profile.set_permission_policy(
+                            session.session_id, route.permission_policy
                         )
-                except Exception as recovery_exc:
-                    LOGGER.warning(
-                        "Hermes recovery failed for %s: %s; route will retry on next event",
-                        self.redactor.ref("route", route.key),
-                        self.redactor.redact(recovery_exc.__class__.__name__),
-                    )
-                    LOGGER.debug("Hermes recovery failure details", exc_info=True)
-                handled = True
-                return TurnOutcome(
-                    TurnOutcomeStatus.ERROR,
-                    route_state=state,
-                    error=exc.__class__.__name__,
-                    **self._synthetic_outcome_fields(turn),
-                )
+                    if session.ephemeral:
+                        session.profile.release_session(session.session_id)
             finally:
-                # Defensive backup for cancellation paths that skip the
-                # try/except branches. Idempotent: no-op if already stopped.
-                await self._stop_busy_notice(turn_done, notice_task)
-                await self._typing(route, False)
-                if turn.synthetic is not None and turn.synthetic.permission_policy is not None:
-                    session.profile.set_permission_policy(
-                        session.session_id, route.permission_policy
-                    )
-                if session.ephemeral:
-                    session.profile.release_session(session.session_id)
+                self._cleanup_owned_outbound_attachments(frozen_attachments)
         finally:
             if handled:
                 for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
@@ -474,6 +581,124 @@ class SignalHermesRouter:
             else:
                 for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
                     self.dedupe.release(route.key, dedupe_sender_id, dedupe_timestamp)
+
+    @staticmethod
+    def _turn_dedupe_identities(turn: RoutedTurnInput) -> tuple[tuple[str, int], ...]:
+        identities = [(turn.dedupe_sender_id, turn.dedupe_timestamp)]
+        if turn.secondary_dedupe is not None:
+            identities.append(turn.secondary_dedupe)
+        return tuple(identities)
+
+    def _turn_dedupe_has_status(self, turn: RoutedTurnInput, status: str) -> bool:
+        return any(
+            self.dedupe.status(turn.route.key, dedupe_sender_id, dedupe_timestamp) == status
+            for dedupe_sender_id, dedupe_timestamp in self._turn_dedupe_identities(turn)
+        )
+
+    def _freeze_outbound_attachments(
+        self,
+        attachments: Any,
+    ) -> tuple[OutboundAttachment, ...]:
+        media_root = Path(self.config.router.media_root).expanduser()
+        if isinstance(attachments, list | tuple) and all(
+            isinstance(attachment, OutboundAttachment) for attachment in attachments
+        ):
+            attachment_requests = tuple(attachments)
+        else:
+            attachment_requests = validate_outbound_attachments(
+                attachments,
+                media_root=media_root,
+                max_bytes=self.config.router.max_attachment_bytes,
+            )
+        if not attachment_requests:
+            return ()
+        frozen: list[OutboundAttachment] = []
+        send_dirs: list[Path] = []
+        try:
+            for attachment in attachment_requests:
+                if attachment.owned_by_router:
+                    frozen.append(attachment)
+                    continue
+                validated = validate_outbound_attachments(
+                    [str(attachment.path)],
+                    media_root=media_root,
+                    max_bytes=self.config.router.max_attachment_bytes,
+                )[0]
+                send_dir = ensure_private_dir_tree(
+                    media_root,
+                    media_root / ".outbound" / uuid.uuid4().hex,
+                )
+                send_dirs.append(send_dir)
+                suffix = validated.path.suffix.lower()
+                destination = send_dir / f"attachment{suffix}"
+                try:
+                    with validated.path.open("rb") as handle:
+                        body = handle.read(self.config.router.max_attachment_bytes + 1)
+                except FileNotFoundError as exc:
+                    raise OutboundAttachmentError(
+                        "attachment_not_found",
+                        "attachment path does not exist",
+                    ) from exc
+                except PermissionError as exc:
+                    raise OutboundAttachmentError(
+                        "attachment_not_readable",
+                        "attachment path is not readable",
+                    ) from exc
+                except OSError as exc:
+                    raise OutboundAttachmentError(
+                        "attachment_not_found",
+                        "attachment path could not be read",
+                    ) from exc
+                if len(body) > self.config.router.max_attachment_bytes:
+                    raise OutboundAttachmentError(
+                        "attachment_too_large",
+                        f"attachment exceeds {self.config.router.max_attachment_bytes} bytes",
+                    )
+                write_private_bytes(destination, body)
+                frozen.append(
+                    OutboundAttachment(
+                        path=destination.resolve(),
+                        content_type=validated.content_type,
+                        size=len(body),
+                        owned_by_router=True,
+                    )
+                )
+                frozen_validated = validate_outbound_attachments(
+                    [str(destination)],
+                    media_root=media_root,
+                    max_bytes=self.config.router.max_attachment_bytes,
+                )[0]
+                frozen[-1] = OutboundAttachment(
+                    path=frozen_validated.path,
+                    content_type=frozen_validated.content_type,
+                    size=frozen_validated.size,
+                    owned_by_router=True,
+                )
+        except Exception:
+            self._cleanup_owned_outbound_attachments(tuple(frozen))
+            for send_dir in reversed(send_dirs):
+                with suppress(OSError):
+                    send_dir.rmdir()
+            with suppress(OSError):
+                (media_root / ".outbound").rmdir()
+            raise
+        return tuple(frozen)
+
+    def _cleanup_owned_outbound_attachments(
+        self,
+        attachments: Sequence[OutboundAttachment],
+    ) -> None:
+        media_root = Path(self.config.router.media_root).expanduser()
+        outbound_root = media_root / ".outbound"
+        for attachment in attachments:
+            if not attachment.owned_by_router:
+                continue
+            with suppress(FileNotFoundError):
+                attachment.path.unlink()
+            with suppress(OSError):
+                attachment.path.parent.rmdir()
+        with suppress(OSError):
+            outbound_root.rmdir()
 
     def _signal_turn_input(self, route: Route, event: NormalizedEvent) -> RoutedTurnInput:
         return RoutedTurnInput(
@@ -496,6 +721,7 @@ class SignalHermesRouter:
         scheduled_at: int | None,
         idempotency_key: str | None,
         payload: CanonicalNotificationPayload | None = None,
+        outbound_attachments: Any = (),
     ) -> RoutedTurnInput:
         triggered_at_ms = self._clock_ms()
         dedupe_sender_id, dedupe_timestamp = self._synthetic_dedupe_identity(
@@ -520,6 +746,7 @@ class SignalHermesRouter:
             synthetic=synthetic,
             synthetic_prompt=synthetic.prompt,
             synthetic_payload=payload,
+            outbound_attachments=outbound_attachments,
             scheduled_at_ms=scheduled_at,
             triggered_at_ms=triggered_at_ms,
             permission_policy=synthetic.permission_policy or route.permission_policy,
@@ -653,7 +880,13 @@ class SignalHermesRouter:
             signal_id=signal_id,
         )
 
-    async def _send_once(self, route: Route, message: str) -> bool:
+    async def _send_once(
+        self,
+        route: Route,
+        message: str,
+        *,
+        attachments: Sequence[OutboundAttachment] = (),
+    ) -> bool:
         message = prepare_outgoing_message(
             route,
             message,
@@ -670,13 +903,29 @@ class SignalHermesRouter:
                 self.redactor.ref("route", route.key),
                 total,
             )
+        attachment_paths = tuple(str(attachment.path) for attachment in attachments)
         index = 0
         try:
             for index, chunk in enumerate(chunks, 1):
+                chunk_attachments = attachment_paths if index == 1 else ()
                 if route.chat_type == ChatType.DIRECT:
-                    await self.signal.send_direct(_direct_recipient(route), chunk)
+                    if chunk_attachments:
+                        await self.signal.send_direct(
+                            _direct_recipient(route),
+                            chunk,
+                            attachments=chunk_attachments,
+                        )
+                    else:
+                        await self.signal.send_direct(_direct_recipient(route), chunk)
                 else:
-                    await self.signal.send_group(_group_id(route), chunk)
+                    if chunk_attachments:
+                        await self.signal.send_group(
+                            _group_id(route),
+                            chunk,
+                            attachments=chunk_attachments,
+                        )
+                    else:
+                        await self.signal.send_group(_group_id(route), chunk)
         except Exception as exc:
             LOGGER.error(
                 "failed Signal reply chunk %d/%d for %s: %s",
@@ -844,10 +1093,17 @@ class SignalHermesRouter:
         timeout, error = _parse_control_timeout(payload.get("timeout"))
         if error is not None:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": error}
+        deduped_response = self._deduped_notification_control_response(
+            notification_id,
+            idempotency_key,
+        )
+        if deduped_response is not None:
+            return deduped_response
         try:
             outcome = await self.handle_notification(
                 notification_id,
                 notification_payload,
+                outbound_attachments=payload.get("attachments", []),
                 idempotency_key=idempotency_key,
                 route_lock_timeout=timeout,
             )
@@ -865,6 +1121,34 @@ class SignalHermesRouter:
                 "error": exc.__class__.__name__,
             }
         return outcome.to_control_response()
+
+    def _deduped_notification_control_response(
+        self,
+        notification_id: str,
+        idempotency_key: str | None,
+    ) -> dict[str, Any] | None:
+        if not idempotency_key:
+            return None
+        notification = self.config.find_notification(notification_id)
+        if notification is None:
+            return None
+        route = self.config.find_route_by_name(notification.route_name)
+        if route is None:
+            return None
+        dedupe_sender_id, dedupe_timestamp = self._synthetic_dedupe_identity(
+            notification.namespace,
+            scheduled_at=None,
+            idempotency_key=idempotency_key,
+            triggered_at_ms=0,
+        )
+        if not self.dedupe.is_handled(route.key, dedupe_sender_id, dedupe_timestamp):
+            return None
+        return TurnOutcome(
+            TurnOutcomeStatus.DEDUPED,
+            route_state=self.route_state_overrides.get(route.key, route.state),
+            synthetic_id=notification.id,
+            synthetic_kind=notification.kind,
+        ).to_control_response()
 
     async def _handle_preflight_permissions_control(
         self, payload: dict[str, Any]

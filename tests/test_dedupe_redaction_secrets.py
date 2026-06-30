@@ -32,6 +32,14 @@ class DedupeTests(unittest.TestCase):
         store.mark_handled("signal:one", "uuid", 1)
         self.assertFalse(store.claim("signal:one", "uuid", 1))
 
+    def test_is_handled_only_matches_completed_claims(self) -> None:
+        store = DedupeStore()
+        self.assertFalse(store.is_handled("signal:one", "uuid", 1))
+        self.assertTrue(store.claim("signal:one", "uuid", 1))
+        self.assertFalse(store.is_handled("signal:one", "uuid", 1))
+        store.mark_handled("signal:one", "uuid", 1)
+        self.assertTrue(store.is_handled("signal:one", "uuid", 1))
+
     def test_file_backed_store_migrates_legacy_table_and_context_closes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "nested" / "router.db"

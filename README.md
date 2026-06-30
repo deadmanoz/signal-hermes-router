@@ -20,9 +20,9 @@ local script       --+
 
 This public tree is intentionally generic. Keep real Signal group IDs, phone numbers, hostnames, profile-private identifiers, route context, state DBs, secrets, and audit checklists in a private deployment repo.
 
-Media today flows inbound only - Signal attachments are normalised, stored on disk, and forwarded to Hermes as ACP content blocks, but replies back to Signal are text-only. A narrow router-owned outbound media contract (so a profile-side plugin - TTS audio, a generated image or chart, and so on - can hand the router a validated local attachment reference to deliver alongside the reply) is planned future work. Route delivery, chunking, retries, and audit logging will stay with the router; profiles won't call Signal directly.
+Media normally flows inbound: Signal attachments are normalised, stored on disk, and forwarded to Hermes as ACP content blocks. Configured `notify-route` notifications may also carry one trusted local image path with `--attachment`; the router validates that path under `router.media_root`, freezes it into a private router-owned send artifact, and sends that artifact through a loopback signal-cli daemon with the first reply chunk. Route delivery, chunking, retries, and audit logging stay with the router; profiles do not call Signal directly.
 
-Synthetic route events let trusted local automation trigger a configured route through the already-running router. A host scheduler can send a configured job ID with `trigger-job`; a local script can send a configured notification ID plus bounded JSON payload with `notify-route`. The router then uses the same route state, session policy, permission allowlist, ACP supervision, Signal outbound chunking, retries, redaction, and audit behavior as an inbound Signal turn. Automation never sends Signal directly and never starts its own Hermes ACP session.
+Synthetic route events let trusted local automation trigger a configured route through the already-running router. A host scheduler can send a configured job ID with `trigger-job`; a local script can send a configured notification ID plus bounded JSON payload with `notify-route`, optionally with one validated image attachment. The router then uses the same route state, session policy, permission allowlist, ACP supervision, Signal outbound chunking, retries, redaction, and audit behavior as an inbound Signal turn. Automation never sends Signal directly and never starts its own Hermes ACP session.
 
 ## Why a router
 
@@ -103,6 +103,12 @@ Configured notifications use the same control socket and route-owned delivery pa
 
 ```bash
 signal-hermes-router --config /path/to/private/config.yaml notify-route backup-report --payload-file /path/to/private/payload.json --idempotency-key backup-report-1714521600000
+```
+
+Trusted local automation can attach one staged image to a notification:
+
+```bash
+signal-hermes-router --config /path/to/private/config.yaml notify-route camera-person --payload-file /path/to/private/payload.json --attachment /path/to/private/media/camera/person.png --idempotency-key camera-person-1714521600000
 ```
 
 Before activating routes or changing allowlists, run a permission preflight

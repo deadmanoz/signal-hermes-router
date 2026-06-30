@@ -63,6 +63,7 @@
 - Preserve deployment-local operator notes and private artefacts during service-tree syncs.
 - Surface unknown and exception Signal shreds in logs without private payloads.
 - Preserve scheduled synthetic job dedupe and control-response compatibility while adding route notifications.
+- Preserve notify-route attachment bytes before lock waits while avoiding unused media reads on skipped and duplicate requests.
 
 ### Features
 
@@ -70,6 +71,7 @@
 - Route explicitly allowlisted Signal direct messages to Hermes profiles.
 - Trigger scheduled synthetic route turns through the router-owned control socket.
 - Send configured external route notifications through the router-owned control socket.
+- Send one router-validated, private, frozen image attachment with configured external route notifications.
 - Preflight route permission allowlists against recorded or live structured ACP tool surfaces.
 - Expose stored attachment paths as `tool_path` in prompt manifests when a route opts in via `route_context.attachment_tool_paths`, so profile tools can operate on the exact stored file.
 

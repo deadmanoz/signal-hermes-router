@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import Counter
+from collections.abc import Sequence
 from contextlib import suppress
 from datetime import datetime, timezone
 import json
@@ -54,6 +55,7 @@ def main(argv: list[str] | None = None) -> None:
     notify = subparsers.add_parser("notify-route", help="send a configured route notification")
     notify.add_argument("notification_id")
     notify.add_argument("--payload-file", type=Path, required=True)
+    notify.add_argument("--attachment", type=Path, action="append", default=[])
     notify.add_argument("--idempotency-key")
     notify.add_argument("--timeout", type=float, help="router route-lock timeout in seconds")
     notify.add_argument(
@@ -164,6 +166,10 @@ async def _notify_route(args: argparse.Namespace) -> int:
             raw_payload,
             max_bytes=max_payload_bytes,
         )
+        attachments = getattr(args, "attachment", []) or []
+        if len(attachments) > 1:
+            raise ValueError("--attachment may be supplied at most once")
+        attachment_kwargs = {"attachments": attachments} if attachments else {}
         response = await notify_route_via_control_socket(
             socket_path,
             args.notification_id,
@@ -171,6 +177,7 @@ async def _notify_route(args: argparse.Namespace) -> int:
             idempotency_key=args.idempotency_key,
             timeout=args.timeout,
             client_timeout=client_timeout,
+            **attachment_kwargs,
         )
     except (json.JSONDecodeError, NotificationPayloadError, OSError, ValueError) as exc:
         logging.error("notify-route failed: %s", exc.__class__.__name__)
@@ -318,6 +325,7 @@ async def notify_route_via_control_socket(
     notification_id: str,
     *,
     payload: dict[str, Any] | list[Any],
+    attachments: Sequence[str | Path] = (),
     idempotency_key: str | None = None,
     timeout: float | None = None,
     client_timeout: float | None = DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
@@ -327,6 +335,8 @@ async def notify_route_via_control_socket(
         "notification_id": notification_id,
         "payload": payload,
     }
+    if attachments:
+        request["attachments"] = [str(path) for path in attachments]
     if idempotency_key is not None:
         request["idempotency_key"] = idempotency_key
     if timeout is not None:

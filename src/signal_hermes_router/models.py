@@ -123,6 +123,14 @@ class MediaManifest:
 
 
 @dataclass(frozen=True)
+class OutboundAttachment:
+    path: Path
+    content_type: str
+    size: int
+    owned_by_router: bool = False
+
+
+@dataclass(frozen=True)
 class TurnResult:
     text: str
     stop_reason: str = "end_turn"

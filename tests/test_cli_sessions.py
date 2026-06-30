@@ -230,6 +230,44 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
+    async def test_notify_route_via_control_socket_includes_attachments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "control.sock"
+            attachment = Path(tmp) / "media" / "person.png"
+            requests: list[dict] = []
+
+            async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                requests.append(json.loads((await reader.readline()).decode("utf-8")))
+                writer.write(b'{"status":"delivered"}\n')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_unix_server(handle, path=str(socket_path))
+            async with server:
+                response = await cli_module.notify_route_via_control_socket(
+                    socket_path,
+                    "camera-person",
+                    payload={"camera": "front"},
+                    attachments=[attachment],
+                    client_timeout=1.5,
+                )
+                server.close()
+                await server.wait_closed()
+
+        self.assertEqual(response, {"status": "delivered"})
+        self.assertEqual(
+            requests,
+            [
+                {
+                    "command": "notify_route",
+                    "notification_id": "camera-person",
+                    "payload": {"camera": "front"},
+                    "attachments": [str(attachment)],
+                }
+            ],
+        )
+
     async def test_preflight_permissions_via_control_socket_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             socket_path = Path(tmp) / "control.sock"
@@ -556,6 +594,69 @@ router:
             ):
                 self.assertEqual(await cli_module._notify_route(args), 1)
             notify.assert_not_awaited()
+
+    async def test_notify_route_passes_cli_attachment_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload_file = Path(tmp) / "payload.json"
+            payload_file.write_text('{"camera":"front"}', encoding="utf-8")
+            attachment = Path(tmp) / "media" / "person.png"
+            args = argparse.Namespace(
+                config=Path(tmp) / "missing-config.yaml",
+                control_socket=Path("override/control.sock"),
+                notification_id="camera-person",
+                payload_file=payload_file,
+                attachment=[attachment],
+                idempotency_key=None,
+                timeout=None,
+                client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+            )
+
+            with (
+                patch.object(cli_module, "load_router_config", side_effect=AssertionError),
+                patch.object(
+                    cli_module,
+                    "notify_route_via_control_socket",
+                    AsyncMock(return_value={"status": "delivered"}),
+                ) as notify,
+                patch("builtins.print"),
+            ):
+                code = await cli_module._notify_route(args)
+
+        self.assertEqual(code, 0)
+        notify.assert_awaited_once_with(
+            Path("override/control.sock"),
+            "camera-person",
+            payload={"camera": "front"},
+            attachments=[attachment],
+            idempotency_key=None,
+            timeout=None,
+            client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+        )
+
+    async def test_notify_route_rejects_multiple_cli_attachments_locally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload_file = Path(tmp) / "payload.json"
+            payload_file.write_text('{"camera":"front"}', encoding="utf-8")
+            args = argparse.Namespace(
+                config=Path(tmp) / "missing-config.yaml",
+                control_socket=Path("override/control.sock"),
+                notification_id="camera-person",
+                payload_file=payload_file,
+                attachment=[Path(tmp) / "a.png", Path(tmp) / "b.png"],
+                idempotency_key=None,
+                timeout=None,
+                client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+            )
+
+            with (
+                patch.object(cli_module, "load_router_config", side_effect=AssertionError),
+                patch.object(cli_module, "notify_route_via_control_socket", AsyncMock()) as notify,
+                patch.object(cli_module.logging, "error"),
+            ):
+                code = await cli_module._notify_route(args)
+
+        self.assertEqual(code, 1)
+        notify.assert_not_awaited()
 
     async def test_preflight_permissions_uses_probe_contract_and_exit_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

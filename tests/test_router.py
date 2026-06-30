@@ -8,6 +8,7 @@ import re
 import tempfile
 import time
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import patch
 
@@ -23,6 +24,7 @@ from signal_hermes_router.dedupe import DedupeStore
 from signal_hermes_router.models import (
     ChatType,
     NormalizedEvent,
+    OutboundAttachment,
     RouteState,
     SessionPolicy,
     SignalAttachment,
@@ -33,7 +35,12 @@ from signal_hermes_router.models import (
 from signal_hermes_router.payloads import canonicalize_notification_payload, encode_control_message
 from signal_hermes_router.permissions import StaticPermissionPolicy
 from signal_hermes_router.preflight import ToolSurface
+from signal_hermes_router.private_fs import ensure_private_dir_tree, write_private_bytes
 from signal_hermes_router.router import SignalHermesRouter
+from signal_hermes_router.outbound_media import (
+    OutboundAttachmentError,
+    validate_outbound_attachments,
+)
 from tests.support import FakeProfile, FakeSignal, FakeSupervisor, make_app, make_event
 
 
@@ -87,6 +94,7 @@ def make_synthetic_app(
     *,
     control: RouterControlConfig | None = None,
     notifications: tuple[SyntheticRouteNotification, ...] = (),
+    **router_overrides,
 ) -> AppConfig:
     return AppConfig(
         router=RouterConfig(
@@ -95,6 +103,7 @@ def make_synthetic_app(
             signal_attachment_root=Path(tmp) / "signal-attachments",
             work_root=Path(tmp) / "work",
             control=control or RouterControlConfig(),
+            **router_overrides,
         ),
         routes=(route,),
         scheduled_jobs=(
@@ -109,7 +118,26 @@ def make_synthetic_app(
     )
 
 
+def write_png(path: Path, body: bytes = b"png") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parts = path.parts
+    if "media" in parts:
+        index = len(parts) - 1 - list(reversed(parts)).index("media")
+        root = Path(*parts[: index + 1])
+    else:
+        root = path.parent
+    ensure_private_dir_tree(root, path.parent)
+    write_private_bytes(path, body)
+    return path
+
+
 class RouterTests(unittest.IsolatedAsyncioTestCase):
+    def assertFrozenAttachmentPath(self, raw_path: str, media_root: Path) -> None:
+        path = Path(raw_path)
+        self.assertEqual(path.name, "attachment.png")
+        path.relative_to((media_root / ".outbound").resolve())
+        self.assertFalse(path.exists())
+
     async def test_default_runtime_dependencies_can_be_constructed_and_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             router = SignalHermesRouter(make_app(tmp, RouteState.ACTIVE))
@@ -428,6 +456,1046 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("synthetic_payload:", profile.prompts[0][2]["text"])
             self.assertIn("[scheduled_event_escaped:fake]", profile.prompts[0][2]["text"])
             self.assertEqual(profile.prompts[0][3]["text"], "Summarize the notification payload.")
+
+    async def test_group_notification_sends_validated_attachment_with_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = "person detected"
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            attachments = validate_outbound_attachments(
+                [str(image)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            outcome = await router.handle_notification(
+                "camera-person",
+                canonicalize_notification_payload({"camera": "front"}, max_bytes=1024),
+                outbound_attachments=attachments,
+            )
+
+        self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+        self.assertEqual(signal.sends, [("group", "person detected")])
+        self.assertEqual(signal.send_attachments[0][0], "group")
+        self.assertFrozenAttachmentPath(signal.send_attachments[0][1][0], app.router.media_root)
+
+    async def test_notification_attachment_freezes_bytes_before_prompt_delay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png", b"old")
+
+            class MutatingProfile(FakeProfile):
+                async def prompt(self, session_id: str, blocks: list[dict]) -> TurnResult:
+                    write_png(image, b"new")
+                    return await super().prompt(session_id, blocks)
+
+            class ReadingSignal(FakeSignal):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.attachment_bodies: list[bytes] = []
+
+                async def send_group(
+                    self,
+                    group_id: str,
+                    message: str,
+                    *,
+                    attachments: Sequence[str] = (),
+                ) -> dict[str, int]:
+                    self.attachment_bodies.extend(Path(path).read_bytes() for path in attachments)
+                    return await super().send_group(group_id, message, attachments=attachments)
+
+            signal = ReadingSignal()
+            profile = MutatingProfile()
+            profile.reply_text = "person detected"
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            attachments = validate_outbound_attachments(
+                [str(image)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            outcome = await router.handle_notification(
+                "camera-person",
+                canonicalize_notification_payload({"camera": "front"}, max_bytes=1024),
+                outbound_attachments=attachments,
+            )
+            mutated_source_body = image.read_bytes()
+
+        self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+        self.assertEqual(signal.attachment_bodies, [b"old"])
+        self.assertEqual(mutated_source_body, b"new")
+
+    async def test_freeze_and_cleanup_respect_router_owned_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            app = make_synthetic_app(tmp, route)
+            source = write_png(Path(tmp) / "media" / "camera" / "source.png")
+            frozen_path = write_png(
+                Path(tmp) / "media" / ".outbound" / "existing" / "attachment.png"
+            )
+            source_attachment = OutboundAttachment(
+                path=source.resolve(),
+                content_type="image/png",
+                size=source.stat().st_size,
+            )
+            router_owned_attachment = OutboundAttachment(
+                path=frozen_path.resolve(),
+                content_type="image/png",
+                size=frozen_path.stat().st_size,
+                owned_by_router=True,
+            )
+            router = SignalHermesRouter(
+                app,
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            frozen = router._freeze_outbound_attachments((router_owned_attachment,))
+            router._cleanup_owned_outbound_attachments((source_attachment,))
+            source_still_exists = source.exists()
+            router._cleanup_owned_outbound_attachments(frozen)
+
+            self.assertEqual(frozen, (router_owned_attachment,))
+            self.assertTrue(source_still_exists)
+            self.assertFalse(frozen_path.exists())
+
+    async def test_freeze_outbound_attachments_cleans_partial_copy_when_later_file_grows(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            app = make_synthetic_app(tmp, route, max_attachment_bytes=3)
+            first = write_png(Path(tmp) / "media" / "camera" / "first.png", b"ok")
+            second = write_png(Path(tmp) / "media" / "camera" / "second.png", b"abcd")
+            first_attachment = validate_outbound_attachments(
+                [str(first)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )[0]
+            second_attachment = OutboundAttachment(
+                path=second.resolve(),
+                content_type="image/png",
+                size=app.router.max_attachment_bytes,
+            )
+            router = SignalHermesRouter(
+                app,
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            def validate_with_growth_race(
+                raw,
+                *,
+                media_root: Path,
+                max_bytes: int,
+            ):
+                if raw == [str(second.resolve())]:
+                    return (second_attachment,)
+                return validate_outbound_attachments(
+                    raw, media_root=media_root, max_bytes=max_bytes
+                )
+
+            with (
+                patch(
+                    "signal_hermes_router.router.validate_outbound_attachments",
+                    side_effect=validate_with_growth_race,
+                ),
+                self.assertRaises(OutboundAttachmentError) as raised,
+            ):
+                router._freeze_outbound_attachments((first_attachment, second_attachment))
+
+            self.assertEqual(raised.exception.error_code, "attachment_too_large")
+            self.assertFalse((app.router.media_root / ".outbound").exists())
+
+    async def test_freeze_outbound_attachment_cleans_copy_when_frozen_name_fails_validation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            app = make_synthetic_app(tmp, route)
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png.gz")
+            attachment = validate_outbound_attachments(
+                [str(image)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )[0]
+            router = SignalHermesRouter(
+                app,
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertRaises(OutboundAttachmentError) as raised:
+                router._freeze_outbound_attachments((attachment,))
+
+            self.assertEqual(raised.exception.error_code, "attachment_not_image")
+            self.assertFalse((app.router.media_root / ".outbound").exists())
+
+    async def test_freeze_outbound_attachment_reports_source_removed_after_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            app = make_synthetic_app(tmp, route)
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            attachment = validate_outbound_attachments(
+                [str(image)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )[0]
+            router = SignalHermesRouter(
+                app,
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            removed = False
+
+            def validate_then_remove(
+                raw,
+                *,
+                media_root: Path,
+                max_bytes: int,
+            ):
+                nonlocal removed
+                result = validate_outbound_attachments(
+                    raw,
+                    media_root=media_root,
+                    max_bytes=max_bytes,
+                )
+                if not removed and raw == [str(image.resolve())]:
+                    removed = True
+                    image.unlink()
+                return result
+
+            with (
+                patch(
+                    "signal_hermes_router.router.validate_outbound_attachments",
+                    side_effect=validate_then_remove,
+                ),
+                self.assertRaises(OutboundAttachmentError) as raised,
+            ):
+                router._freeze_outbound_attachments((attachment,))
+
+            self.assertEqual(raised.exception.error_code, "attachment_not_found")
+            self.assertFalse((app.router.media_root / ".outbound").exists())
+
+    async def test_freeze_outbound_attachment_reports_source_permission_error_after_validation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            app = make_synthetic_app(tmp, route)
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            attachment = validate_outbound_attachments(
+                [str(image)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )[0]
+            router = SignalHermesRouter(
+                app,
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            original_open = Path.open
+
+            def deny_source_open(self, *args, **kwargs):
+                if self == image.resolve():
+                    raise PermissionError("denied")
+                return original_open(self, *args, **kwargs)
+
+            with (
+                patch.object(Path, "open", deny_source_open),
+                self.assertRaises(OutboundAttachmentError) as raised,
+            ):
+                router._freeze_outbound_attachments((attachment,))
+
+            self.assertEqual(raised.exception.error_code, "attachment_not_readable")
+            self.assertFalse((app.router.media_root / ".outbound").exists())
+
+    async def test_notification_attachment_uses_fallback_when_reply_text_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = ""
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            attachments = validate_outbound_attachments(
+                [str(image)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            outcome = await router.handle_notification(
+                "camera-person",
+                canonicalize_notification_payload({"camera": "front"}, max_bytes=1024),
+                outbound_attachments=attachments,
+            )
+
+        self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+        self.assertTrue(outcome.reply_sent)
+        self.assertEqual(signal.sends, [("group", "Image attached.")])
+        self.assertEqual(signal.send_attachments[0][0], "group")
+        self.assertFrozenAttachmentPath(signal.send_attachments[0][1][0], app.router.media_root)
+
+    async def test_notification_attachment_uses_fallback_when_reply_text_is_whitespace(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = "   "
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            attachments = validate_outbound_attachments(
+                [str(image)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            outcome = await router.handle_notification(
+                "camera-person",
+                canonicalize_notification_payload({"camera": "front"}, max_bytes=1024),
+                outbound_attachments=attachments,
+            )
+
+        self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+        self.assertTrue(outcome.reply_sent)
+        self.assertEqual(signal.sends, [("group", "Image attached.")])
+        self.assertEqual(signal.send_attachments[0][0], "group")
+        self.assertFrozenAttachmentPath(signal.send_attachments[0][1][0], app.router.media_root)
+
+    async def test_direct_notification_sends_validated_attachment_with_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-direct",
+                chat_type=ChatType.DIRECT,
+                sender_id="sender-uuid",
+                sender_number="+00000000000",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_SENDER,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = "person detected"
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-direct",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            attachments = validate_outbound_attachments(
+                [str(image)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            outcome = await router.handle_notification(
+                "camera-person",
+                canonicalize_notification_payload({"camera": "front"}, max_bytes=1024),
+                outbound_attachments=attachments,
+            )
+
+        self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+        self.assertEqual(signal.direct_sends, [("sender-uuid", "person detected")])
+        self.assertEqual(signal.direct_send_attachments[0][0], "sender-uuid")
+        self.assertFrozenAttachmentPath(
+            signal.direct_send_attachments[0][1][0],
+            app.router.media_root,
+        )
+
+    async def test_chunked_notification_attachment_is_sent_only_on_first_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = "x" * 4000
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            attachments = validate_outbound_attachments(
+                [str(image)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            await router.handle_notification(
+                "camera-person",
+                canonicalize_notification_payload({"camera": "front"}, max_bytes=1024),
+                outbound_attachments=attachments,
+            )
+
+        self.assertGreater(len(signal.sends), 1)
+        self.assertEqual(signal.send_attachments[0][0], "group")
+        self.assertFrozenAttachmentPath(signal.send_attachments[0][1][0], app.router.media_root)
+        for _, attached_paths in signal.send_attachments[1:]:
+            self.assertEqual(attached_paths, ())
+
+    async def test_notify_route_rejects_invalid_attachment_before_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    notifications=(
+                        SyntheticRouteNotification(
+                            id="camera-person",
+                            route_name="camera-route",
+                            prompt="Summarize the camera alert.",
+                        ),
+                    ),
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            response = await router._handle_control_line(
+                b'{"command":"notify_route","notification_id":"camera-person",'
+                b'"payload":{"camera":"front"},"attachments":["relative.png"]}\n'
+            )
+
+        self.assertEqual(
+            response,
+            {
+                "status": "error",
+                "route_state": "active",
+                "synthetic_id": "camera-person",
+                "synthetic_kind": "notification",
+                "error": "attachment_path_not_absolute",
+            },
+        )
+        self.assertEqual(profile.prompts, [])
+        self.assertEqual(signal.sends, [])
+
+    async def test_notify_route_state_gate_skips_before_reading_unused_attachment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.DISABLED,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    notifications=(
+                        SyntheticRouteNotification(
+                            id="camera-person",
+                            route_name="camera-route",
+                            prompt="Summarize the camera alert.",
+                        ),
+                    ),
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            response = await router._handle_control_line(
+                encode_control_message(
+                    {
+                        "command": "notify_route",
+                        "notification_id": "camera-person",
+                        "payload": {"camera": "front"},
+                        "attachments": [str(Path(tmp) / "media" / "camera" / "missing.png")],
+                    }
+                )
+            )
+
+        self.assertEqual(
+            response,
+            {
+                "status": "skipped",
+                "route_state": "disabled",
+                "synthetic_id": "camera-person",
+                "synthetic_kind": "notification",
+            },
+        )
+        self.assertEqual(profile.prompts, [])
+        self.assertEqual(signal.sends, [])
+
+    async def test_notify_route_control_line_sends_valid_attachment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = "person detected"
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            response = await router._handle_control_line(
+                encode_control_message(
+                    {
+                        "command": "notify_route",
+                        "notification_id": "camera-person",
+                        "payload": {"camera": "front"},
+                        "attachments": [str(image)],
+                    }
+                )
+            )
+
+        self.assertEqual(response["status"], "delivered")
+        self.assertEqual(signal.sends, [("group", "person detected")])
+        self.assertEqual(signal.send_attachments[0][0], "group")
+        self.assertFrozenAttachmentPath(signal.send_attachments[0][1][0], app.router.media_root)
+
+    async def test_notify_route_freezes_attachment_before_waiting_on_route_lock(self) -> None:
+        class ReadingSignal(FakeSignal):
+            def __init__(self) -> None:
+                super().__init__()
+                self.attachment_bodies: list[bytes] = []
+
+            async def send_group(
+                self,
+                group_id: str,
+                message: str,
+                *,
+                attachments: Sequence[str] = (),
+            ) -> dict[str, int]:
+                self.attachment_bodies.extend(Path(path).read_bytes() for path in attachments)
+                return await super().send_group(group_id, message, attachments=attachments)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = ReadingSignal()
+            profile = FakeProfile()
+            profile.reply_text = "person detected"
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png", b"first")
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            lock = router._route_lock(route)
+            await lock.acquire()
+            task = asyncio.create_task(
+                router._handle_control_line(
+                    encode_control_message(
+                        {
+                            "command": "notify_route",
+                            "notification_id": "camera-person",
+                            "payload": {"camera": "front"},
+                            "attachments": [str(image)],
+                            "timeout": 1,
+                        }
+                    )
+                )
+            )
+            try:
+                outbound_root = app.router.media_root / ".outbound"
+                for _ in range(50):
+                    if outbound_root.exists():
+                        break
+                    await asyncio.sleep(0.001)
+                self.assertTrue(outbound_root.exists())
+                write_png(image, b"second")
+            finally:
+                lock.release()
+            response = await task
+
+        self.assertEqual(response["status"], "delivered")
+        self.assertEqual(signal.attachment_bodies, [b"first"])
+        self.assertFalse((app.router.media_root / ".outbound").exists())
+
+    async def test_notify_route_rejects_falsey_malformed_attachments(self) -> None:
+        for raw_attachments in (None, "", {}):
+            with self.subTest(raw_attachments=raw_attachments):
+                with tempfile.TemporaryDirectory() as tmp:
+                    route = Route(
+                        platform="signal",
+                        name="camera-route",
+                        group_id="group",
+                        profile="profile",
+                        session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                        state=RouteState.ACTIVE,
+                    )
+                    signal = FakeSignal()
+                    profile = FakeProfile()
+                    router = SignalHermesRouter(
+                        make_synthetic_app(
+                            tmp,
+                            route,
+                            notifications=(
+                                SyntheticRouteNotification(
+                                    id="camera-person",
+                                    route_name="camera-route",
+                                    prompt="Summarize the camera alert.",
+                                ),
+                            ),
+                        ),
+                        signal_client=signal,  # type: ignore[arg-type]
+                        supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                        dedupe=DedupeStore(),
+                    )
+
+                    response = await router._handle_control_line(
+                        encode_control_message(
+                            {
+                                "command": "notify_route",
+                                "notification_id": "camera-person",
+                                "payload": {"camera": "front"},
+                                "attachments": raw_attachments,
+                            }
+                        )
+                    )
+
+                self.assertEqual(response["status"], "error")
+                self.assertEqual(response["error"], "invalid_attachment")
+                self.assertEqual(profile.prompts, [])
+                self.assertEqual(signal.sends, [])
+
+    async def test_notify_route_rejects_attachment_with_remote_signal_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+                signal_base_url="http://signal.example:8080",
+                allow_remote_signal_base_url=True,
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            response = await router._handle_control_line(
+                encode_control_message(
+                    {
+                        "command": "notify_route",
+                        "notification_id": "camera-person",
+                        "payload": {"camera": "front"},
+                        "attachments": [str(image)],
+                    }
+                )
+            )
+
+        self.assertEqual(
+            response,
+            {
+                "status": "error",
+                "route_state": "active",
+                "synthetic_id": "camera-person",
+                "synthetic_kind": "notification",
+                "error": "attachment_signal_daemon_not_local",
+            },
+        )
+        self.assertEqual(profile.prompts, [])
+        self.assertEqual(signal.sends, [])
+
+    async def test_notify_route_idempotent_retry_dedupes_before_attachment_validation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = "person detected"
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            request = {
+                "command": "notify_route",
+                "notification_id": "camera-person",
+                "payload": {"camera": "front"},
+                "attachments": [str(image)],
+                "idempotency_key": "camera-person-1",
+            }
+
+            delivered = await router._handle_control_line(encode_control_message(request))
+            image.unlink()
+            retried = await router._handle_control_line(encode_control_message(request))
+
+        self.assertEqual(delivered["status"], "delivered")
+        self.assertEqual(retried["status"], "deduped")
+        self.assertEqual(signal.sends, [("group", "person detected")])
+
+    async def test_notify_route_processing_idempotency_skips_attachment_validation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            notification = SyntheticRouteNotification(
+                id="camera-person",
+                route_name="camera-route",
+                prompt="Summarize the camera alert.",
+            )
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(notification,),
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            idempotency_key = "camera-person-1"
+            dedupe_sender_id, dedupe_timestamp = router._synthetic_dedupe_identity(
+                notification.namespace,
+                scheduled_at=None,
+                idempotency_key=idempotency_key,
+                triggered_at_ms=0,
+            )
+            self.assertTrue(router.dedupe.claim(route.key, dedupe_sender_id, dedupe_timestamp))
+
+            with patch(
+                "signal_hermes_router.router.validate_outbound_attachments",
+                side_effect=AssertionError("processing retry should not validate attachments"),
+            ):
+                response = await router._handle_control_line(
+                    encode_control_message(
+                        {
+                            "command": "notify_route",
+                            "notification_id": "camera-person",
+                            "payload": {"camera": "front"},
+                            "attachments": [str(Path(tmp) / "media" / "camera" / "missing.png")],
+                            "idempotency_key": idempotency_key,
+                        }
+                    )
+                )
+
+        self.assertEqual(response["status"], "deduped")
+        self.assertEqual(profile.prompts, [])
+        self.assertEqual(signal.sends, [])
+
+    async def test_notify_route_in_flight_idempotency_does_not_short_circuit_as_deduped(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            notification = SyntheticRouteNotification(
+                id="camera-person",
+                route_name="camera-route",
+                prompt="Summarize the camera alert.",
+            )
+            signal = FakeSignal()
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(notification,),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            idempotency_key = "camera-person-1"
+            dedupe_sender_id, dedupe_timestamp = router._synthetic_dedupe_identity(
+                notification.namespace,
+                scheduled_at=None,
+                idempotency_key=idempotency_key,
+                triggered_at_ms=0,
+            )
+            self.assertTrue(router.dedupe.claim(route.key, dedupe_sender_id, dedupe_timestamp))
+            lock = router._route_lock(route)
+            await lock.acquire()
+            image.unlink()
+            try:
+                response = await router._handle_control_line(
+                    encode_control_message(
+                        {
+                            "command": "notify_route",
+                            "notification_id": "camera-person",
+                            "payload": {"camera": "front"},
+                            "attachments": [str(image)],
+                            "idempotency_key": idempotency_key,
+                            "timeout": 0,
+                        }
+                    )
+                )
+            finally:
+                lock.release()
+
+        self.assertEqual(response["status"], "busy")
+        self.assertEqual(signal.sends, [])
 
     async def test_active_direct_synthetic_job_replies_directly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
