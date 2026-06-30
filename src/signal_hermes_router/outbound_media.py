@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import mimetypes
 import os
 import stat
 from pathlib import Path
@@ -17,6 +18,8 @@ ALLOWED_OUTBOUND_IMAGE_CONTENT_TYPES = frozenset(
         "image/webp",
     }
 )
+
+mimetypes.add_type("image/webp", ".webp")
 
 
 class OutboundAttachmentError(ValueError):

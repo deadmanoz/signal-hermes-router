@@ -167,6 +167,8 @@ async def _notify_route(args: argparse.Namespace) -> int:
             max_bytes=max_payload_bytes,
         )
         attachments = getattr(args, "attachment", []) or []
+        if len(attachments) > 1:
+            raise ValueError("--attachment may be supplied at most once")
         attachment_kwargs = {"attachments": attachments} if attachments else {}
         response = await notify_route_via_control_socket(
             socket_path,

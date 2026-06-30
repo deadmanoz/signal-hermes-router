@@ -124,6 +124,19 @@ class OutboundMediaTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.error_code, "attachment_not_image")
 
+    def test_validate_outbound_attachment_accepts_webp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            media_root = Path(tmp) / "media"
+            image = write_file(media_root / "image.webp", b"webp")
+
+            attachments = validate_outbound_attachments(
+                [str(image)],
+                media_root=media_root,
+                max_bytes=1024,
+            )
+
+        self.assertEqual(attachments[0].content_type, "image/webp")
+
 
 if __name__ == "__main__":
     unittest.main()

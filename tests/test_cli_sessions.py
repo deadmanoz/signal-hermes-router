@@ -633,6 +633,31 @@ router:
             client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
         )
 
+    async def test_notify_route_rejects_multiple_cli_attachments_locally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload_file = Path(tmp) / "payload.json"
+            payload_file.write_text('{"camera":"front"}', encoding="utf-8")
+            args = argparse.Namespace(
+                config=Path(tmp) / "missing-config.yaml",
+                control_socket=Path("override/control.sock"),
+                notification_id="camera-person",
+                payload_file=payload_file,
+                attachment=[Path(tmp) / "a.png", Path(tmp) / "b.png"],
+                idempotency_key=None,
+                timeout=None,
+                client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+            )
+
+            with (
+                patch.object(cli_module, "load_router_config", side_effect=AssertionError),
+                patch.object(cli_module, "notify_route_via_control_socket", AsyncMock()) as notify,
+                patch.object(cli_module.logging, "error"),
+            ):
+                code = await cli_module._notify_route(args)
+
+        self.assertEqual(code, 1)
+        notify.assert_not_awaited()
+
     async def test_preflight_permissions_uses_probe_contract_and_exit_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "config.yaml"

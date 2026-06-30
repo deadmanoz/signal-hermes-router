@@ -722,6 +722,53 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(profile.prompts, [])
         self.assertEqual(signal.sends, [])
 
+    async def test_notify_route_control_line_sends_valid_attachment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = "person detected"
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            response = await router._handle_control_line(
+                encode_control_message(
+                    {
+                        "command": "notify_route",
+                        "notification_id": "camera-person",
+                        "payload": {"camera": "front"},
+                        "attachments": [str(image)],
+                    }
+                )
+            )
+
+        self.assertEqual(response["status"], "delivered")
+        self.assertEqual(signal.sends, [("group", "person detected")])
+        self.assertEqual(signal.send_attachments, [("group", (str(image.resolve()),))])
+
     async def test_active_direct_synthetic_job_replies_directly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = make_direct_route()
