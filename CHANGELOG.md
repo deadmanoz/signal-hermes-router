@@ -5,7 +5,7 @@
 
 ### Features
 
-* **router:** add generic failure diagnostics ([#24](https://github.com/deadmanoz/signal-hermes-router/issues/24)) ([6571227](https://github.com/deadmanoz/signal-hermes-router/commit/657122762298e5d84eeb9fce70907db0dde282db))
+* **router:** add generic failure diagnostics ([#24](https://github.com/deadmanoz/signal-hermes-router/issues/24))
 
 ## [0.1.11](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.10...v0.1.11) (2026-06-30)
 
