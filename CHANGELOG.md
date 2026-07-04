@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.12](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.11...v0.1.12) (2026-07-04)
+
+
+### Features
+
+* **router:** add generic failure diagnostics ([#24](https://github.com/deadmanoz/signal-hermes-router/issues/24))
+
 ## [0.1.11](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.10...v0.1.11) (2026-06-30)
 
 
