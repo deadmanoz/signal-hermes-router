@@ -82,6 +82,18 @@ def main(argv: list[str] | None = None) -> None:
         help="local control socket round-trip timeout in seconds",
     )
     preflight.add_argument("--control-socket", type=Path)
+    status = subparsers.add_parser("route-status", help="inspect route health and recovery state")
+    status.add_argument("--route", action="append", default=[])
+    status.add_argument("--route-index", action="append", type=int, default=[])
+    status.add_argument("--profile", action="append", default=[])
+    status.add_argument("--json", action="store_true")
+    status.add_argument(
+        "--client-timeout",
+        type=float,
+        default=DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+        help="local control socket round-trip timeout in seconds",
+    )
+    status.add_argument("--control-socket", type=Path)
     args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
     exit_code = asyncio.run(_main_async(args))
@@ -99,6 +111,8 @@ async def _main_async(args: argparse.Namespace) -> int:
         return await _notify_route(args)
     if args.command == "preflight-permissions":
         return await _preflight_permissions(args)
+    if args.command == "route-status":
+        return await _route_status(args)
     raise ValueError(f"unknown command {args.command!r}")
 
 
@@ -237,6 +251,32 @@ async def _preflight_permissions(args: argparse.Namespace) -> int:
     return 0 if report.ok else 1
 
 
+async def _route_status(args: argparse.Namespace) -> int:
+    try:
+        socket_path = (
+            args.control_socket or load_router_config(args.config).control_socket_path
+        ).expanduser()
+        client_timeout = getattr(args, "client_timeout", DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS)
+        if client_timeout is not None and client_timeout < 0:
+            raise ValueError("--client-timeout must be non-negative")
+        response = await route_status_via_control_socket(
+            socket_path,
+            route_names=tuple(args.route),
+            route_indexes=tuple(args.route_index),
+            profiles=tuple(args.profile),
+            client_timeout=client_timeout,
+        )
+    except Exception as exc:
+        logging.error("route-status failed: %s", exc.__class__.__name__)
+        logging.debug("route-status failure details", exc_info=True)
+        return 1
+    if args.json:
+        print(json.dumps(response, sort_keys=True))
+    else:
+        print(_format_route_status_response(response))
+    return 0 if response.get("status") == "ok" else 1
+
+
 def _preflight_scope_from_args(args: argparse.Namespace) -> PreflightScope:
     return parse_preflight_scope(
         {
@@ -282,6 +322,31 @@ def _format_preflight_response(response: dict[str, Any]) -> str:
             lines.append(
                 f"- {tool.get('route_ref')} {tool.get('profile')} {source} {tool.get('tool')}"
             )
+    return "\n".join(lines)
+
+
+def _format_route_status_response(response: dict[str, Any]) -> str:
+    if response.get("status") != "ok":
+        return f"Route status: {response.get('status', 'unknown')}"
+    lines = [
+        f"Route status: {response.get('route_count', len(response.get('routes') or []))} route(s)"
+    ]
+    for route in response.get("routes") or []:
+        if not isinstance(route, dict):
+            continue
+        session = route.get("session") or {}
+        circuit = route.get("circuit") or {}
+        last_failure = route.get("last_failure") or {}
+        suffix = ""
+        if last_failure:
+            suffix = f" last_failure={last_failure.get('code', 'unknown')}"
+        lines.append(
+            f"- {route.get('route_ref')} state={route.get('route_state')} "
+            f"profile={route.get('profile')} session={session.get('policy')} "
+            f"cached={session.get('cached_sessions', 0)} "
+            f"circuit={circuit.get('state')} failures={circuit.get('failure_count', 0)}"
+            f"{suffix}"
+        )
     return "\n".join(lines)
 
 
@@ -354,6 +419,24 @@ async def preflight_permissions_via_control_socket(
         "command": "preflight_permissions",
         "scope": scope.to_dict(),
     }
+    return await _control_round_trip(socket_path, request, client_timeout=client_timeout)
+
+
+async def route_status_via_control_socket(
+    socket_path: Path,
+    *,
+    route_names: Sequence[str] = (),
+    route_indexes: Sequence[int] = (),
+    profiles: Sequence[str] = (),
+    client_timeout: float | None = DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {"command": "route_status"}
+    if route_names:
+        request["routes"] = list(route_names)
+    if route_indexes:
+        request["route_indexes"] = list(route_indexes)
+    if profiles:
+        request["profiles"] = list(profiles)
     return await _control_round_trip(socket_path, request, client_timeout=client_timeout)
 
 

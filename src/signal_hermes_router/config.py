@@ -85,6 +85,7 @@ class Route:
     friendly_name: str | None = None
     maintenance_reply: str | None = None
     failure_reply: str | None = None
+    recreate_session_on_resume_failure: bool = False
 
     @property
     def key(self) -> str:
@@ -499,6 +500,9 @@ def parse_route(raw: dict[str, Any]) -> Route:
         friendly_name=raw.get("friendly_name"),
         maintenance_reply=raw.get("maintenance_reply"),
         failure_reply=raw.get("failure_reply"),
+        recreate_session_on_resume_failure=_as_bool(
+            raw.get("recreate_session_on_resume_failure", False)
+        ),
     )
 
 

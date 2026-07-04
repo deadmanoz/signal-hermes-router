@@ -139,6 +139,11 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await cli_module._main_async(preflight_args), 0)
         preflight.assert_awaited_once_with(preflight_args)
 
+        status_args = argparse.Namespace(command="route-status")
+        with patch.object(cli_module, "_route_status", AsyncMock(return_value=0)) as status:
+            self.assertEqual(await cli_module._main_async(status_args), 0)
+        status.assert_awaited_once_with(status_args)
+
         with self.assertRaisesRegex(ValueError, "unknown command"):
             await cli_module._main_async(argparse.Namespace(command="unknown"))
 
@@ -307,6 +312,43 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
                             "route_indexes": [0],
                             "profiles": ["profile"],
                         },
+                    }
+                ],
+            )
+
+    async def test_route_status_via_control_socket_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "control.sock"
+            requests: list[dict] = []
+
+            async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                requests.append(json.loads((await reader.readline()).decode("utf-8")))
+                writer.write(b'{"status":"ok","routes":[],"route_count":0}\n')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_unix_server(handle, path=str(socket_path))
+            async with server:
+                response = await cli_module.route_status_via_control_socket(
+                    socket_path,
+                    route_names=("example-route",),
+                    route_indexes=(0,),
+                    profiles=("profile",),
+                    client_timeout=1.5,
+                )
+                server.close()
+                await server.wait_closed()
+
+            self.assertEqual(response, {"status": "ok", "routes": [], "route_count": 0})
+            self.assertEqual(
+                requests,
+                [
+                    {
+                        "command": "route_status",
+                        "routes": ["example-route"],
+                        "route_indexes": [0],
+                        "profiles": ["profile"],
                     }
                 ],
             )
@@ -890,6 +932,64 @@ routes:
         self.assertIn("route:example example-profile route web_search", output)
         logged_warning.assert_called_once()
 
+    async def test_route_status_uses_control_socket_and_formats_text_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            config.write_text(
+                """
+router:
+  control:
+    socket_path: private/control.sock
+""",
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                config=config,
+                control_socket=None,
+                route=["agenda-route"],
+                route_index=[],
+                profile=["profile"],
+                json=False,
+                client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+            )
+            response = {
+                "status": "ok",
+                "route_count": 1,
+                "routes": [
+                    {
+                        "route_ref": "route:agenda-route",
+                        "route_state": "active",
+                        "profile": "profile",
+                        "session": {
+                            "policy": "persistent_route",
+                            "cached_sessions": 1,
+                        },
+                        "circuit": {"state": "closed", "failure_count": 0},
+                    }
+                ],
+            }
+            with (
+                patch.object(
+                    cli_module,
+                    "route_status_via_control_socket",
+                    AsyncMock(return_value=response),
+                ) as route_status,
+                patch("builtins.print") as printed,
+            ):
+                code = await cli_module._route_status(args)
+
+        self.assertEqual(code, 0)
+        route_status.assert_awaited_once_with(
+            Path("private/control.sock"),
+            route_names=("agenda-route",),
+            route_indexes=(),
+            profiles=("profile",),
+            client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+        )
+        output = printed.call_args.args[0]
+        self.assertIn("Route status: 1 route(s)", output)
+        self.assertIn("route:agenda-route state=active", output)
+
     async def test_trigger_job_expands_configured_control_socket_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "config.yaml"
@@ -983,8 +1083,11 @@ class FakeManagedProfile:
 
 
 class RegistryProfile:
-    def __init__(self, *, resume_result: bool = True) -> None:
+    def __init__(
+        self, *, resume_result: bool = True, resume_exception: Exception | None = None
+    ) -> None:
         self.resume_result = resume_result
+        self.resume_exception = resume_exception
         self.new_sessions = 0
         self.new_session_cwds: list[Path] = []
         self.resume_calls: list[tuple[str, Path]] = []
@@ -997,6 +1100,8 @@ class RegistryProfile:
 
     async def resume_session(self, session_id: str, cwd: Path) -> bool:
         self.resume_calls.append((session_id, cwd))
+        if self.resume_exception is not None:
+            raise self.resume_exception
         return self.resume_result
 
     def set_permission_policy(self, session_id: str, policy: StaticPermissionPolicy) -> None:
@@ -1143,6 +1248,60 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(replacement.profile, replacement_profile)
             self.assertEqual(replacement.session_id, first.session_id)
             self.assertEqual(replacement_profile.resume_calls, [(first.session_id, first.cwd)])
+
+    async def test_resume_exception_surfaces_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first_profile = RegistryProfile()
+            supervisor = MutableSupervisor(first_profile)
+            registry = SessionRegistry(Path(tmp), supervisor=supervisor)  # type: ignore[arg-type]
+            route = make_route()
+            event = make_event()
+
+            first = await registry.get(route, event)
+            replacement_profile = RegistryProfile(resume_exception=RuntimeError("resume failed"))
+            supervisor.profile = replacement_profile
+
+            with self.assertRaisesRegex(RuntimeError, "resume failed"):
+                await registry.get(route, event)
+
+            self.assertEqual(replacement_profile.resume_calls, [(first.session_id, first.cwd)])
+            self.assertEqual(replacement_profile.new_sessions, 0)
+
+    async def test_resume_exception_recreates_when_route_opts_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first_profile = RegistryProfile()
+            supervisor = MutableSupervisor(first_profile)
+            registry = SessionRegistry(Path(tmp), supervisor=supervisor)  # type: ignore[arg-type]
+            route = make_route(recreate_session_on_resume_failure=True)
+            event = make_event()
+
+            first = await registry.get(route, event)
+            replacement_profile = RegistryProfile(resume_exception=RuntimeError("resume failed"))
+            supervisor.profile = replacement_profile
+            replacement = await registry.get(route, event)
+
+            self.assertIs(replacement.profile, replacement_profile)
+            self.assertEqual(replacement_profile.resume_calls, [(first.session_id, first.cwd)])
+            self.assertEqual(replacement_profile.new_sessions, 1)
+            self.assertEqual(replacement.session_id, "session-1")
+
+    async def test_resume_cancellation_is_not_recreated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first_profile = RegistryProfile()
+            supervisor = MutableSupervisor(first_profile)
+            registry = SessionRegistry(Path(tmp), supervisor=supervisor)  # type: ignore[arg-type]
+            route = make_route(recreate_session_on_resume_failure=True)
+            event = make_event()
+
+            first = await registry.get(route, event)
+            replacement_profile = RegistryProfile(resume_exception=asyncio.CancelledError())
+            supervisor.profile = replacement_profile
+
+            with self.assertRaises(asyncio.CancelledError):
+                await registry.get(route, event)
+
+            self.assertEqual(replacement_profile.resume_calls, [(first.session_id, first.cwd)])
+            self.assertEqual(replacement_profile.new_sessions, 0)
 
     async def test_ephemeral_replacement_after_restart_is_not_cached(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

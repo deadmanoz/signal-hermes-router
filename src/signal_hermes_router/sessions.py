@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import time
@@ -9,7 +10,7 @@ from pathlib import Path
 
 from .acp import ACPProfile, DEFAULT_ACP_PROMPT_TIMEOUT_SECONDS, DEFAULT_MAX_ACP_LINE_BYTES
 from .config import Route
-from .models import ChatType, NormalizedEvent, SessionKeyInput, SessionPolicy
+from .models import ChatType, NormalizedEvent, SessionKeyInput, SessionPolicy, SessionStatus
 from .permissions import StaticPermissionPolicy
 
 LOGGER = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ class SessionRegistry:
         self.work_root = work_root
         self.supervisor = supervisor
         self._sessions: dict[str, RoutedSession] = {}
+        self._session_routes: dict[str, str] = {}
 
     async def get(
         self,
@@ -114,6 +116,7 @@ class SessionRegistry:
             if existing.profile is not profile:
                 existing = await self._resume_or_recreate(route, profile, existing, policy)
                 self._sessions[session_key] = existing
+                self._session_routes[session_key] = route.key
             profile.set_permission_policy(existing.session_id, policy)
             return existing
         cwd = self._cwd(route.profile, session_key)
@@ -125,6 +128,7 @@ class SessionRegistry:
         )
         if not ephemeral:
             self._sessions[session_key] = session
+            self._session_routes[session_key] = route.key
         return session
 
     async def replace_after_restart(
@@ -139,8 +143,22 @@ class SessionRegistry:
         policy = permission_policy or route.permission_policy
         replacement = await self._resume_or_recreate(route, profile, previous, policy)
         if route.session_policy != SessionPolicy.EPHEMERAL:
-            self._sessions[self._session_key(route, session_ref)] = replacement
+            session_key = self._session_key(route, session_ref)
+            self._sessions[session_key] = replacement
+            self._session_routes[session_key] = route.key
         return replacement
+
+    def status_for_route(self, route: Route) -> SessionStatus:
+        keys = [
+            session_key
+            for session_key, route_key in self._session_routes.items()
+            if route_key == route.key and session_key in self._sessions
+        ]
+        return SessionStatus(
+            policy=route.session_policy,
+            cached=bool(keys),
+            cached_sessions=len(keys),
+        )
 
     async def _resume_or_recreate(
         self,
@@ -149,13 +167,29 @@ class SessionRegistry:
         previous: RoutedSession,
         permission_policy: StaticPermissionPolicy,
     ) -> RoutedSession:
-        if await profile.resume_session(previous.session_id, previous.cwd):
-            session_id = previous.session_id
-        else:
-            LOGGER.error(
-                "Hermes profile does not advertise ACP session resume; creating a fresh session"
+        try:
+            resumed = await profile.resume_session(previous.session_id, previous.cwd)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if not route.recreate_session_on_resume_failure:
+                raise
+            # This option deliberately treats every resume exception as stale
+            # session state, including structured provider errors.
+            LOGGER.warning(
+                "Hermes session resume failed for profile %s; creating a fresh session",
+                route.profile,
             )
+            LOGGER.debug("Hermes session resume failure details", exc_info=True)
             session_id = await profile.new_session(previous.cwd)
+        else:
+            if resumed:
+                session_id = previous.session_id
+            else:
+                LOGGER.error(
+                    "Hermes profile does not advertise ACP session resume; creating a fresh session"
+                )
+                session_id = await profile.new_session(previous.cwd)
         profile.set_permission_policy(session_id, permission_policy)
         return RoutedSession(
             profile=profile,

@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from signal_hermes_router.config import (
     AppConfig,
+    CircuitBreakerConfig,
     Route,
     RouterConfig,
     RouterControlConfig,
@@ -1676,6 +1677,57 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
+    async def test_synthetic_failure_recovery_resets_replacement_session_policy(self) -> None:
+        class RestartingSupervisor(FakeSupervisor):
+            def __init__(self, initial: FakeProfile, replacement: FakeProfile) -> None:
+                super().__init__(initial)
+                self.replacement = replacement
+
+            async def restart_profile(self, profile_name: str) -> None:
+                await super().restart_profile(profile_name)
+                self.profile = self.replacement
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route_policy = StaticPermissionPolicy.from_config(
+                [{"tool": "read_file", "arguments": {"path": {"prefix": "/route"}}}]
+            )
+            job_policy = StaticPermissionPolicy.from_config(
+                [{"tool": "read_file", "arguments": {"path": {"prefix": "/job"}}}]
+            )
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                permission_policy=route_policy,
+            )
+            job = SyntheticRouteJob(
+                id="daily-agenda",
+                route_name="agenda-route",
+                prompt="Prepare the synthetic daily agenda.",
+                permission_policy=job_policy,
+            )
+            initial = FakeProfile()
+            initial.fail = True
+            replacement = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route, job),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=RestartingSupervisor(initial, replacement),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                outcome = await router.handle_synthetic_job("daily-agenda", scheduled_at=1)
+
+            self.assertEqual(outcome.status, TurnOutcomeStatus.ERROR)
+            self.assertEqual(
+                replacement.policies,
+                [("session-1", job_policy), ("session-1", route_policy)],
+            )
+
     async def test_synthetic_scheduled_at_and_idempotency_key_are_deduped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = Route(
@@ -1765,6 +1817,105 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(profile.prompts, [])
             self.assertEqual(signal.sends, [])
 
+    async def test_synthetic_hermes_failure_releases_dedupe_for_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.fail = True
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+            profile.fail = False
+            retry = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            self.assertEqual(failed.status, TurnOutcomeStatus.ERROR)
+            self.assertEqual(failed.error, "unknown")
+            self.assertEqual(failed.to_control_response()["failure"]["code"], "unknown")
+            self.assertEqual(retry.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(len(profile.prompts), 2)
+            self.assertEqual(
+                [send[1] for send in signal.sends],
+                ["I hit an internal router error handling that message.", "reply"],
+            )
+
+    async def test_synthetic_maintenance_retry_does_not_mark_dedupe_handled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.fail = True
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    circuit_breaker=CircuitBreakerConfig(failures=1, window_seconds=60),
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+            maintenance = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            self.assertEqual(failed.status, TurnOutcomeStatus.ERROR)
+            self.assertEqual(maintenance.status, TurnOutcomeStatus.DELIVERED)
+            self.assertIsNone(router.dedupe.status("signal:group", "scheduled:daily-agenda", 1000))
+
+            router.route_state_overrides.pop("signal:group", None)
+            router._trip_times.pop("signal:group", None)
+            router._trip_times_ms.pop("signal:group", None)
+            profile.fail = False
+            retried = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            self.assertEqual(retried.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(profile.prompt_session_ids, ["session-1", "session-1"])
+
+    async def test_signal_hermes_failure_marks_event_handled_after_failure_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.fail = True
+            dedupe = DedupeStore()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                first = await router.handle_event(make_event())
+            profile.fail = False
+            duplicate = await router.handle_event(make_event())
+
+            self.assertIsNone(first)
+            self.assertIsNone(duplicate)
+            self.assertEqual(len(profile.prompts), 1)
+            self.assertFalse(dedupe.claim("signal:group", "sender", 1))
+
     async def test_synthetic_send_failure_returns_error_and_marks_dedupe_handled(self) -> None:
         class FlakySignal(FakeSignal):
             def __init__(self) -> None:
@@ -1801,9 +1952,73 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(failed.status, TurnOutcomeStatus.ERROR)
             self.assertEqual(failed.error, "signal_send_failed")
+            self.assertEqual(failed.to_control_response()["failure"]["code"], "signal_send_failed")
             self.assertFalse(failed.to_control_response()["reply_sent"])
             self.assertEqual(retry.status, TurnOutcomeStatus.DEDUPED)
             self.assertEqual(len(profile.prompts), 1)
+            self.assertEqual(signal.sends, [])
+
+    async def test_synthetic_failure_reply_send_failure_preserves_root_failure(self) -> None:
+        class FlakySignal(FakeSignal):
+            async def send_group(self, group_id: str, message: str) -> dict[str, int]:
+                raise RuntimeError("send failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            profile = FakeProfile()
+            profile.fail = True
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=FlakySignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            response = failed.to_control_response()
+            self.assertEqual(response["status"], "error")
+            self.assertFalse(response["reply_sent"])
+            self.assertEqual(response["failure"]["code"], "unknown")
+            self.assertEqual(
+                router._route_status_response({})["routes"][0]["last_failure"]["code"],
+                "unknown",
+            )
+
+    async def test_synthetic_failure_with_empty_failure_reply_does_not_send(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                failure_reply="",
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.fail = True
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route, failure_reply=""),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            self.assertEqual(failed.status, TurnOutcomeStatus.ERROR)
+            self.assertFalse(failed.to_control_response()["reply_sent"])
             self.assertEqual(signal.sends, [])
 
     async def test_synthetic_bare_manual_triggers_are_fresh_with_same_clock(self) -> None:
@@ -2035,6 +2250,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
             self.assertEqual(preflight["issues"][0]["code"], "probe_unsupported")
+            self.assertEqual(preflight["failure"]["code"], "preflight_failed")
             self.assertNotIn("group", json.dumps(preflight, sort_keys=True))
             response = await router._handle_control_line(
                 b'{"command":"trigger_job","job_id":"daily-agenda","scheduled_at":1000}\n'
@@ -2091,6 +2307,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["missing_tools_count"], 1)
         self.assertEqual(response["missing_tools"][0]["tool"], "web_search")
         self.assertEqual(response["issues"][0]["code"], "missing_tool")
+        self.assertEqual(response["failure"]["code"], "permission_denied")
         self.assertNotIn("EXAMPLE_GROUP", json.dumps(response, sort_keys=True))
 
     async def test_control_preflight_reports_busy_profile_without_waiting(self) -> None:
@@ -2131,6 +2348,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(response["issues"][0]["code"], "probe_profile_busy")
+        self.assertEqual(response["failure"]["code"], "preflight_failed")
 
     async def test_control_preflight_reports_supervisor_probe_failure_without_leaking(
         self,
@@ -2169,7 +2387,62 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             [{"profile": "profile", "code": "probe_failed", "error": "RuntimeError"}],
         )
         self.assertEqual(response["issues"][0]["code"], "probe_failed")
+        self.assertEqual(response["failure"]["code"], "preflight_failed")
         self.assertNotIn("private-startup-token", json.dumps(response, sort_keys=True))
+
+    async def test_route_status_reports_health_without_private_route_values(self) -> None:
+        class DetailFailProfile(FakeProfile):
+            async def prompt(self, session_id: str, blocks: list[dict]) -> TurnResult:
+                self.prompt_session_ids.append(session_id)
+                self.prompts.append(blocks)
+                raise RuntimeError(
+                    "failed for EXAMPLE_STATUS_GROUP at https://signal.test/v1 "
+                    "/private/work/session +00000000000 [route_context:begin]"
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="EXAMPLE_STATUS_GROUP",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            success_profile = FakeProfile()
+            supervisor = FakeSupervisor(success_profile)
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=supervisor,  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+            supervisor.profile = DetailFailProfile()
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                await router.handle_synthetic_job("daily-agenda", scheduled_at=1001)
+
+            response = await router._handle_control_line(
+                b'{"command":"route_status","routes":["agenda-route"]}\n'
+            )
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["route_count"], 1)
+        route_status = response["routes"][0]
+        self.assertEqual(route_status["route_ref"], "route:agenda-route")
+        self.assertEqual(route_status["route_state"], "active")
+        self.assertEqual(route_status["session"]["cached_sessions"], 1)
+        self.assertEqual(route_status["circuit"]["failure_count"], 1)
+        self.assertIn("last_success_at_ms", route_status)
+        self.assertEqual(route_status["last_failure"]["code"], "unknown")
+        serialized = json.dumps(response, sort_keys=True)
+        self.assertNotIn("EXAMPLE_STATUS_GROUP", serialized)
+        self.assertNotIn("+00000000000", serialized)
+        self.assertNotIn("signal.test", serialized)
+        self.assertNotIn("/private/work", serialized)
+        self.assertNotIn("route_context", serialized)
 
     async def test_control_line_rejects_invalid_request_fields_and_reports_exceptions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2270,7 +2543,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             self.assertEqual(response["status"], "error")
-            self.assertEqual(response["error"], "RuntimeError")
+            self.assertEqual(response["error"], "router_error")
+            self.assertEqual(response["failure"]["code"], "router_error")
             self.assertEqual(response["job_id"], "daily-agenda")
             self.assertEqual(response["synthetic_id"], "daily-agenda")
             self.assertEqual(response["synthetic_kind"], "scheduled_job")
@@ -3528,6 +3802,123 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(router.route_state_overrides["signal:group"], RouteState.MAINTENANCE)
             self.assertEqual(signal.sends[0][1], "This route is temporarily under maintenance.")
             self.assertEqual(signal.typing, [("group", True), ("group", False)])
+
+    async def test_session_acquisition_failure_is_classified_and_trips_circuit(self) -> None:
+        class FailingSupervisor:
+            def __init__(self) -> None:
+                self.restarts = 0
+
+            async def get_profile(self, route: Route) -> FakeProfile:
+                raise RuntimeError("session setup failed at http://127.0.0.1:8000/private")
+
+            async def restart_profile(self, profile_name: str) -> None:
+                self.restarts += 1
+
+            async def close(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            dedupe = DedupeStore()
+            supervisor = FailingSupervisor()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, failures=1),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=supervisor,  # type: ignore[arg-type]
+                dedupe=dedupe,
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                result = await router.handle_event(make_event())
+
+            self.assertIsNone(result)
+            self.assertEqual(supervisor.restarts, 1)
+            self.assertEqual(router.route_state_overrides["signal:group"], RouteState.MAINTENANCE)
+            self.assertEqual(
+                signal.sends, [("group", "This route is temporarily under maintenance.")]
+            )
+            self.assertFalse(dedupe.claim("signal:group", "sender", 1))
+            status = router._route_status_response({})
+            route_status = status["routes"][0]
+            self.assertEqual(route_status["last_failure"]["code"], "acp_session_failed")
+            self.assertEqual(route_status["circuit"]["state"], "open")
+            self.assertNotIn("profile.local", json.dumps(route_status, sort_keys=True))
+            self.assertNotIn("/private", json.dumps(route_status, sort_keys=True))
+
+    async def test_turn_failure_recovery_preserves_cancellation(self) -> None:
+        class CancellingSupervisor(FakeSupervisor):
+            async def restart_profile(self, profile_name: str) -> None:
+                raise asyncio.CancelledError()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.fail = True
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=CancellingSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertRaises(asyncio.CancelledError):
+                await router.handle_event(make_event())
+
+    async def test_route_status_rejects_invalid_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            response = router._route_status_response({"route_indexes": [True]})
+
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["error"], "invalid_route_status_scope")
+
+    async def test_route_status_filters_by_route_index_and_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            alpha = Route(
+                platform="signal",
+                name="alpha",
+                group_id="EXAMPLE_ALPHA_GROUP",
+                profile="profile-a",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            beta = Route(
+                platform="signal",
+                name="beta",
+                group_id="EXAMPLE_BETA_GROUP",
+                profile="profile-b",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, routes=(alpha, beta)),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            by_name = router._route_status_response({"route": "alpha"})
+            by_index = router._route_status_response({"route_index": 1})
+            by_index_list = router._route_status_response({"route_indexes": [0, 1, 1]})
+            by_profile = router._route_status_response({"profiles": ["profile-b"]})
+            invalid_string_list = router._route_status_response({"routes": [""]})
+            invalid_bool = router._route_status_response({"route_index": True})
+
+        self.assertEqual([route["route_ref"] for route in by_name["routes"]], ["route:alpha"])
+        self.assertEqual([route["route_ref"] for route in by_index["routes"]], ["route:beta"])
+        self.assertEqual(
+            [route["route_ref"] for route in by_index_list["routes"]],
+            ["route:alpha", "route:beta"],
+        )
+        self.assertEqual([route["route_ref"] for route in by_profile["routes"]], ["route:beta"])
+        self.assertEqual(invalid_string_list["error"], "invalid_route_status_scope")
+        self.assertEqual(invalid_bool["error"], "invalid_route_status_scope")
 
     async def test_circuit_recovery_probes_after_cooldown_and_clears_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

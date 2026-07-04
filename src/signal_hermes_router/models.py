@@ -5,6 +5,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from .failures import FailureInfo
+
 
 class RouteState(StrEnum):
     SHADOW = "shadow"
@@ -148,6 +150,7 @@ class TurnOutcome:
     route_state: RouteState | None = None
     result: TurnResult | None = None
     error: str | None = None
+    failure: FailureInfo | None = None
     synthetic_id: str | None = None
     synthetic_kind: SyntheticTurnKind | None = None
     reply_sent: bool | None = None
@@ -166,6 +169,75 @@ class TurnOutcome:
             response["stop_reason"] = self.result.stop_reason
         if self.reply_sent is not None:
             response["reply_sent"] = self.reply_sent
-        if self.error is not None:
+        if self.failure is not None:
+            response["error"] = self.failure.code.value
+            response["failure"] = self.failure.to_dict()
+        elif self.error is not None:
             response["error"] = self.error
         return response
+
+
+@dataclass(frozen=True)
+class SessionStatus:
+    policy: SessionPolicy
+    cached: bool
+    cached_sessions: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "policy": self.policy.value,
+            "cached": self.cached,
+            "cached_sessions": self.cached_sessions,
+        }
+
+
+@dataclass(frozen=True)
+class CircuitStatus:
+    state: str
+    failure_count: int
+    tripped_at_ms: int | None = None
+    cooldown_remaining_seconds: float | None = None
+    last_reset_at_ms: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "state": self.state,
+            "failure_count": self.failure_count,
+        }
+        if self.tripped_at_ms is not None:
+            value["tripped_at_ms"] = self.tripped_at_ms
+        if self.cooldown_remaining_seconds is not None:
+            value["cooldown_remaining_seconds"] = self.cooldown_remaining_seconds
+        if self.last_reset_at_ms is not None:
+            value["last_reset_at_ms"] = self.last_reset_at_ms
+        return value
+
+
+@dataclass(frozen=True)
+class RouteHealth:
+    route_ref: str
+    profile: str
+    route_state: RouteState
+    configured_state: RouteState
+    session: SessionStatus
+    circuit: CircuitStatus
+    last_success_at_ms: int | None = None
+    last_failure_at_ms: int | None = None
+    last_failure: FailureInfo | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "route_ref": self.route_ref,
+            "profile": self.profile,
+            "route_state": self.route_state.value,
+            "configured_state": self.configured_state.value,
+            "session": self.session.to_dict(),
+            "circuit": self.circuit.to_dict(),
+        }
+        if self.last_success_at_ms is not None:
+            value["last_success_at_ms"] = self.last_success_at_ms
+        if self.last_failure_at_ms is not None:
+            value["last_failure_at_ms"] = self.last_failure_at_ms
+        if self.last_failure is not None:
+            value["last_failure"] = self.last_failure.to_dict()
+        return value

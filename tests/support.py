@@ -62,6 +62,7 @@ def make_route(
     friendly_name: str | None = None,
     maintenance_reply: str | None = None,
     failure_reply: str | None = None,
+    recreate_session_on_resume_failure: bool = False,
 ) -> Route:
     return Route(
         platform=platform,
@@ -78,6 +79,7 @@ def make_route(
         friendly_name=friendly_name,
         maintenance_reply=maintenance_reply,
         failure_reply=failure_reply,
+        recreate_session_on_resume_failure=recreate_session_on_resume_failure,
     )
 
 
