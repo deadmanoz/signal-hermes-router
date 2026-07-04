@@ -93,7 +93,12 @@ Defined in `signal_hermes_router.models.SessionPolicy`:
 - `persistent_sender` - one ACP session per `(route, sender)` pair
 - `ephemeral` - a fresh ACP session per turn
 
-Sessions are replaced when the underlying Hermes subprocess restarts. If the Hermes profile advertises `sessionCapabilities.resume`, the router will call `session/resume` rather than creating a new session.
+Sessions are replaced when the underlying Hermes subprocess restarts. If the
+Hermes profile advertises `sessionCapabilities.resume`, the router will call
+`session/resume` rather than creating a new session. By default, a raised
+`session/resume` error still surfaces as an ACP session failure. A persistent
+route can opt into discarding that stale cached session and creating a fresh
+one by setting `recreate_session_on_resume_failure: true`.
 
 ## Route schema
 
@@ -119,6 +124,11 @@ Required keys are listed first; optional keys carry their defaults.
   router discards the event even when `sender_number` matches.
 - `session_policy` (optional, default `persistent_route`) - one of the
   [session policy](#session-policies) values.
+- `recreate_session_on_resume_failure` (optional, default `false`) - for
+  persistent routes, discard a stale cached session and create a fresh session
+  if `session/resume` raises after a Hermes subprocess restart. This does not
+  change `ephemeral` routes, and it does not affect the existing fallback where
+  Hermes returns "resume unsupported" and the router creates a fresh session.
 - `state` (optional, default `shadow`) - one of the [route state](#route-states)
   values.
 - `name` (optional) - stable private selector used by `scheduled_jobs` and
@@ -271,6 +281,14 @@ the control socket instead of supplying a recorded contract:
 signal-hermes-router --config /path/to/private/config.yaml preflight-permissions --active-only --control-socket /path/to/private/control.sock --json
 ```
 
+Use `route-status` to inspect route health, circuit state, cached-session
+state, and the most recent success/failure metadata from the running router:
+
+```bash
+signal-hermes-router --config /path/to/private/config.yaml route-status --json
+signal-hermes-router --config /path/to/private/config.yaml route-status --route agenda-route --profile example-hermes-profile
+```
+
 `--scheduled-at` accepts either an epoch millisecond integer or a timezone-aware
 ISO 8601 timestamp. Naive datetimes are rejected. `--idempotency-key` is hashed
 before it is used in the dedupe identity. Reusing the same `--scheduled-at` or
@@ -315,12 +333,28 @@ Reports use only `route:<name>` or `routes[<index>]` references, profile names,
 source IDs, and tool names. They do not report raw Signal IDs, direct sender
 IDs, route keys, secrets, or permission argument predicates.
 
+`route-status` reports the same safe route references plus route state, session
+policy, cached-session count, circuit state, last success timestamp, and last
+failure metadata. It does not report raw Signal group IDs, direct sender IDs,
+phone numbers, route keys, local filesystem paths, prompt text, or payload
+JSON. Last failures use stable provider-neutral codes such as
+`acp_session_failed`, `acp_prompt_timeout`, `signal_send_failed`,
+`model_auth_failed`, `model_rate_limited`, `model_unavailable`,
+`model_timeout`, and `endpoint_unreachable`. Provider-specific raw diagnostics
+are kept only as bounded sanitized `detail` / `provider_detail` fields. Model
+and endpoint classifications are most reliable when Hermes supplies structured
+JSON-RPC `error.data.code`; otherwise the router applies only conservative
+generic text fallbacks and may report `unknown`. `provider_class` is populated
+only from structured `error.data.provider_class` values of `cloud_api`,
+`local_endpoint`, or `unknown`.
+
 CLI exit status is zero for `delivered`, `deduped`, `busy`, and expected
 `skipped` outcomes such as shadow or disabled routes. It is non-zero for an
 unavailable socket, malformed request or response, unknown synthetic ID, config
 parse error, or router-reported `error`.
 For `preflight-permissions`, exit status is zero only when the report status is
-`ok`.
+`ok`. For `route-status`, exit status is zero when the control response status
+is `ok`.
 
 ## Runtime size limits
 
@@ -373,6 +407,11 @@ When the timeout is exceeded the router restarts the Hermes profile and
 records a circuit-breaker failure for the route. Other ACP requests
 (`initialize`, `session/new`, `session/resume`) use a fixed 5-minute timeout
 and are not affected by this key.
+
+Failure metadata distinguishes router-owned ACP prompt timeouts from
+provider-facing model timeouts. A bare router-side wait timeout is reported as
+`acp_prompt_timeout`. `model_timeout` requires structured Hermes error data or
+a generic provider-facing timeout signal in the error text.
 
 `router.busy_notice_after_seconds` (default `120`) controls how long a turn
 may run before a one-shot busy notice is sent to the Signal target. To keep

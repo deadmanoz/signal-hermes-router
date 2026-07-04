@@ -14,6 +14,8 @@ local scheduler    --+             |            \-----> hermes -p B acp
   trigger-job        |             \------------------> hermes -p C acp
 local script       --+
   notify-route       |
+operator CLI      --+
+  route-status       |
   control.sock       |
                      \-------- Signal replies --------> signal-cli
 ```
@@ -109,6 +111,13 @@ Trusted local automation can attach one staged image to a notification:
 
 ```bash
 signal-hermes-router --config /path/to/private/config.yaml notify-route camera-person --payload-file /path/to/private/payload.json --attachment /path/to/private/media/camera/person.png --idempotency-key camera-person-1714521600000
+```
+
+Operators can inspect route health, circuit state, cached-session state, and
+last failure metadata through the same local control socket:
+
+```bash
+signal-hermes-router --config /path/to/private/config.yaml route-status --json
 ```
 
 Before activating routes or changing allowlists, run a permission preflight

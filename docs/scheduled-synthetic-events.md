@@ -180,6 +180,16 @@ same `--idempotency-key`, are deduped. Notification triggers dedupe by
 identity fields are treated as fresh attempts, even when two invocations land
 in the same millisecond.
 
+If a synthetic turn reaches Hermes and then fails during ACP session setup,
+ACP prompt execution, model/provider work, or profile recovery, the router
+returns an `error` response, sends the configured failure or maintenance reply
+when the route state allows a reply, and releases the synthetic dedupe claim.
+The same `--scheduled-at` or `--idempotency-key` can then be retried
+deliberately after the operator fixes the underlying issue. Successful
+synthetic turns still mark the dedupe identity handled, and Signal send
+failures still mark it handled because Hermes work already completed and a
+retry would run the profile work again.
+
 ## Route Lock Contention
 
 The router holds one async lock per route while a turn is in flight. That lock

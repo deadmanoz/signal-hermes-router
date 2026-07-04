@@ -35,6 +35,10 @@ class JsonRpcError(RuntimeError):
         super().__init__(error.get("message", str(error)))
 
 
+class JsonRpcPeerExited(RuntimeError):
+    """Raised for pending JSON-RPC requests when the ACP subprocess exits."""
+
+
 RequestHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
@@ -162,7 +166,7 @@ class JsonRpcStdioPeer:
                 elif "method" in payload:
                     self._handle_notification(payload)
         finally:
-            error = RuntimeError("JSON-RPC peer exited")
+            error = JsonRpcPeerExited("JSON-RPC peer exited")
             for future in list(self._pending.values()):
                 if not future.done():
                     future.set_exception(error)

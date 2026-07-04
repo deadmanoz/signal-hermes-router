@@ -31,3 +31,13 @@ class CircuitBreaker:
         if len(failures) >= self.failures:
             return CircuitTrip(route_key, len(failures), self.window_seconds)
         return None
+
+    def failure_count(self, route_key: str, now: float | None = None) -> int:
+        failures = self._failures.get(route_key)
+        if not failures:
+            return 0
+        now = now if now is not None else time.monotonic()
+        cutoff = now - self.window_seconds
+        while failures and failures[0] < cutoff:
+            failures.popleft()
+        return len(failures)

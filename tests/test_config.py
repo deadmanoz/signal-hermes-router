@@ -692,6 +692,22 @@ router:
         )
         self.assertEqual(route.profile, "profile-01")
 
+    def test_parse_route_reads_resume_failure_recovery_flag(self) -> None:
+        default_route = parse_route(
+            {"platform": "signal", "group_id": "GROUP", "profile": "profile"}
+        )
+        opt_in_route = parse_route(
+            {
+                "platform": "signal",
+                "group_id": "OTHER",
+                "profile": "profile",
+                "recreate_session_on_resume_failure": "true",
+            }
+        )
+
+        self.assertFalse(default_route.recreate_session_on_resume_failure)
+        self.assertTrue(opt_in_route.recreate_session_on_resume_failure)
+
 
 if __name__ == "__main__":
     unittest.main()

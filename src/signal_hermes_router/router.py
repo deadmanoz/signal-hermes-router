@@ -20,12 +20,21 @@ from .config import AppConfig, Route, SyntheticRouteDefinition
 from .context import build_prompt_blocks, build_synthetic_prompt_blocks
 from .dedupe import DedupeStore
 from .events import SignalEventSummary, parse_signal_event, probe_signal_route
+from .failures import (
+    FailureCode,
+    FailureInfo,
+    classify_exception,
+    failure_info,
+    preflight_failure_from_report,
+)
 from .media import write_attachment
 from .models import (
     ChatType,
+    CircuitStatus,
     MediaManifest,
     NormalizedEvent,
     OutboundAttachment,
+    RouteHealth,
     RouteState,
     SessionKeyInput,
     SessionPolicy,
@@ -62,7 +71,7 @@ from .private_fs import (
     write_private_bytes,
 )
 from .redaction import Redactor
-from .sessions import ProfileSupervisor, SessionRegistry
+from .sessions import ProfileSupervisor, RoutedSession, SessionRegistry
 from .signal import SignalHttpClient
 
 LOGGER = logging.getLogger(__name__)
@@ -131,6 +140,10 @@ class SignalHermesRouter:
             )
         self.route_state_overrides: dict[str, RouteState] = {}
         self._trip_times: dict[str, float] = {}
+        self._trip_times_ms: dict[str, int] = {}
+        self._last_breaker_reset_ms: dict[str, int] = {}
+        self._last_success_ms: dict[str, int] = {}
+        self._last_failures: dict[str, tuple[int, FailureInfo]] = {}
         self._route_locks: dict[str, asyncio.Lock] = {}
         self._profile_locks: dict[str, asyncio.Lock] = {}
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
@@ -414,14 +427,16 @@ class SignalHermesRouter:
                     route, route.maintenance_reply or self.config.router.maintenance_reply
                 )
                 if not sent:
-                    handled = True
+                    failure = self._signal_send_failure(route)
+                    handled = turn.synthetic is None
                     return TurnOutcome(
                         TurnOutcomeStatus.ERROR,
                         route_state=state,
-                        error="signal_send_failed",
+                        error=failure.code.value,
+                        failure=failure,
                         **self._synthetic_outcome_fields(turn),
                     )
-                handled = True
+                handled = turn.synthetic is None
                 return TurnOutcome(
                     TurnOutcomeStatus.DELIVERED,
                     route_state=state,
@@ -467,11 +482,37 @@ class SignalHermesRouter:
 
                 blocks = self._build_turn_prompt_blocks(turn, manifests)
                 permission_policy = turn.permission_policy or route.permission_policy
-                session = await self.sessions.get(
-                    route,
-                    turn.session,
-                    permission_policy=permission_policy,
-                )
+                try:
+                    session = await self.sessions.get(
+                        route,
+                        turn.session,
+                        permission_policy=permission_policy,
+                    )
+                except Exception as exc:
+                    LOGGER.error(
+                        "Hermes session acquisition failed for %s: %s",
+                        self.redactor.ref("route", route.key),
+                        self.redactor.redact(exc.__class__.__name__),
+                    )
+                    LOGGER.debug("Hermes session acquisition failure details", exc_info=True)
+                    failure = classify_exception(
+                        exc,
+                        redactor=self.redactor.redact,
+                        context=FailureCode.ACP_SESSION_FAILED,
+                    )
+                    outcome = await self._handle_hermes_failure(
+                        turn,
+                        route,
+                        state,
+                        failure,
+                        session=None,
+                        permission_policy=permission_policy,
+                    )
+                    # Signal events are marked handled after the failure reply
+                    # attempt; synthetic jobs release dedupe so schedulers can
+                    # retry the same logical job.
+                    handled = turn.synthetic is None
+                    return outcome
                 await self._typing(route, True)
                 turn_done = asyncio.Event()
                 notice_task = asyncio.create_task(self._long_running_notice(route, turn_done))
@@ -488,17 +529,20 @@ class SignalHermesRouter:
                         reply_text,
                         attachments=frozen_attachments,
                     ):
+                        failure = self._signal_send_failure(route)
                         handled = True
                         return TurnOutcome(
                             TurnOutcomeStatus.ERROR,
                             route_state=state,
                             result=result,
-                            error="signal_send_failed",
+                            error=failure.code.value,
+                            failure=failure,
                             reply_sent=False,
                             **self._synthetic_outcome_fields(turn),
                         )
                     reply_sent = bool(reply_text)
                     self.circuit.record_success(route.key)
+                    self._record_route_success(route)
                     handled = True
                     return TurnOutcome(
                         TurnOutcomeStatus.DELIVERED,
@@ -519,48 +563,17 @@ class SignalHermesRouter:
                         self.redactor.redact(exc.__class__.__name__),
                     )
                     LOGGER.debug("Hermes turn failure details", exc_info=True)
-                    # Record the breaker hit and pick the user-facing reply
-                    # BEFORE attempting subprocess recovery. If restart or
-                    # replace_after_restart fails (e.g. binary missing, profile
-                    # broken, cooldown), the user still gets a reply and the
-                    # breaker still moves; recovery is best-effort for the
-                    # next event.
-                    trip = self.circuit.record_failure(route.key)
-                    if trip:
-                        self.route_state_overrides[route.key] = RouteState.MAINTENANCE
-                        self._trip_times[route.key] = time.monotonic()
-                        LOGGER.error(
-                            "route %s tripped circuit breaker after %s failures",
-                            self.redactor.ref("route", route.key),
-                            trip.failures,
-                        )
-                        reply_text = route.maintenance_reply or self.config.router.maintenance_reply
-                    else:
-                        reply_text = route.failure_reply or self.config.router.failure_reply
-                    await self._send_once(route, reply_text)
-                    try:
-                        await self.supervisor.restart_profile(route.profile)
-                        if route.session_policy != SessionPolicy.EPHEMERAL:
-                            session = await self.sessions.replace_after_restart(
-                                route,
-                                turn.session,
-                                session,
-                                permission_policy=permission_policy,
-                            )
-                    except Exception as recovery_exc:
-                        LOGGER.warning(
-                            "Hermes recovery failed for %s: %s; route will retry on next event",
-                            self.redactor.ref("route", route.key),
-                            self.redactor.redact(recovery_exc.__class__.__name__),
-                        )
-                        LOGGER.debug("Hermes recovery failure details", exc_info=True)
-                    handled = True
-                    return TurnOutcome(
-                        TurnOutcomeStatus.ERROR,
-                        route_state=state,
-                        error=exc.__class__.__name__,
-                        **self._synthetic_outcome_fields(turn),
+                    failure = classify_exception(exc, redactor=self.redactor.redact)
+                    outcome = await self._handle_hermes_failure(
+                        turn,
+                        route,
+                        state,
+                        failure,
+                        session=session,
+                        permission_policy=permission_policy,
                     )
+                    handled = turn.synthetic is None
+                    return outcome
                 finally:
                     # Defensive backup for cancellation paths that skip the
                     # try/except branches. Idempotent: no-op if already stopped.
@@ -826,6 +839,149 @@ class SignalHermesRouter:
             self._profile_locks[profile] = lock
         return lock
 
+    async def _handle_hermes_failure(
+        self,
+        turn: RoutedTurnInput,
+        route: Route,
+        state: RouteState,
+        failure: FailureInfo,
+        *,
+        session: RoutedSession | None,
+        permission_policy: StaticPermissionPolicy,
+    ) -> TurnOutcome:
+        # Record the breaker hit and pick the user-facing reply BEFORE attempting
+        # subprocess recovery. If restart or replace_after_restart fails (binary
+        # missing, profile broken, cooldown), the user still gets a reply and the
+        # breaker still moves; recovery is best-effort for the next event.
+        self._record_route_failure(route, failure)
+        trip = self.circuit.record_failure(route.key)
+        if trip:
+            self.route_state_overrides[route.key] = RouteState.MAINTENANCE
+            self._trip_times[route.key] = time.monotonic()
+            self._trip_times_ms[route.key] = self._clock_ms()
+            LOGGER.error(
+                "route %s tripped circuit breaker after %s failures",
+                self.redactor.ref("route", route.key),
+                trip.failures,
+            )
+            reply_text = route.maintenance_reply or self.config.router.maintenance_reply
+        else:
+            reply_text = route.failure_reply or self.config.router.failure_reply
+        reply_sent = False
+        if reply_text:
+            reply_sent = await self._send_once(route, reply_text)
+            if not reply_sent:
+                LOGGER.error(
+                    "failure reply delivery failed for %s; preserving original route failure",
+                    self.redactor.ref("route", route.key),
+                )
+        try:
+            await self.supervisor.restart_profile(route.profile)
+            if session is not None:
+                if route.session_policy != SessionPolicy.EPHEMERAL:
+                    replacement = await self.sessions.replace_after_restart(
+                        route,
+                        turn.session,
+                        session,
+                        permission_policy=permission_policy,
+                    )
+                    if turn.synthetic is not None and turn.synthetic.permission_policy is not None:
+                        replacement.profile.set_permission_policy(
+                            replacement.session_id,
+                            route.permission_policy,
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as recovery_exc:
+            LOGGER.warning(
+                "Hermes recovery failed for %s: %s; route will retry on next event",
+                self.redactor.ref("route", route.key),
+                self.redactor.redact(recovery_exc.__class__.__name__),
+            )
+            LOGGER.debug("Hermes recovery failure details", exc_info=True)
+        return TurnOutcome(
+            TurnOutcomeStatus.ERROR,
+            route_state=state,
+            error=failure.code.value,
+            failure=failure,
+            reply_sent=reply_sent,
+            **self._synthetic_outcome_fields(turn),
+        )
+
+    def _signal_send_failure(self, route: Route) -> FailureInfo:
+        failure = failure_info(
+            FailureCode.SIGNAL_SEND_FAILED,
+            detail="Signal reply send failed",
+            redactor=self.redactor.redact,
+        )
+        # Signal transport-out failures are surfaced in route health, but they
+        # do not feed the Hermes circuit breaker: maintenance replies would use
+        # the same broken Signal send path and would not protect the profile.
+        self._record_route_failure(route, failure)
+        return failure
+
+    def _record_route_success(self, route: Route) -> None:
+        self._last_success_ms[route.key] = self._clock_ms()
+
+    def _record_route_failure(self, route: Route, failure: FailureInfo) -> None:
+        self._last_failures[route.key] = (self._clock_ms(), failure)
+
+    def _route_status_response(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            route_names, route_indexes, profiles = _parse_route_status_filters(payload)
+        except ValueError:
+            return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_route_status_scope"}
+        routes: list[dict[str, Any]] = []
+        for index, route in enumerate(self.config.routes):
+            if route_names and route.name not in route_names:
+                continue
+            if route_indexes and index not in route_indexes:
+                continue
+            if profiles and route.profile not in profiles:
+                continue
+            routes.append(self._route_health(index, route).to_dict())
+        return {
+            "status": "ok",
+            "routes": routes,
+            "route_count": len(routes),
+        }
+
+    def _route_health(self, index: int, route: Route) -> RouteHealth:
+        return RouteHealth(
+            route_ref=_route_ref(index, route),
+            profile=route.profile,
+            route_state=self.route_state_overrides.get(route.key, route.state),
+            configured_state=route.state,
+            session=self.sessions.status_for_route(route),
+            circuit=self._circuit_status(route),
+            last_success_at_ms=self._last_success_ms.get(route.key),
+            # Route status exposes the most recent sanitized failure only. It is
+            # a quick health surface, not a failure history.
+            last_failure_at_ms=(
+                self._last_failures[route.key][0] if route.key in self._last_failures else None
+            ),
+            last_failure=(
+                self._last_failures[route.key][1] if route.key in self._last_failures else None
+            ),
+        )
+
+    def _circuit_status(self, route: Route) -> CircuitStatus:
+        trip_time = self._trip_times.get(route.key)
+        tripped = (
+            self.route_state_overrides.get(route.key) == RouteState.MAINTENANCE
+            and trip_time is not None
+        )
+        remaining = None
+        if tripped:
+            remaining = max(0.0, self.recovery_seconds - (time.monotonic() - trip_time))
+        return CircuitStatus(
+            state="open" if tripped else "closed",
+            failure_count=self.circuit.failure_count(route.key),
+            tripped_at_ms=self._trip_times_ms.get(route.key) if tripped else None,
+            cooldown_remaining_seconds=remaining,
+            last_reset_at_ms=self._last_breaker_reset_ms.get(route.key),
+        )
+
     @staticmethod
     async def _acquire_route_lock(lock: asyncio.Lock, timeout: float | None) -> bool:
         if timeout is None:
@@ -1035,6 +1191,8 @@ class SignalHermesRouter:
             return await self._handle_notify_route_control(payload)
         if command == "preflight_permissions":
             return await self._handle_preflight_permissions_control(payload)
+        if command == "route_status":
+            return self._route_status_response(payload)
         return {"status": TurnOutcomeStatus.ERROR.value, "error": "unknown_command"}
 
     async def _handle_trigger_job_control(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1064,12 +1222,18 @@ class SignalHermesRouter:
                 self.redactor.redact(exc.__class__.__name__),
             )
             LOGGER.debug("control trigger failure details", exc_info=True)
+            failure = classify_exception(
+                exc,
+                redactor=self.redactor.redact,
+                context=FailureCode.ROUTER_ERROR,
+            )
             return {
                 "status": TurnOutcomeStatus.ERROR.value,
                 "job_id": job_id,
                 "synthetic_id": job_id,
                 "synthetic_kind": SyntheticTurnKind.SCHEDULED_JOB.value,
-                "error": exc.__class__.__name__,
+                "error": failure.code.value,
+                "failure": failure.to_dict(),
             }
         return outcome.to_control_response()
 
@@ -1114,11 +1278,17 @@ class SignalHermesRouter:
                 self.redactor.redact(exc.__class__.__name__),
             )
             LOGGER.debug("control notification failure details", exc_info=True)
+            failure = classify_exception(
+                exc,
+                redactor=self.redactor.redact,
+                context=FailureCode.ROUTER_ERROR,
+            )
             return {
                 "status": TurnOutcomeStatus.ERROR.value,
                 "synthetic_id": notification_id,
                 "synthetic_kind": SyntheticTurnKind.NOTIFICATION.value,
-                "error": exc.__class__.__name__,
+                "error": failure.code.value,
+                "failure": failure.to_dict(),
             }
         return outcome.to_control_response()
 
@@ -1162,7 +1332,11 @@ class SignalHermesRouter:
             self._probe_profile_tool_surface,
             scope=scope,
         )
-        return report.to_dict()
+        response = report.to_dict()
+        failure = preflight_failure_from_report(report, redactor=self.redactor.redact)
+        if failure is not None:
+            response["failure"] = failure.to_dict()
+        return response
 
     async def _probe_profile_tool_surface(self, profile: str) -> ToolSurface:
         route = self._representative_route_for_profile(profile)
@@ -1219,6 +1393,8 @@ class SignalHermesRouter:
             return
         self.route_state_overrides.pop(route.key, None)
         self._trip_times.pop(route.key, None)
+        self._trip_times_ms.pop(route.key, None)
+        self._last_breaker_reset_ms[route.key] = self._clock_ms()
         self.circuit.record_success(route.key)
         LOGGER.info(
             "route %s circuit breaker cooldown elapsed; probing route in configured state",
@@ -1320,6 +1496,59 @@ def _parse_control_timeout(value: Any) -> tuple[float | None, str | None]:
     if not math.isfinite(timeout) or timeout < 0:
         return None, "invalid_timeout"
     return timeout, None
+
+
+def _parse_route_status_filters(
+    payload: dict[str, Any],
+) -> tuple[tuple[str, ...], tuple[int, ...], tuple[str, ...]]:
+    route_names = _string_filter_values(payload, "route", "routes", "route_names")
+    profiles = _string_filter_values(payload, "profile", "profiles")
+    route_indexes = _index_filter_values(payload, "route_index", "route_indexes")
+    return route_names, route_indexes, profiles
+
+
+def _string_filter_values(payload: dict[str, Any], *keys: str) -> tuple[str, ...]:
+    values: list[str] = []
+    for key in keys:
+        if key not in payload:
+            continue
+        raw = payload[key]
+        if isinstance(raw, str):
+            if not raw:
+                raise ValueError(f"{key} must not be empty")
+            values.append(raw)
+            continue
+        if isinstance(raw, list) and all(isinstance(item, str) and item for item in raw):
+            values.extend(raw)
+            continue
+        raise ValueError(f"{key} must be a string or string list")
+    return tuple(dict.fromkeys(values))
+
+
+def _index_filter_values(payload: dict[str, Any], *keys: str) -> tuple[int, ...]:
+    values: list[int] = []
+    for key in keys:
+        if key not in payload:
+            continue
+        raw = payload[key]
+        if isinstance(raw, bool):
+            raise ValueError(f"{key} must be a non-negative integer")
+        if isinstance(raw, int) and raw >= 0:
+            values.append(raw)
+            continue
+        if isinstance(raw, list) and all(
+            not isinstance(item, bool) and isinstance(item, int) and item >= 0 for item in raw
+        ):
+            values.extend(raw)
+            continue
+        raise ValueError(f"{key} must be a non-negative integer or integer list")
+    return tuple(dict.fromkeys(values))
+
+
+def _route_ref(index: int, route: Route) -> str:
+    if route.name:
+        return f"route:{route.name}"
+    return f"routes[{index}]"
 
 
 def _unix_socket_accepts_connections(path: Path) -> bool:
