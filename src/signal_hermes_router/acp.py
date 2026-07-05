@@ -119,11 +119,14 @@ class JsonRpcStdioPeer:
         payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
         try:
             async with self._write_lock:
-                self.process.stdin.write(json.dumps(payload).encode("utf-8") + b"\n")
-                await self.process.stdin.drain()
+                await self._write_frame(payload)
             return await asyncio.wait_for(future, timeout=timeout)
         finally:
             self._pending.pop(request_id, None)
+
+    async def _write_frame(self, message: dict[str, Any]) -> None:
+        self.process.stdin.write(json.dumps(message).encode("utf-8") + b"\n")
+        await self.process.stdin.drain()
 
     async def _drain_stderr(self) -> None:
         assert self.process and self.process.stderr
@@ -201,8 +204,7 @@ class JsonRpcStdioPeer:
                     "id": payload["id"],
                     "error": {"code": -32603, "message": str(exc)},
                 }
-        self.process.stdin.write(json.dumps(response).encode("utf-8") + b"\n")
-        await self.process.stdin.drain()
+        await self._write_frame(response)
 
     def subscribe_session(self, session_id: str) -> asyncio.Queue[dict[str, Any]]:
         return self._session_updates.setdefault(session_id, asyncio.Queue())

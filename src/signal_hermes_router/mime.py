@@ -3,6 +3,11 @@ from __future__ import annotations
 import mimetypes
 from pathlib import Path
 
+# webp is absent from the default mimetypes database on some Python builds;
+# register it here (the MIME owner) so content_type_for_path resolves .webp
+# consistently for every consumer.
+mimetypes.add_type("image/webp", ".webp")
+
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 
 _EXTENSIONS = {

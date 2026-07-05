@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -286,55 +286,30 @@ def _unmatched_scope_selector_errors(
     config: AppConfig,
     scope: PreflightScope,
 ) -> tuple[PreflightScopeError, ...]:
+    specs = (
+        ("route_names", scope.route_names, "unmatched_route_name", "route selector", "route"),
+        (
+            "route_indexes",
+            scope.route_indexes,
+            "unmatched_route_index",
+            "route-index selector",
+            "route_index",
+        ),
+        ("profiles", scope.profiles, "unmatched_profile", "profile selector", "profile"),
+    )
     errors: list[PreflightScopeError] = []
-    for route_name in scope.route_names:
-        selector_scope = PreflightScope(
-            active_only=scope.active_only,
-            route_names=(route_name,),
-            route_indexes=scope.route_indexes,
-            profiles=scope.profiles,
-        )
-        if not scope_matches_route(config, selector_scope):
-            errors.append(
-                PreflightScopeError(
-                    code="unmatched_route_name",
-                    error=f"preflight route selector matched no route: {route_name}",
-                    selector_kind="route",
-                    selector=route_name,
+    for field, selectors, code, label, selector_kind in specs:
+        for selector in selectors:
+            selector_scope = replace(scope, **{field: (selector,)})
+            if not scope_matches_route(config, selector_scope):
+                errors.append(
+                    PreflightScopeError(
+                        code=code,
+                        error=f"preflight {label} matched no route: {selector}",
+                        selector_kind=selector_kind,
+                        selector=selector,
+                    )
                 )
-            )
-    for route_index in scope.route_indexes:
-        selector_scope = PreflightScope(
-            active_only=scope.active_only,
-            route_names=scope.route_names,
-            route_indexes=(route_index,),
-            profiles=scope.profiles,
-        )
-        if not scope_matches_route(config, selector_scope):
-            errors.append(
-                PreflightScopeError(
-                    code="unmatched_route_index",
-                    error=f"preflight route-index selector matched no route: {route_index}",
-                    selector_kind="route_index",
-                    selector=route_index,
-                )
-            )
-    for profile in scope.profiles:
-        selector_scope = PreflightScope(
-            active_only=scope.active_only,
-            route_names=scope.route_names,
-            route_indexes=scope.route_indexes,
-            profiles=(profile,),
-        )
-        if not scope_matches_route(config, selector_scope):
-            errors.append(
-                PreflightScopeError(
-                    code="unmatched_profile",
-                    error=f"preflight profile selector matched no route: {profile}",
-                    selector_kind="profile",
-                    selector=profile,
-                )
-            )
     return tuple(errors)
 
 
@@ -411,27 +386,43 @@ def load_probe_contract(path: Path) -> ProbeCallable:
 
 
 def format_preflight_report(report: PreflightReport) -> str:
+    return format_preflight_report_dict(report.to_dict())
+
+
+def format_preflight_report_dict(data: dict[str, Any]) -> str:
     lines = [
-        f"Permission preflight: {report.status}",
-        f"Profiles targeted: {len(report.checked_profiles)}",
-        f"Configured permission tool entries: {len(report.expected_permissions)}",
-        f"Missing tool entries: {len(report.missing_tools)}",
+        f"Permission preflight: {data.get('status', 'unknown')}",
+        f"Profiles targeted: {len(data.get('checked_profiles') or [])}",
+        "Configured permission tool entries: "
+        f"{data.get('expected_permissions_count', len(data.get('expected_permissions') or []))}",
+        f"Missing tool entries: {data.get('missing_tools_count', len(data.get('missing_tools') or []))}",
     ]
-    if report.probe_errors:
+    probe_errors = data.get("probe_errors") or []
+    if probe_errors:
         lines.append("Probe errors:")
-        for error in report.probe_errors:
-            lines.append(f"- {error.profile}: {error.error or error.code}")
-    if report.scope_errors:
+        for error in probe_errors:
+            if not isinstance(error, dict):
+                continue
+            lines.append(f"- {error.get('profile')}: {error.get('error') or error.get('code')}")
+    scope_errors = data.get("scope_errors") or []
+    if scope_errors:
         lines.append("Scope errors:")
-        for error in report.scope_errors:
-            lines.append(f"- {error.error}")
-    if report.missing_tools:
+        for error in scope_errors:
+            if not isinstance(error, dict):
+                continue
+            lines.append(f"- {error.get('error') or error.get('code')}")
+    missing_tools = data.get("missing_tools") or []
+    if missing_tools:
         lines.append("Missing tools:")
-        for tool in report.missing_tools:
-            source = tool.source_kind
-            if tool.source_id is not None:
-                source = f"{source}:{tool.source_id}"
-            lines.append(f"- {tool.route_ref} {tool.profile} {source} {tool.tool_name}")
+        for tool in missing_tools:
+            if not isinstance(tool, dict):
+                continue
+            source = tool.get("source_kind")
+            if tool.get("source_id") is not None:
+                source = f"{source}:{tool['source_id']}"
+            lines.append(
+                f"- {tool.get('route_ref')} {tool.get('profile')} {source} {tool.get('tool')}"
+            )
     return "\n".join(lines)
 
 

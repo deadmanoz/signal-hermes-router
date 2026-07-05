@@ -84,17 +84,12 @@ class DedupeStore:
 
     def mark_handled(self, route_key: str, source_uuid: str, timestamp: int) -> None:
         with self._lock:
-            cursor = self._db.execute(
-                "UPDATE dedupe_events SET status = 'handled' "
-                "WHERE route_key = ? AND source_uuid = ? AND timestamp = ?",
+            self._db.execute(
+                "INSERT INTO dedupe_events (route_key, source_uuid, timestamp, status) "
+                "VALUES (?, ?, ?, 'handled') "
+                "ON CONFLICT(route_key, source_uuid, timestamp) DO UPDATE SET status = 'handled'",
                 (route_key, source_uuid, int(timestamp)),
             )
-            if cursor.rowcount == 0:
-                self._db.execute(
-                    "INSERT OR IGNORE INTO dedupe_events "
-                    "(route_key, source_uuid, timestamp, status) VALUES (?, ?, ?, 'handled')",
-                    (route_key, source_uuid, int(timestamp)),
-                )
             self._db.commit()
 
     def release(self, route_key: str, source_uuid: str, timestamp: int) -> None:
