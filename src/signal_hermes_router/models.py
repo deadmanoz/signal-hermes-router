@@ -88,10 +88,9 @@ class MediaManifest:
     sender_ref: str
     signal_timestamp: int
 
-    def to_dict(self) -> dict[str, Any]:
+    def _base_fields(self) -> dict[str, Any]:
         return {
             "display_filename": self.display_filename,
-            "canonical_path": str(self.canonical_path),
             "content_type": self.content_type,
             "size": self.size,
             "sha256": self.sha256,
@@ -100,16 +99,16 @@ class MediaManifest:
             "signal_timestamp": self.signal_timestamp,
         }
 
-    def to_prompt_dict(self, *, include_tool_path: bool = False) -> dict[str, Any]:
-        prompt_dict: dict[str, Any] = {
-            "display_filename": self.display_filename,
-            "content_type": self.content_type,
-            "size": self.size,
-            "sha256": self.sha256,
-            "group_ref": self.group_ref,
-            "sender_ref": self.sender_ref,
-            "signal_timestamp": self.signal_timestamp,
+    def to_dict(self) -> dict[str, Any]:
+        fields = self._base_fields()
+        return {
+            "display_filename": fields.pop("display_filename"),
+            "canonical_path": str(self.canonical_path),
+            **fields,
         }
+
+    def to_prompt_dict(self, *, include_tool_path: bool = False) -> dict[str, Any]:
+        prompt_dict: dict[str, Any] = self._base_fields()
         # Opt-in only: expose the router-managed stored path under tool_path so
         # profile-side tools can operate on the exact file. The canonical_path
         # key itself stays omitted from the prompt in every path.
