@@ -100,11 +100,11 @@ class MediaManifest:
         }
 
     def to_dict(self) -> dict[str, Any]:
-        fields = self._base_fields()
+        base = self._base_fields()
         return {
-            "display_filename": fields.pop("display_filename"),
+            "display_filename": base["display_filename"],
             "canonical_path": str(self.canonical_path),
-            **fields,
+            **{key: value for key, value in base.items() if key != "display_filename"},
         }
 
     def to_prompt_dict(self, *, include_tool_path: bool = False) -> dict[str, Any]:
