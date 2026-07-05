@@ -14,7 +14,6 @@ from typing import Any
 from .config import load_app_config, load_router_config
 from .models import TurnOutcomeStatus
 from .payloads import (
-    NotificationPayloadError,
     canonicalize_notification_payload,
     encode_control_message,
 )
@@ -131,15 +130,34 @@ async def _run(config_path: Path, routes_path: Path) -> None:
         await router.close()
 
 
+_CONTROL_SUCCESS_STATUSES = frozenset(
+    {
+        TurnOutcomeStatus.DELIVERED.value,
+        TurnOutcomeStatus.DEDUPED.value,
+        TurnOutcomeStatus.BUSY.value,
+        TurnOutcomeStatus.SKIPPED.value,
+    }
+)
+
+
+def _exit_code_for_status(response: dict[str, Any]) -> int:
+    return 0 if response.get("status") in _CONTROL_SUCCESS_STATUSES else 1
+
+
+def _resolve_client_timeout(args: argparse.Namespace) -> float | None:
+    client_timeout = getattr(args, "client_timeout", DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS)
+    if client_timeout is not None and client_timeout < 0:
+        raise ValueError("--client-timeout must be non-negative")
+    return client_timeout
+
+
 async def _trigger_job(args: argparse.Namespace) -> int:
     try:
         socket_path = (
             args.control_socket or load_router_config(args.config).control_socket_path
         ).expanduser()
         scheduled_at = parse_scheduled_at(args.scheduled_at) if args.scheduled_at else None
-        client_timeout = getattr(args, "client_timeout", DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS)
-        if client_timeout is not None and client_timeout < 0:
-            raise ValueError("--client-timeout must be non-negative")
+        client_timeout = _resolve_client_timeout(args)
         response = await trigger_job_via_control_socket(
             socket_path,
             args.job_id,
@@ -153,14 +171,7 @@ async def _trigger_job(args: argparse.Namespace) -> int:
         logging.debug("trigger-job failure details", exc_info=True)
         return 1
     print(json.dumps(response, sort_keys=True))
-    if response.get("status") in {
-        TurnOutcomeStatus.DELIVERED.value,
-        TurnOutcomeStatus.DEDUPED.value,
-        TurnOutcomeStatus.BUSY.value,
-        TurnOutcomeStatus.SKIPPED.value,
-    }:
-        return 0
-    return 1
+    return _exit_code_for_status(response)
 
 
 async def _notify_route(args: argparse.Namespace) -> int:
@@ -172,9 +183,7 @@ async def _notify_route(args: argparse.Namespace) -> int:
             router_config = load_router_config(args.config)
             socket_path = router_config.control_socket_path.expanduser()
             max_payload_bytes = router_config.control.max_notification_payload_bytes
-        client_timeout = getattr(args, "client_timeout", DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS)
-        if client_timeout is not None and client_timeout < 0:
-            raise ValueError("--client-timeout must be non-negative")
+        client_timeout = _resolve_client_timeout(args)
         raw_payload = json.loads(args.payload_file.read_text(encoding="utf-8"))
         payload = canonicalize_notification_payload(
             raw_payload,
@@ -193,31 +202,18 @@ async def _notify_route(args: argparse.Namespace) -> int:
             client_timeout=client_timeout,
             **attachment_kwargs,
         )
-    except (json.JSONDecodeError, NotificationPayloadError, OSError, ValueError) as exc:
-        logging.error("notify-route failed: %s", exc.__class__.__name__)
-        logging.debug("notify-route failure details", exc_info=True)
-        return 1
     except Exception as exc:
         logging.error("notify-route failed: %s", exc.__class__.__name__)
         logging.debug("notify-route failure details", exc_info=True)
         return 1
     print(json.dumps(response, sort_keys=True))
-    if response.get("status") in {
-        TurnOutcomeStatus.DELIVERED.value,
-        TurnOutcomeStatus.DEDUPED.value,
-        TurnOutcomeStatus.BUSY.value,
-        TurnOutcomeStatus.SKIPPED.value,
-    }:
-        return 0
-    return 1
+    return _exit_code_for_status(response)
 
 
 async def _preflight_permissions(args: argparse.Namespace) -> int:
     try:
         scope = _preflight_scope_from_args(args)
-        client_timeout = getattr(args, "client_timeout", DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS)
-        if client_timeout is not None and client_timeout < 0:
-            raise ValueError("--client-timeout must be non-negative")
+        client_timeout = _resolve_client_timeout(args)
         if args.control_socket is not None:
             if args.probe_contract_file is not None:
                 logging.warning(
@@ -256,9 +252,7 @@ async def _route_status(args: argparse.Namespace) -> int:
         socket_path = (
             args.control_socket or load_router_config(args.config).control_socket_path
         ).expanduser()
-        client_timeout = getattr(args, "client_timeout", DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS)
-        if client_timeout is not None and client_timeout < 0:
-            raise ValueError("--client-timeout must be non-negative")
+        client_timeout = _resolve_client_timeout(args)
         response = await route_status_via_control_socket(
             socket_path,
             route_names=tuple(args.route),
