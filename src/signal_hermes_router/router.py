@@ -9,6 +9,7 @@ import socket
 import stat
 import time
 import uuid
+from collections import defaultdict
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -144,8 +145,8 @@ class SignalHermesRouter:
         self._last_breaker_reset_ms: dict[str, int] = {}
         self._last_success_ms: dict[str, int] = {}
         self._last_failures: dict[str, tuple[int, FailureInfo]] = {}
-        self._route_locks: dict[str, asyncio.Lock] = {}
-        self._profile_locks: dict[str, asyncio.Lock] = {}
+        self._route_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._profile_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self._nonce_factory = nonce_factory or (lambda: uuid.uuid4().hex)
         self._control_server: asyncio.Server | None = None
@@ -290,14 +291,23 @@ class SignalHermesRouter:
         payload: CanonicalNotificationPayload | None = None,
         outbound_attachments: Any = (),
     ) -> TurnOutcome:
-        route = self.config.find_route_by_name(synthetic.route_name)
-        if route is None:
+        def _synthetic_outcome(
+            status: TurnOutcomeStatus,
+            *,
+            route_state: RouteState | None = None,
+            error: str | None = None,
+        ) -> TurnOutcome:
             return TurnOutcome(
-                TurnOutcomeStatus.ERROR,
-                error="unknown_route",
+                status,
+                route_state=route_state,
+                error=error,
                 synthetic_id=synthetic.id,
                 synthetic_kind=synthetic.kind,
             )
+
+        route = self.config.find_route_by_name(synthetic.route_name)
+        if route is None:
+            return _synthetic_outcome(TurnOutcomeStatus.ERROR, error="unknown_route")
         self.redactor.add(route.key, route.group_id, route.sender_id, route.sender_number)
         turn = self._synthetic_turn_input(
             synthetic,
@@ -318,32 +328,23 @@ class SignalHermesRouter:
         try:
             if outbound_attachments:
                 if self._turn_dedupe_has_status(turn, "handled"):
-                    return TurnOutcome(
+                    return _synthetic_outcome(
                         TurnOutcomeStatus.DEDUPED,
                         route_state=self.route_state_overrides.get(route.key, route.state),
-                        synthetic_id=synthetic.id,
-                        synthetic_kind=synthetic.kind,
                     )
                 if not self._turn_dedupe_has_status(turn, "processing"):
                     self._maybe_clear_breaker_override(route)
                     state = self.route_state_overrides.get(route.key, route.state)
                     if state == RouteState.ACTIVE:
                         if timeout <= 0 and (lock.locked() or profile_lock.locked()):
-                            return TurnOutcome(
-                                TurnOutcomeStatus.BUSY,
-                                route_state=state,
-                                synthetic_id=synthetic.id,
-                                synthetic_kind=synthetic.kind,
-                            )
+                            return _synthetic_outcome(TurnOutcomeStatus.BUSY, route_state=state)
                         if not signal_base_url_supports_local_attachment_paths(
                             self.config.router.signal_base_url
                         ):
-                            return TurnOutcome(
+                            return _synthetic_outcome(
                                 TurnOutcomeStatus.ERROR,
                                 route_state=state,
                                 error="attachment_signal_daemon_not_local",
-                                synthetic_id=synthetic.id,
-                                synthetic_kind=synthetic.kind,
                             )
                         try:
                             frozen_attachments = self._freeze_outbound_attachments(
@@ -351,38 +352,30 @@ class SignalHermesRouter:
                             )
                         except OutboundAttachmentError as exc:
                             if self._turn_dedupe_has_status(turn, "handled"):
-                                return TurnOutcome(
+                                return _synthetic_outcome(
                                     TurnOutcomeStatus.DEDUPED,
                                     route_state=self.route_state_overrides.get(
                                         route.key, route.state
                                     ),
-                                    synthetic_id=synthetic.id,
-                                    synthetic_kind=synthetic.kind,
                                 )
-                            return TurnOutcome(
+                            return _synthetic_outcome(
                                 TurnOutcomeStatus.ERROR,
                                 route_state=state,
                                 error=exc.error_code,
-                                synthetic_id=synthetic.id,
-                                synthetic_kind=synthetic.kind,
                             )
                         turn = replace(turn, outbound_attachments=frozen_attachments)
 
             if not await self._acquire_route_lock(lock, timeout):
-                return TurnOutcome(
+                return _synthetic_outcome(
                     TurnOutcomeStatus.BUSY,
                     route_state=self.route_state_overrides.get(route.key, route.state),
-                    synthetic_id=synthetic.id,
-                    synthetic_kind=synthetic.kind,
                 )
             try:
                 profile_lock_acquired = await self._acquire_route_lock(profile_lock, timeout)
                 if not profile_lock_acquired:
-                    return TurnOutcome(
+                    return _synthetic_outcome(
                         TurnOutcomeStatus.BUSY,
                         route_state=self.route_state_overrides.get(route.key, route.state),
-                        synthetic_id=synthetic.id,
-                        synthetic_kind=synthetic.kind,
                     )
                 try:
                     return await self._run_turn(turn)
@@ -826,18 +819,10 @@ class SignalHermesRouter:
         return {"synthetic_id": turn.synthetic.id, "synthetic_kind": turn.synthetic.kind}
 
     def _route_lock(self, route: Route) -> asyncio.Lock:
-        lock = self._route_locks.get(route.key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._route_locks[route.key] = lock
-        return lock
+        return self._route_locks[route.key]
 
     def _profile_lock(self, profile: str) -> asyncio.Lock:
-        lock = self._profile_locks.get(profile)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._profile_locks[profile] = lock
-        return lock
+        return self._profile_locks[profile]
 
     async def _handle_hermes_failure(
         self,
