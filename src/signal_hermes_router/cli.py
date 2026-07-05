@@ -203,6 +203,8 @@ async def _notify_route(args: argparse.Namespace) -> int:
             **attachment_kwargs,
         )
     except Exception as exc:
+        # Any failure here (payload parse, canonicalization, control-socket I/O)
+        # is logged and mapped to exit 1, matching the other control commands.
         logging.error("notify-route failed: %s", exc.__class__.__name__)
         logging.debug("notify-route failure details", exc_info=True)
         return 1
