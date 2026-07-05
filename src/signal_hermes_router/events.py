@@ -53,28 +53,7 @@ class SignalRouteProbe:
 
 
 def inspect_signal_event(raw: dict[str, Any]) -> SignalEventSummary:
-    params = unwrap_signal_event(raw)
-    envelope = params.get("envelope") if isinstance(params, dict) else None
-    has_exception = _has_exception(params)
-    if not isinstance(envelope, dict):
-        return SignalEventSummary(
-            shape="unknown",
-            message_type="none",
-            has_group=False,
-            has_exception=has_exception,
-        )
-    shape = "direct" if raw is params else "jsonrpc"
-    message_type = _message_type(envelope)
-    data_message = _data_message_from_envelope(envelope)
-    has_group = False
-    if isinstance(data_message, dict):
-        has_group = _group_id(data_message) is not None
-    return SignalEventSummary(
-        shape=shape,
-        message_type=message_type,
-        has_group=has_group,
-        has_exception=has_exception,
-    )
+    return probe_signal_route(raw).summary
 
 
 def summarize_signal_event(raw: dict[str, Any]) -> str:
