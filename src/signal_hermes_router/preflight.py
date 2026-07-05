@@ -386,27 +386,43 @@ def load_probe_contract(path: Path) -> ProbeCallable:
 
 
 def format_preflight_report(report: PreflightReport) -> str:
+    return format_preflight_report_dict(report.to_dict())
+
+
+def format_preflight_report_dict(data: dict[str, Any]) -> str:
     lines = [
-        f"Permission preflight: {report.status}",
-        f"Profiles targeted: {len(report.checked_profiles)}",
-        f"Configured permission tool entries: {len(report.expected_permissions)}",
-        f"Missing tool entries: {len(report.missing_tools)}",
+        f"Permission preflight: {data.get('status', 'unknown')}",
+        f"Profiles targeted: {len(data.get('checked_profiles') or [])}",
+        "Configured permission tool entries: "
+        f"{data.get('expected_permissions_count', len(data.get('expected_permissions') or []))}",
+        f"Missing tool entries: {data.get('missing_tools_count', len(data.get('missing_tools') or []))}",
     ]
-    if report.probe_errors:
+    probe_errors = data.get("probe_errors") or []
+    if probe_errors:
         lines.append("Probe errors:")
-        for error in report.probe_errors:
-            lines.append(f"- {error.profile}: {error.error or error.code}")
-    if report.scope_errors:
+        for error in probe_errors:
+            if not isinstance(error, dict):
+                continue
+            lines.append(f"- {error.get('profile')}: {error.get('error') or error.get('code')}")
+    scope_errors = data.get("scope_errors") or []
+    if scope_errors:
         lines.append("Scope errors:")
-        for error in report.scope_errors:
-            lines.append(f"- {error.error}")
-    if report.missing_tools:
+        for error in scope_errors:
+            if not isinstance(error, dict):
+                continue
+            lines.append(f"- {error.get('error') or error.get('code')}")
+    missing_tools = data.get("missing_tools") or []
+    if missing_tools:
         lines.append("Missing tools:")
-        for tool in report.missing_tools:
-            source = tool.source_kind
-            if tool.source_id is not None:
-                source = f"{source}:{tool.source_id}"
-            lines.append(f"- {tool.route_ref} {tool.profile} {source} {tool.tool_name}")
+        for tool in missing_tools:
+            if not isinstance(tool, dict):
+                continue
+            source = tool.get("source_kind")
+            if tool.get("source_id") is not None:
+                source = f"{source}:{tool['source_id']}"
+            lines.append(
+                f"- {tool.get('route_ref')} {tool.get('profile')} {source} {tool.get('tool')}"
+            )
     return "\n".join(lines)
 
 

@@ -21,6 +21,7 @@ from .preflight import (
     ProbeCallable,
     PreflightScope,
     format_preflight_report,
+    format_preflight_report_dict,
     load_probe_contract,
     parse_preflight_scope,
     run_permission_preflight,
@@ -229,7 +230,7 @@ async def _preflight_permissions(args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps(response, sort_keys=True))
             else:
-                print(_format_preflight_response(response))
+                print(format_preflight_report_dict(response))
             return 0 if response.get("status") == "ok" else 1
         config = load_app_config(args.config, args.routes)
         probe = (
@@ -282,43 +283,6 @@ def _preflight_scope_from_args(args: argparse.Namespace) -> PreflightScope:
             "profiles": args.profile,
         }
     )
-
-
-def _format_preflight_response(response: dict[str, Any]) -> str:
-    lines = [
-        f"Permission preflight: {response.get('status', 'unknown')}",
-        f"Profiles targeted: {len(response.get('checked_profiles') or [])}",
-        "Configured permission tool entries: "
-        f"{response.get('expected_permissions_count', len(response.get('expected_permissions') or []))}",
-        f"Missing tool entries: {response.get('missing_tools_count', len(response.get('missing_tools') or []))}",
-    ]
-    probe_errors = response.get("probe_errors") or []
-    if probe_errors:
-        lines.append("Probe errors:")
-        for error in probe_errors:
-            if not isinstance(error, dict):
-                continue
-            lines.append(f"- {error.get('profile')}: {error.get('error') or error.get('code')}")
-    scope_errors = response.get("scope_errors") or []
-    if scope_errors:
-        lines.append("Scope errors:")
-        for error in scope_errors:
-            if not isinstance(error, dict):
-                continue
-            lines.append(f"- {error.get('error') or error.get('code')}")
-    missing_tools = response.get("missing_tools") or []
-    if missing_tools:
-        lines.append("Missing tools:")
-        for tool in missing_tools:
-            if not isinstance(tool, dict):
-                continue
-            source = tool.get("source_kind")
-            if tool.get("source_id") is not None:
-                source = f"{source}:{tool['source_id']}"
-            lines.append(
-                f"- {tool.get('route_ref')} {tool.get('profile')} {source} {tool.get('tool')}"
-            )
-    return "\n".join(lines)
 
 
 def _format_route_status_response(response: dict[str, Any]) -> str:
