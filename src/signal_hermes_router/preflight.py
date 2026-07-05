@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -286,55 +286,30 @@ def _unmatched_scope_selector_errors(
     config: AppConfig,
     scope: PreflightScope,
 ) -> tuple[PreflightScopeError, ...]:
+    specs = (
+        ("route_names", scope.route_names, "unmatched_route_name", "route selector", "route"),
+        (
+            "route_indexes",
+            scope.route_indexes,
+            "unmatched_route_index",
+            "route-index selector",
+            "route_index",
+        ),
+        ("profiles", scope.profiles, "unmatched_profile", "profile selector", "profile"),
+    )
     errors: list[PreflightScopeError] = []
-    for route_name in scope.route_names:
-        selector_scope = PreflightScope(
-            active_only=scope.active_only,
-            route_names=(route_name,),
-            route_indexes=scope.route_indexes,
-            profiles=scope.profiles,
-        )
-        if not scope_matches_route(config, selector_scope):
-            errors.append(
-                PreflightScopeError(
-                    code="unmatched_route_name",
-                    error=f"preflight route selector matched no route: {route_name}",
-                    selector_kind="route",
-                    selector=route_name,
+    for field, selectors, code, label, selector_kind in specs:
+        for selector in selectors:
+            selector_scope = replace(scope, **{field: (selector,)})
+            if not scope_matches_route(config, selector_scope):
+                errors.append(
+                    PreflightScopeError(
+                        code=code,
+                        error=f"preflight {label} matched no route: {selector}",
+                        selector_kind=selector_kind,
+                        selector=selector,
+                    )
                 )
-            )
-    for route_index in scope.route_indexes:
-        selector_scope = PreflightScope(
-            active_only=scope.active_only,
-            route_names=scope.route_names,
-            route_indexes=(route_index,),
-            profiles=scope.profiles,
-        )
-        if not scope_matches_route(config, selector_scope):
-            errors.append(
-                PreflightScopeError(
-                    code="unmatched_route_index",
-                    error=f"preflight route-index selector matched no route: {route_index}",
-                    selector_kind="route_index",
-                    selector=route_index,
-                )
-            )
-    for profile in scope.profiles:
-        selector_scope = PreflightScope(
-            active_only=scope.active_only,
-            route_names=scope.route_names,
-            route_indexes=scope.route_indexes,
-            profiles=(profile,),
-        )
-        if not scope_matches_route(config, selector_scope):
-            errors.append(
-                PreflightScopeError(
-                    code="unmatched_profile",
-                    error=f"preflight profile selector matched no route: {profile}",
-                    selector_kind="profile",
-                    selector=profile,
-                )
-            )
     return tuple(errors)
 
 
