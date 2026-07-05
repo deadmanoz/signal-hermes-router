@@ -46,10 +46,6 @@ def escape_prompt_text(text: str) -> str:
     )
 
 
-def escape_user_text(text: str) -> str:
-    return escape_prompt_text(text)
-
-
 def text_block(text: str) -> dict[str, str]:
     return {"type": "text", "text": text}
 
