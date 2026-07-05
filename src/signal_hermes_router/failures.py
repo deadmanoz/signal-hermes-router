@@ -173,6 +173,9 @@ def classify_exception(
 ) -> FailureInfo:
     from .acp import JsonRpcError, JsonRpcPeerExited
 
+    def _detail(code: FailureCode) -> FailureInfo:
+        return failure_info(code, provider_detail=_exception_detail(exc), redactor=redactor)
+
     if context is not None:
         if isinstance(exc, JsonRpcError):
             error = exc.error if isinstance(getattr(exc, "error", None), dict) else {}
@@ -186,36 +189,20 @@ def classify_exception(
         # Only JSON-RPC errors can carry structured provider metadata. Peer
         # exits and generic exceptions keep the caller-supplied context code
         # with a sanitized diagnostic string.
-        return failure_info(context, provider_detail=_exception_detail(exc), redactor=redactor)
+        return _detail(context)
     if isinstance(exc, JsonRpcError):
         return _classify_json_rpc_error(exc, redactor=redactor)
     if isinstance(exc, JsonRpcPeerExited):
-        return failure_info(
-            FailureCode.ACP_SUBPROCESS_FAILED,
-            provider_detail=_exception_detail(exc),
-            redactor=redactor,
-        )
+        return _detail(FailureCode.ACP_SUBPROCESS_FAILED)
     if _is_subprocess_pipe_error(exc):
-        return failure_info(
-            FailureCode.ACP_SUBPROCESS_FAILED,
-            provider_detail=_exception_detail(exc),
-            redactor=redactor,
-        )
+        return _detail(FailureCode.ACP_SUBPROCESS_FAILED)
     # Keep timeout classification before OSError: router-owned wait timeouts
     # should stay acp_prompt_timeout even when a runtime exposes them through a
     # broader OSError-compatible type.
     if isinstance(exc, TimeoutError):
-        return failure_info(
-            FailureCode.ACP_PROMPT_TIMEOUT,
-            provider_detail=_exception_detail(exc),
-            redactor=redactor,
-        )
+        return _detail(FailureCode.ACP_PROMPT_TIMEOUT)
     if isinstance(exc, OSError):
-        return failure_info(
-            FailureCode.ENDPOINT_UNREACHABLE,
-            provider_detail=_exception_detail(exc),
-            redactor=redactor,
-        )
+        return _detail(FailureCode.ENDPOINT_UNREACHABLE)
     return _classify_text_fallback(_exception_detail(exc), redactor=redactor)
 
 
