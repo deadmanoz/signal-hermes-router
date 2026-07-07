@@ -10,12 +10,27 @@ from signal_hermes_router.failures import (
     ProviderClass,
     classify_exception,
     failure_info,
+    is_model_provider_failure_code,
     preflight_failure_from_report,
     sanitize_detail,
 )
 
 
 class FailureClassificationTests(unittest.TestCase):
+    def test_model_provider_failure_code_set_matches_public_enum(self) -> None:
+        expected_model_provider_codes = {
+            FailureCode.MODEL_AUTH_FAILED,
+            FailureCode.MODEL_RATE_LIMITED,
+            FailureCode.MODEL_UNAVAILABLE,
+            FailureCode.MODEL_TIMEOUT,
+            FailureCode.ENDPOINT_UNREACHABLE,
+        }
+        actual_model_provider_codes = {
+            code for code in FailureCode if is_model_provider_failure_code(code)
+        }
+
+        self.assertEqual(actual_model_provider_codes, expected_model_provider_codes)
+
     def test_structured_json_rpc_error_data_drives_public_code(self) -> None:
         failure = classify_exception(
             JsonRpcError(
@@ -59,6 +74,73 @@ class FailureClassificationTests(unittest.TestCase):
         self.assertEqual(failure.code, FailureCode.ACP_SESSION_FAILED)
         self.assertEqual(failure.provider_class, ProviderClass.CLOUD_API)
         self.assertIn("expired token [token]", failure.to_dict()["provider_detail"])
+
+    def test_session_context_can_prefer_structured_provider_failure(self) -> None:
+        failure = classify_exception(
+            JsonRpcError(
+                {
+                    "code": -32000,
+                    "message": "session failed",
+                    "data": {
+                        "code": "quota_exceeded",
+                        "provider_class": "cloud_api",
+                        "provider_detail": "429 usage_limit_reached",
+                    },
+                }
+            ),
+            context=FailureCode.ACP_SESSION_FAILED,
+            prefer_structured_provider_failure=True,
+        )
+
+        self.assertEqual(failure.code, FailureCode.MODEL_RATE_LIMITED)
+        self.assertEqual(failure.provider_class, ProviderClass.CLOUD_API)
+        self.assertIn("usage_limit_reached", failure.to_dict()["provider_detail"])
+
+    def test_session_context_opt_in_preserves_non_provider_and_text_only_errors(self) -> None:
+        permission = classify_exception(
+            JsonRpcError(
+                {
+                    "code": -32000,
+                    "message": "permission failed",
+                    "data": {"code": "permission_denied", "detail": "tool rejected"},
+                }
+            ),
+            context=FailureCode.ACP_SESSION_FAILED,
+            prefer_structured_provider_failure=True,
+        )
+        text_only = classify_exception(
+            JsonRpcError(
+                {
+                    "code": -32000,
+                    "message": "429 quota exceeded",
+                    "data": {"provider_class": "cloud_api"},
+                }
+            ),
+            context=FailureCode.ACP_SESSION_FAILED,
+            prefer_structured_provider_failure=True,
+        )
+
+        self.assertEqual(permission.code, FailureCode.ACP_SESSION_FAILED)
+        self.assertEqual(text_only.code, FailureCode.ACP_SESSION_FAILED)
+        self.assertEqual(text_only.provider_class, ProviderClass.CLOUD_API)
+
+    def test_router_error_context_ignores_structured_provider_code_without_opt_in(self) -> None:
+        failure = classify_exception(
+            JsonRpcError(
+                {
+                    "code": -32000,
+                    "message": "provider rate limited",
+                    "data": {
+                        "code": "model_rate_limited",
+                        "provider_class": "cloud_api",
+                    },
+                }
+            ),
+            context=FailureCode.ROUTER_ERROR,
+        )
+
+        self.assertEqual(failure.code, FailureCode.ROUTER_ERROR)
+        self.assertEqual(failure.provider_class, ProviderClass.CLOUD_API)
 
     def test_provider_class_is_not_inferred_from_text(self) -> None:
         failure = classify_exception(

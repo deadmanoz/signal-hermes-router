@@ -119,6 +119,7 @@ router:
                 "work_root": "work",
                 "maintenance_reply": "maintenance",
                 "failure_reply": "failure",
+                "model_failure_reply": "model failure",
                 "busy_notice_after_seconds": "3.5",
                 "busy_notice": "busy",
                 "acp_prompt_timeout_seconds": "450",
@@ -142,6 +143,7 @@ router:
         self.assertEqual(router.circuit_breaker.window_seconds, 9.5)
         self.assertEqual(router.circuit_breaker.recovery_seconds, 12.5)
         self.assertEqual(router.maintenance_reply, "maintenance")
+        self.assertEqual(router.model_failure_reply, "model failure")
 
     def test_parse_router_config_defaults_acp_prompt_timeout_and_recovery(self) -> None:
         router = parse_router_config({})

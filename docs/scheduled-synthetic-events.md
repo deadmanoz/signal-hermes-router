@@ -184,6 +184,13 @@ If a synthetic turn reaches Hermes and then fails during ACP session setup,
 ACP prompt execution, model/provider work, or profile recovery, the router
 returns an `error` response, sends the configured failure or maintenance reply
 when the route state allows a reply, and releases the synthetic dedupe claim.
+Route-owned failure responses include safe observability fields for scheduler
+logs: `route_ref`, `profile`, `last_failure_at_ms`, `reply_sent`, and the
+sanitized `failure` object with stable `code`, `message`, `provider_class`,
+and bounded detail fields. ACP session-acquisition model/provider failures use
+model/provider codes only when Hermes supplies structured JSON-RPC
+`error.data.code`; text-only quota or rate-limit wording remains
+`acp_session_failed`.
 The same `--scheduled-at` or `--idempotency-key` can then be retried
 deliberately after the operator fixes the underlying issue. Successful
 synthetic turns still mark the dedupe identity handled, and Signal send
