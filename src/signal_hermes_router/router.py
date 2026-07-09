@@ -227,6 +227,9 @@ class SignalHermesRouter:
         turn = self._signal_turn_input(route, event)
         lock = self._route_lock(route)
         async with lock:
+            if self._is_empty_signal_event(event):
+                self._mark_empty_signal_turn_handled(turn)
+                return None
             profile_lock = self._profile_lock(route.profile)
             async with profile_lock:
                 outcome = await self._run_turn(turn)
@@ -719,6 +722,29 @@ class SignalHermesRouter:
             signal_event=event,
             permission_policy=route.permission_policy,
         )
+
+    @staticmethod
+    def _is_empty_signal_event(event: NormalizedEvent) -> bool:
+        return not event.text.strip() and not event.attachments
+
+    def _mark_empty_signal_turn_handled(self, turn: RoutedTurnInput) -> None:
+        route = turn.route
+        dedupe_identities = self._turn_dedupe_identities(turn)
+        claimed_dedupe: list[tuple[str, int]] = []
+        for dedupe_sender_id, dedupe_timestamp in dedupe_identities:
+            if not self.dedupe.claim(route.key, dedupe_sender_id, dedupe_timestamp):
+                for claimed_sender_id, claimed_timestamp in claimed_dedupe:
+                    self.dedupe.release(route.key, claimed_sender_id, claimed_timestamp)
+                event_ref = f"{route.key}:{dedupe_sender_id}:{dedupe_timestamp}"
+                LOGGER.info("deduped routed turn %s", self.redactor.ref("event", event_ref))
+                return
+            claimed_dedupe.append((dedupe_sender_id, dedupe_timestamp))
+        LOGGER.info(
+            "discarding empty Signal event for route %s",
+            self.redactor.ref("route", route.key),
+        )
+        for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
+            self.dedupe.mark_handled(route.key, dedupe_sender_id, dedupe_timestamp)
 
     def _synthetic_turn_input(
         self,
