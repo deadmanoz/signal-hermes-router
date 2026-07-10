@@ -3491,9 +3491,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             for exc_type in (ConnectionResetError, BrokenPipeError):
                 with self.subTest(exc_type=exc_type.__name__):
                     reader = asyncio.StreamReader()
-                    reader.feed_data(
-                        b'{"command":"route_status"}\n{"command":"route_status"}\n'
-                    )
+                    reader.feed_data(b'{"command":"route_status"}\n{"command":"route_status"}\n')
                     reader.feed_eof()
                     writer = DisconnectedWriter(exc_type())
                     with self.assertLogs(
