@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -84,6 +85,26 @@ class DedupeTests(unittest.TestCase):
                     with self.assertRaises(sqlite3.OperationalError):
                         DedupeStore(path)
 
+                self.assertEqual(store.status("signal:route", "in-flight-uuid", 1), "processing")
+                # The failed same-process overlap must not have dropped the
+                # live store's file locks: a separate process stays excluded.
+                probe = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sqlite3, sys\n"
+                        "db = sqlite3.connect(sys.argv[1], timeout=0.2)\n"
+                        "try:\n"
+                        "    db.execute(\"DELETE FROM dedupe_events WHERE status = 'processing'\")\n"
+                        "    db.commit()\n"
+                        "except sqlite3.OperationalError:\n"
+                        "    sys.exit(3)\n"
+                        "sys.exit(0)\n",
+                        str(path),
+                    ],
+                    capture_output=True,
+                )
+                self.assertEqual(probe.returncode, 3)
                 self.assertEqual(store.status("signal:route", "in-flight-uuid", 1), "processing")
 
             with DedupeStore(path) as reopened:

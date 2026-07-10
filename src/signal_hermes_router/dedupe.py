@@ -5,7 +5,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from .private_fs import ensure_private_dir, ensure_private_file
+from .private_fs import PRIVATE_FILE_MODE, ensure_private_dir, ensure_private_file
 
 LOGGER = logging.getLogger(__name__)
 
@@ -16,7 +16,14 @@ class DedupeStore:
         if self.path != ":memory:":
             db_path = Path(self.path)
             ensure_private_dir(db_path.parent)
-            ensure_private_file(db_path)
+            if db_path.exists():
+                # Never reopen an existing DB outside sqlite: closing any
+                # descriptor for the inode drops this process's POSIX record
+                # locks, including a live store's exclusive lock. chmod
+                # enforces the private mode without opening the file.
+                db_path.chmod(PRIVATE_FILE_MODE)
+            else:
+                ensure_private_file(db_path)
         self._lock = threading.Lock()
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._closed = False
