@@ -5,7 +5,7 @@
 
 ### Bug Fixes
 
-* **router:** ignore empty Signal turns ([#30](https://github.com/deadmanoz/signal-hermes-router/issues/30)) ([183c0f5](https://github.com/deadmanoz/signal-hermes-router/commit/183c0f5adb7da2ea8e153b62f7b3c84be08d6cae))
+* **router:** ignore empty Signal turns ([#30](https://github.com/deadmanoz/signal-hermes-router/issues/30))
 
 ## [0.1.12](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.11...v0.1.12) (2026-07-04)
 
