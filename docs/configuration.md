@@ -300,8 +300,9 @@ route can also wait on the route lock or return `busy`). Only claims left
 `processing` by a crash mid-turn are reclaimed at the next startup, so a retry
 with the same key then delivers instead of reporting `deduped`; a crash after
 the Signal send but before the identity is marked `handled` can therefore
-duplicate output on retry. Completed synthetic failures still release their
-claim for deliberate retry (see
+duplicate output on retry. Synthetic failures during Hermes work still
+release their claim for deliberate retry, while Signal send failures after
+completed Hermes work mark the identity `handled` (see
 [docs/scheduled-synthetic-events.md](scheduled-synthetic-events.md)).
 `--client-timeout` bounds the local control socket round trip and defaults to
 300 seconds. `notify-route` reads `--payload-file` as UTF-8 JSON, rejects

@@ -68,19 +68,25 @@ class DedupeTests(unittest.TestCase):
             self.assertEqual(file_mode(path), 0o600)
 
     def test_live_store_locks_out_overlapping_store(self) -> None:
+        real_connect = sqlite3.connect
+
+        def impatient_connect(path: str, **kwargs: object) -> sqlite3.Connection:
+            return real_connect(path, timeout=0.2, **kwargs)  # type: ignore[arg-type]
+
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "router.db"
             with DedupeStore(path) as store:
-                store.mark_handled("signal:route", "uuid", 1)
-                overlapping = sqlite3.connect(path, timeout=0.2)
-                try:
+                self.assertTrue(store.claim("signal:route", "in-flight-uuid", 1))
+                store.mark_handled("signal:route", "handled-uuid", 2)
+
+                with patch("signal_hermes_router.dedupe.sqlite3.connect", impatient_connect):
                     with self.assertRaises(sqlite3.OperationalError):
-                        overlapping.execute("SELECT 1 FROM dedupe_events")
-                finally:
-                    overlapping.close()
+                        DedupeStore(path)
+
+                self.assertEqual(store.status("signal:route", "in-flight-uuid", 1), "processing")
 
             with DedupeStore(path) as reopened:
-                self.assertTrue(reopened.is_handled("signal:route", "uuid", 1))
+                self.assertTrue(reopened.is_handled("signal:route", "handled-uuid", 2))
 
     def test_fresh_store_reclaims_orphaned_processing_claims(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
