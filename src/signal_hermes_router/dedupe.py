@@ -20,13 +20,18 @@ class DedupeStore:
         self._lock = threading.Lock()
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._closed = False
-        # Hold the sqlite file lock for the connection's lifetime. The reclaim
-        # below assumes this process owns the state DB exclusively, so an
-        # overlapping router over the same file must fail loudly at startup
-        # instead of erasing this process's in-flight claims.
-        self._db.execute("PRAGMA locking_mode=EXCLUSIVE")
-        self._ensure_schema()
-        self._reclaim_orphaned_claims()
+        try:
+            # Hold the sqlite file lock for the connection's lifetime. The
+            # reclaim below assumes this process owns the state DB
+            # exclusively, so an overlapping router over the same file must
+            # fail loudly at startup instead of erasing this process's
+            # in-flight claims.
+            self._db.execute("PRAGMA locking_mode=EXCLUSIVE")
+            self._ensure_schema()
+            self._reclaim_orphaned_claims()
+        except BaseException:
+            self.close()
+            raise
 
     def _ensure_schema(self) -> None:
         columns = {

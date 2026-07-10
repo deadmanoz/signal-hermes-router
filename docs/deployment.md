@@ -40,3 +40,19 @@ uv sync --locked --inexact
 The `--inexact` flag is intentional. The router supervises the `hermes` CLI at
 runtime, but Hermes is installed separately and is not part of this package's
 lockfile.
+
+## Restarts and Upgrades
+
+Run exactly one router process per state DB, and stop the old process fully
+before starting its replacement (systemd's default stop-then-start restart
+behaviour is correct; avoid overlapping start-before-stop schemes). Two live
+routers over the same Signal account double-consume events, and the dedupe
+store's startup reclaim of orphaned `processing` claims assumes exclusive
+ownership of the state DB.
+
+The store enforces that ownership by holding an exclusive sqlite lock for the
+router's lifetime, so a second current-version router fails loudly at startup.
+A router built before this lock existed releases its file locks between
+writes, so that enforcement cannot protect a mixed-version overlap: when
+upgrading from such a version, confirm the old process has exited before
+starting the new one.
