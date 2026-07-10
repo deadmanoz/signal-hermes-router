@@ -88,6 +88,34 @@ def make_direct_raw(
     return {"envelope": envelope, "account": "synthetic-account-number"}
 
 
+def make_group_raw(
+    *,
+    group_id: str = "group",
+    source_uuid: str = "sender-uuid",
+    timestamp: int = 1,
+    text: str | None = "hello",
+    attachments: list[dict] | None = None,
+) -> dict:
+    data_message: dict = {
+        "timestamp": timestamp,
+        "groupInfo": {"groupId": group_id},
+        "attachments": attachments or [],
+    }
+    if text is not None:
+        data_message["message"] = text
+    return {
+        "jsonrpc": "2.0",
+        "method": "receive",
+        "params": {
+            "envelope": {
+                "sourceUuid": source_uuid,
+                "timestamp": timestamp,
+                "dataMessage": data_message,
+            }
+        },
+    }
+
+
 def make_synthetic_app(
     tmp: str | Path,
     route: Route,
@@ -364,6 +392,183 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(signal.direct_typing, [("sender-uuid", True), ("sender-uuid", False)])
             self.assertTrue(profile.prompts[0][0]["text"].startswith("[route_context:"))
             self.assertEqual(profile.prompts[0][1]["text"], "hello direct")
+
+    async def test_empty_group_data_message_is_ignored_and_deduped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            dedupe = DedupeStore()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+            )
+
+            result = await router.handle_raw_event(make_group_raw(text="", timestamp=1))
+
+            self.assertIsNone(result)
+            self.assertEqual(profile.prompts, [])
+            self.assertEqual(signal.sends, [])
+            self.assertEqual(signal.typing, [])
+            self.assertEqual(dedupe.status("signal:group", "sender-uuid", 1), "handled")
+            self.assertFalse(dedupe.claim("signal:group", "sender-uuid", 1))
+
+    async def test_whitespace_only_group_data_message_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            dedupe = DedupeStore()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+            )
+
+            result = await router.handle_raw_event(make_group_raw(text=" \n\t ", timestamp=2))
+
+            self.assertIsNone(result)
+            self.assertEqual(profile.prompts, [])
+            self.assertEqual(signal.sends, [])
+            self.assertEqual(dedupe.status("signal:group", "sender-uuid", 2), "handled")
+
+    async def test_duplicate_empty_group_data_message_does_not_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            dedupe = DedupeStore()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+            )
+            raw = make_group_raw(text="", timestamp=3)
+
+            await router.handle_raw_event(raw)
+            result = await router.handle_raw_event(raw)
+
+            self.assertIsNone(result)
+            self.assertEqual(profile.prompts, [])
+            self.assertEqual(signal.sends, [])
+            self.assertEqual(dedupe.status("signal:group", "sender-uuid", 3), "handled")
+            self.assertFalse(dedupe.claim("signal:group", "sender-uuid", 3))
+
+    async def test_empty_group_data_message_does_not_overtake_queued_real_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            dedupe = DedupeStore()
+            app = make_app(tmp, RouteState.ACTIVE)
+            route = app.routes[0]
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+            )
+            lock = router._route_lock(route)
+            await lock.acquire()
+            text_task = asyncio.create_task(
+                router.handle_raw_event(make_group_raw(text="hello", timestamp=4))
+            )
+            await asyncio.sleep(0)
+            empty_task = asyncio.create_task(
+                router.handle_raw_event(make_group_raw(text="", timestamp=4))
+            )
+            await asyncio.sleep(0)
+            try:
+                self.assertIsNone(dedupe.status("signal:group", "sender-uuid", 4))
+            finally:
+                lock.release()
+
+            text_result, empty_result = await asyncio.gather(text_task, empty_task)
+
+            self.assertEqual(text_result, TurnResult("reply"))
+            self.assertIsNone(empty_result)
+            self.assertEqual(len(profile.prompts), 1)
+            self.assertEqual(signal.sends, [("group", "reply")])
+            self.assertEqual(dedupe.status("signal:group", "sender-uuid", 4), "handled")
+
+    async def test_attachment_only_group_data_message_still_prompts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            attachment = {
+                "contentType": "text/plain",
+                "filename": "note.txt",
+                "data": base64.b64encode(b"body").decode("ascii"),
+            }
+
+            result = await router.handle_raw_event(
+                make_group_raw(text="", attachments=[attachment], timestamp=5)
+            )
+
+            self.assertEqual(result, TurnResult("reply"))
+            self.assertEqual(signal.sends, [("group", "reply")])
+            self.assertEqual(len(profile.prompts), 1)
+            self.assertTrue(profile.prompts[0][0]["text"].startswith("[route_context:"))
+            self.assertEqual(len(profile.prompts[0]), 2)
+            media_files = list((Path(tmp) / "media").rglob("note.txt"))
+            self.assertEqual(len(media_files), 1)
+
+    async def test_normal_group_data_message_still_prompts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            result = await router.handle_raw_event(make_group_raw(text="hello", timestamp=6))
+
+            self.assertEqual(result, TurnResult("reply"))
+            self.assertEqual(signal.sends, [("group", "reply")])
+            self.assertEqual(profile.prompts[0][1]["text"], "hello")
+
+    async def test_empty_direct_data_message_is_ignored_with_route_identity_dedupe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            route = make_direct_route()
+            dedupe = DedupeStore()
+            router = SignalHermesRouter(
+                AppConfig(
+                    router=RouterConfig(
+                        state_db=Path(tmp) / "state.db",
+                        media_root=Path(tmp) / "media",
+                        signal_attachment_root=Path(tmp) / "signal-attachments",
+                        work_root=Path(tmp) / "work",
+                    ),
+                    routes=(route,),
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+            )
+
+            result = await router.handle_raw_event(
+                make_direct_raw(source_uuid=None, text="", timestamp=7)
+            )
+
+            self.assertIsNone(result)
+            self.assertEqual(profile.prompts, [])
+            self.assertEqual(signal.direct_sends, [])
+            self.assertEqual(signal.direct_typing, [])
+            self.assertEqual(dedupe.status(route.key, "sender-uuid", 7), "handled")
+            self.assertIsNone(dedupe.status(route.key, "+00000000000", 7))
+            self.assertFalse(dedupe.claim(route.key, "sender-uuid", 7))
+            self.assertTrue(dedupe.claim(route.key, "+00000000000", 7))
 
     async def test_active_group_synthetic_job_calls_backend_and_replies(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
