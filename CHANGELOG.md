@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.15](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.14...v0.1.15) (2026-07-10)
+
+
+### Bug Fixes
+
+* **router:** guard control-socket response writes against client disconnect ([#33](https://github.com/deadmanoz/signal-hermes-router/issues/33))
+
 ## [0.1.14](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.13...v0.1.14) (2026-07-10)
 
 
