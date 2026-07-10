@@ -3448,14 +3448,23 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_control_client_disconnect_before_response_is_swallowed(self) -> None:
         class DisconnectedWriter:
+            """Simulates a peer that vanished before the response drain.
+
+            write() stays inert, matching a real transport buffering into a
+            dead socket; the failure surfaces at drain(), the site observed
+            in production.
+            """
+
             def __init__(self, exc: BaseException) -> None:
                 self.exc = exc
                 self.closed = False
+                self.drain_attempts = 0
 
             def write(self, data: bytes) -> None:
                 pass
 
             async def drain(self) -> None:
+                self.drain_attempts += 1
                 raise self.exc
 
             def close(self) -> None:
@@ -3482,7 +3491,9 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             for exc_type in (ConnectionResetError, BrokenPipeError):
                 with self.subTest(exc_type=exc_type.__name__):
                     reader = asyncio.StreamReader()
-                    reader.feed_data(b'{"command":"route_status"}\n')
+                    reader.feed_data(
+                        b'{"command":"route_status"}\n{"command":"route_status"}\n'
+                    )
                     reader.feed_eof()
                     writer = DisconnectedWriter(exc_type())
                     with self.assertLogs(
@@ -3496,6 +3507,9 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                         "control client disconnected before reading response",
                         "\n".join(debug_logs.output),
                     )
+                    # The session loop ends on the first failed response; the
+                    # second queued line is never processed.
+                    self.assertEqual(writer.drain_attempts, 1)
                     self.assertTrue(writer.closed)
 
     async def test_turn_prompt_block_guards_reject_malformed_turns(self) -> None:

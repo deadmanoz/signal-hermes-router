@@ -1227,6 +1227,12 @@ class SignalHermesRouter:
             writer.write(encode_control_message(response))
             await writer.drain()
         except (ConnectionResetError, BrokenPipeError):
+            # Only the peer-disconnect exceptions asyncio raises for a client
+            # that went away are swallowed; anything else (encoding bugs,
+            # unexpected transport failures) must propagate, not be masked.
+            # The control socket is unix-domain, so TCP-only disconnect
+            # variants such as ConnectionAbortedError are not part of its
+            # failure surface.
             LOGGER.debug(
                 "control client disconnected before reading response",
                 exc_info=True,
