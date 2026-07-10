@@ -20,6 +20,11 @@ class DedupeStore:
         self._lock = threading.Lock()
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._closed = False
+        # Hold the sqlite file lock for the connection's lifetime. The reclaim
+        # below assumes this process owns the state DB exclusively, so an
+        # overlapping router over the same file must fail loudly at startup
+        # instead of erasing this process's in-flight claims.
+        self._db.execute("PRAGMA locking_mode=EXCLUSIVE")
         self._ensure_schema()
         self._reclaim_orphaned_claims()
 
@@ -47,10 +52,12 @@ class DedupeStore:
         self._db.commit()
 
     def _reclaim_orphaned_claims(self) -> None:
-        # No turn is in flight when the store is constructed (the router owns
-        # the state DB exclusively and creates one store per process), so any
-        # persisted 'processing' claim was orphaned by a dead process and
-        # would otherwise dedupe its retries forever.
+        # No turn is in flight when the store is constructed (construction
+        # fails on the exclusive lock above if another live store owns the
+        # DB), so any persisted 'processing' claim was orphaned by a dead
+        # process and would otherwise dedupe its retries forever. This write
+        # also escalates the exclusive lock, so it is held from startup even
+        # when nothing is reclaimed.
         cursor = self._db.execute("DELETE FROM dedupe_events WHERE status = 'processing'")
         self._db.commit()
         if cursor.rowcount > 0:

@@ -67,6 +67,21 @@ class DedupeTests(unittest.TestCase):
             self.assertEqual(file_mode(path.parent), 0o700)
             self.assertEqual(file_mode(path), 0o600)
 
+    def test_live_store_locks_out_overlapping_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "router.db"
+            with DedupeStore(path) as store:
+                store.mark_handled("signal:route", "uuid", 1)
+                overlapping = sqlite3.connect(path, timeout=0.2)
+                try:
+                    with self.assertRaises(sqlite3.OperationalError):
+                        overlapping.execute("SELECT 1 FROM dedupe_events")
+                finally:
+                    overlapping.close()
+
+            with DedupeStore(path) as reopened:
+                self.assertTrue(reopened.is_handled("signal:route", "uuid", 1))
+
     def test_fresh_store_reclaims_orphaned_processing_claims(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "router.db"
