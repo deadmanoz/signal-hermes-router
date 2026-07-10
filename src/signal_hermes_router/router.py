@@ -1200,25 +1200,45 @@ class SignalHermesRouter:
                 try:
                     line = await reader.readline()
                 except ValueError:
-                    writer.write(
-                        encode_control_message(
-                            {
-                                "status": TurnOutcomeStatus.ERROR.value,
-                                "error": "request_too_large",
-                            }
-                        )
+                    await self._write_control_response(
+                        writer,
+                        {
+                            "status": TurnOutcomeStatus.ERROR.value,
+                            "error": "request_too_large",
+                        },
                     )
-                    await writer.drain()
                     break
                 if not line:
                     break
                 response = await self._handle_control_line(line)
-                writer.write(encode_control_message(response))
-                await writer.drain()
+                if not await self._write_control_response(writer, response):
+                    break
         finally:
             writer.close()
             with suppress(Exception):
                 await writer.wait_closed()
+
+    async def _write_control_response(
+        self,
+        writer: asyncio.StreamWriter,
+        response: dict[str, Any],
+    ) -> bool:
+        try:
+            writer.write(encode_control_message(response))
+            await writer.drain()
+        except (ConnectionResetError, BrokenPipeError):
+            # Only the peer-disconnect exceptions asyncio raises for a client
+            # that went away are swallowed; anything else (encoding bugs,
+            # unexpected transport failures) must propagate, not be masked.
+            # The control socket is unix-domain, so TCP-only disconnect
+            # variants such as ConnectionAbortedError are not part of its
+            # failure surface.
+            LOGGER.debug(
+                "control client disconnected before reading response",
+                exc_info=True,
+            )
+            return False
+        return True
 
     async def _handle_control_line(self, line: bytes) -> dict[str, Any]:
         try:

@@ -3446,6 +3446,70 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(signal.sends, [("group", "reply")])
             self.assertFalse(socket_path.exists())
 
+    async def test_control_client_disconnect_before_response_is_swallowed(self) -> None:
+        class DisconnectedWriter:
+            """Simulates a peer that vanished before the response drain.
+
+            write() stays inert, matching a real transport buffering into a
+            dead socket; the failure surfaces at drain(), the site observed
+            in production.
+            """
+
+            def __init__(self, exc: BaseException) -> None:
+                self.exc = exc
+                self.closed = False
+                self.drain_attempts = 0
+
+            def write(self, data: bytes) -> None:
+                pass
+
+            async def drain(self) -> None:
+                self.drain_attempts += 1
+                raise self.exc
+
+            def close(self) -> None:
+                self.closed = True
+
+            async def wait_closed(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            for exc_type in (ConnectionResetError, BrokenPipeError):
+                with self.subTest(exc_type=exc_type.__name__):
+                    reader = asyncio.StreamReader()
+                    reader.feed_data(b'{"command":"route_status"}\n{"command":"route_status"}\n')
+                    reader.feed_eof()
+                    writer = DisconnectedWriter(exc_type())
+                    with self.assertLogs(
+                        "signal_hermes_router.router", level="DEBUG"
+                    ) as debug_logs:
+                        await router._handle_control_client(
+                            reader,
+                            writer,  # type: ignore[arg-type]
+                        )
+                    self.assertIn(
+                        "control client disconnected before reading response",
+                        "\n".join(debug_logs.output),
+                    )
+                    # The session loop ends on the first failed response; the
+                    # second queued line is never processed.
+                    self.assertEqual(writer.drain_attempts, 1)
+                    self.assertTrue(writer.closed)
+
     async def test_turn_prompt_block_guards_reject_malformed_turns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = Route(
