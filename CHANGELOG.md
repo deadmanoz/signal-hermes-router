@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.13](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.12...v0.1.13) (2026-07-10)
+
+
+### Bug Fixes
+
+* **router:** ignore empty Signal turns ([#30](https://github.com/deadmanoz/signal-hermes-router/issues/30))
+
 ## [0.1.12](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.11...v0.1.12) (2026-07-04)
 
 
