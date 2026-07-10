@@ -110,6 +110,17 @@ class DedupeTests(unittest.TestCase):
             with DedupeStore(path) as reopened:
                 self.assertTrue(reopened.is_handled("signal:route", "handled-uuid", 2))
 
+    def test_directory_state_db_fails_without_touching_its_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state-dir"
+            path.mkdir()
+            os.chmod(path, 0o755)
+
+            with self.assertRaises(sqlite3.OperationalError):
+                DedupeStore(path)
+
+            self.assertEqual(file_mode(path), 0o755)
+
     def test_fresh_live_store_holds_lock_before_any_claim(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "router.db"

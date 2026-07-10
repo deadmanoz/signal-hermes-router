@@ -16,14 +16,16 @@ class DedupeStore:
         if self.path != ":memory:":
             db_path = Path(self.path)
             ensure_private_dir(db_path.parent)
-            if db_path.exists():
+            if db_path.is_file():
                 # Never reopen an existing DB outside sqlite: closing any
                 # descriptor for the inode drops this process's POSIX record
                 # locks, including a live store's exclusive lock. chmod
                 # enforces the private mode without opening the file.
                 db_path.chmod(PRIVATE_FILE_MODE)
-            else:
+            elif not db_path.exists():
                 ensure_private_file(db_path)
+            # A non-regular existing path (for example a directory) is left
+            # untouched; sqlite3.connect below fails loudly on it.
         self._lock = threading.Lock()
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._closed = False
