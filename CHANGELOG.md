@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.14](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.13...v0.1.14) (2026-07-10)
+
+
+### Bug Fixes
+
+* **router:** handle Hermes model failure observability ([#29](https://github.com/deadmanoz/signal-hermes-router/issues/29)) ([a0c1b8e](https://github.com/deadmanoz/signal-hermes-router/commit/a0c1b8ea2971c2adc8c69445d5bd5754b9d9eab8))
+
 ## [0.1.13](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.12...v0.1.13) (2026-07-10)
 
 
