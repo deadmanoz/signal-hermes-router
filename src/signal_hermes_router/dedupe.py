@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from pathlib import Path
 
 from .private_fs import ensure_private_dir, ensure_private_file
+
+LOGGER = logging.getLogger(__name__)
 
 
 class DedupeStore:
@@ -18,6 +21,7 @@ class DedupeStore:
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._closed = False
         self._ensure_schema()
+        self._reclaim_orphaned_claims()
 
     def _ensure_schema(self) -> None:
         columns = {
@@ -41,6 +45,16 @@ class DedupeStore:
                 "SELECT '', source_uuid, timestamp, 'handled' FROM dedupe_events_legacy_v1"
             )
         self._db.commit()
+
+    def _reclaim_orphaned_claims(self) -> None:
+        # No turn is in flight when the store is constructed (the router owns
+        # the state DB exclusively and creates one store per process), so any
+        # persisted 'processing' claim was orphaned by a dead process and
+        # would otherwise dedupe its retries forever.
+        cursor = self._db.execute("DELETE FROM dedupe_events WHERE status = 'processing'")
+        self._db.commit()
+        if cursor.rowcount > 0:
+            LOGGER.info("reclaimed %d orphaned processing dedupe claims", cursor.rowcount)
 
     def _legacy_table_exists(self) -> bool:
         cursor = self._db.execute(

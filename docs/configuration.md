@@ -292,7 +292,17 @@ signal-hermes-router --config /path/to/private/config.yaml route-status --route 
 `--scheduled-at` accepts either an epoch millisecond integer or a timezone-aware
 ISO 8601 timestamp. Naive datetimes are rejected. `--idempotency-key` is hashed
 before it is used in the dedupe identity. Reusing the same `--scheduled-at` or
-the same idempotency key dedupes repeated timer attempts for the same job fire.
+the same idempotency key dedupes repeated timer attempts for the same job fire:
+identities the router persisted as `handled` stay deduplicated, including
+across restarts, and a `processing` claim held by a live router keeps
+reserving the identity while its turn runs (concurrent attempts for the same
+route can also wait on the route lock or return `busy`). Only claims left
+`processing` by a crash mid-turn are reclaimed at the next startup, so a retry
+with the same key then delivers instead of reporting `deduped`; a crash after
+the Signal send but before the identity is marked `handled` can therefore
+duplicate output on retry. Completed synthetic failures still release their
+claim for deliberate retry (see
+[docs/scheduled-synthetic-events.md](scheduled-synthetic-events.md)).
 `--client-timeout` bounds the local control socket round trip and defaults to
 300 seconds. `notify-route` reads `--payload-file` as UTF-8 JSON, rejects
 non-object and non-array payloads, and applies the configured compact JSON byte

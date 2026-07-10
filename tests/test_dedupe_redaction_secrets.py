@@ -67,6 +67,19 @@ class DedupeTests(unittest.TestCase):
             self.assertEqual(file_mode(path.parent), 0o700)
             self.assertEqual(file_mode(path), 0o600)
 
+    def test_fresh_store_reclaims_orphaned_processing_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "router.db"
+            crashed = DedupeStore(path)
+            self.assertTrue(crashed.claim("signal:route", "orphaned-uuid", 1))
+            crashed.mark_handled("signal:route", "handled-uuid", 2)
+            crashed.close()
+
+            with DedupeStore(path) as store:
+                self.assertIsNone(store.status("signal:route", "orphaned-uuid", 1))
+                self.assertTrue(store.claim("signal:route", "orphaned-uuid", 1))
+                self.assertTrue(store.is_handled("signal:route", "handled-uuid", 2))
+
     def test_file_backed_store_uses_private_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state" / "router.db"

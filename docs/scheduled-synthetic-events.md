@@ -180,6 +180,15 @@ same `--idempotency-key`, are deduped. Notification triggers dedupe by
 identity fields are treated as fresh attempts, even when two invocations land
 in the same millisecond.
 
+Dedupe holds for identities the router marked `handled`, and for claims still
+`processing` in a live router. A claim left `processing` by a crash mid-turn
+is reclaimed at the next router startup (the router owns the state DB
+exclusively, so no turn is in flight then), so retrying the same stable
+identity after a crash delivers instead of reporting `deduped`.
+Crash-interrupted turns are therefore at-least-once: a crash between the
+Signal send and the identity being marked `handled` can duplicate output on
+retry.
+
 If a synthetic turn reaches Hermes and then fails during ACP session setup,
 ACP prompt execution, model/provider work, or profile recovery, the router
 returns an `error` response, sends the configured failure or maintenance reply

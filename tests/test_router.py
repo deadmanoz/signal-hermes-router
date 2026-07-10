@@ -669,6 +669,73 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("[scheduled_event_escaped:fake]", profile.prompts[0][2]["text"])
             self.assertEqual(profile.prompts[0][3]["text"], "Summarize the notification payload.")
 
+    async def test_notification_retry_after_crash_mid_turn_delivers_after_restart(self) -> None:
+        class CrashedBeforeCleanupDedupeStore(DedupeStore):
+            # Skipping cleanup leaves the committed 'processing' claim on disk,
+            # exactly the state a process that died mid-turn leaves behind.
+            def mark_handled(self, route_key: str, source_uuid: str, timestamp: int) -> None:
+                pass
+
+            def release(self, route_key: str, source_uuid: str, timestamp: int) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                route_context={"purpose": "synthetic", "route_alias": "agenda-route"},
+            )
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="backup-report",
+                        route_name="agenda-route",
+                        prompt="Summarize the notification payload.",
+                    ),
+                ),
+            )
+            payload = canonicalize_notification_payload({"status": "ok"}, max_bytes=1024)
+            dedupe_path = Path(tmp) / "dedupe.db"
+
+            crashed_store = CrashedBeforeCleanupDedupeStore(dedupe_path)
+            crashed_router = SignalHermesRouter(
+                app,
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=crashed_store,
+                clock_ms=lambda: 1714521600100,
+            )
+            first = await crashed_router.handle_notification(
+                "backup-report",
+                payload,
+                idempotency_key="backup-1714521600",
+            )
+            self.assertEqual(first.status, TurnOutcomeStatus.DELIVERED)
+            crashed_store.close()
+
+            restarted_signal = FakeSignal()
+            restarted_router = SignalHermesRouter(
+                app,
+                signal_client=restarted_signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(dedupe_path),
+                clock_ms=lambda: 1714521700100,
+            )
+            retry = await restarted_router.handle_notification(
+                "backup-report",
+                payload,
+                idempotency_key="backup-1714521600",
+            )
+
+            self.assertEqual(retry.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(restarted_signal.sends, [("group", "reply")])
+
     async def test_group_notification_sends_validated_attachment_with_reply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = Route(
