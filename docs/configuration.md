@@ -44,7 +44,10 @@ from the router's perspective and is not created or chmodded by the router.
 - `router.state_db` (default `./private/state/router.db`) - sqlite database
   used by the dedupe layer (`signal_hermes_router.dedupe`) to record
   route-scoped event claims. The file itself is `0600`; its parent directory
-  is created `0700`.
+  is created `0700`. This must be a filesystem path: `:memory:` is not
+  supported for a running router, because dedupe would not survive restarts
+  and the store's exclusive-ownership lock cannot span processes (in-memory
+  stores exist only as injected test doubles).
 - `router.media_root` (default `./private/media`) - root for attachments and
   their sidecar manifests written by `signal_hermes_router.media`. See
   [media handling](media.md) for the on-disk layout.

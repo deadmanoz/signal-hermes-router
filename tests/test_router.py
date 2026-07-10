@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import re
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -735,6 +736,76 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(retry.status, TurnOutcomeStatus.DELIVERED)
             self.assertEqual(restarted_signal.sends, [("group", "reply")])
+
+    async def test_close_waits_for_in_flight_turn_before_releasing_state_db(self) -> None:
+        started = asyncio.Event()
+        gate = asyncio.Event()
+
+        class GatedProfile(FakeProfile):
+            async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
+                started.set()
+                await gate.wait()
+                return await super().prompt(session_id, blocks)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                route_context={"purpose": "synthetic", "route_alias": "agenda-route"},
+            )
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="backup-report",
+                        route_name="agenda-route",
+                        prompt="Summarize the notification payload.",
+                    ),
+                ),
+            )
+            payload = canonicalize_notification_payload({"status": "ok"}, max_bytes=1024)
+            dedupe_path = Path(tmp) / "dedupe.db"
+            router = SignalHermesRouter(
+                app,
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(GatedProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(dedupe_path),
+                clock_ms=lambda: 1714521600100,
+            )
+            turn = asyncio.create_task(
+                router.handle_notification(
+                    "backup-report",
+                    payload,
+                    idempotency_key="backup-1714521600",
+                )
+            )
+            await started.wait()
+
+            close_task = asyncio.create_task(router.close())
+            for _ in range(10):
+                await asyncio.sleep(0)
+            self.assertFalse(close_task.done())
+
+            gate.set()
+            outcome = await turn
+            await close_task
+            self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+
+            inspect = sqlite3.connect(dedupe_path)
+            try:
+                rows = dict(
+                    inspect.execute(
+                        "SELECT status, COUNT(*) FROM dedupe_events GROUP BY status"
+                    ).fetchall()
+                )
+            finally:
+                inspect.close()
+            self.assertEqual(rows, {"handled": 1})
 
     async def test_group_notification_sends_validated_attachment_with_reply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

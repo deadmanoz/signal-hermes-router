@@ -188,6 +188,14 @@ class SignalHermesRouter:
         await self._close_control_server()
         await self.signal.close()
         await self.supervisor.close()
+        # Every turn holds its route lock through dedupe finalization, so
+        # acquiring each known lock waits out in-flight turns before close()
+        # releases the store's exclusive state-DB lock. A replacement router
+        # starting on this DB therefore cannot reclaim a claim this process
+        # is still working.
+        for lock in list(self._route_locks.values()):
+            async with lock:
+                pass
         self.dedupe.close()
 
     async def handle_raw_event(self, raw: dict) -> TurnResult | None:
