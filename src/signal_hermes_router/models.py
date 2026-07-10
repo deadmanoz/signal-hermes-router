@@ -153,11 +153,20 @@ class TurnOutcome:
     synthetic_id: str | None = None
     synthetic_kind: SyntheticTurnKind | None = None
     reply_sent: bool | None = None
+    route_ref: str | None = None
+    profile: str | None = None
+    last_failure_at_ms: int | None = None
 
     def to_control_response(self) -> dict[str, Any]:
         response: dict[str, Any] = {"status": self.status.value}
         if self.route_state is not None:
             response["route_state"] = self.route_state.value
+        if self.route_ref is not None:
+            response["route_ref"] = self.route_ref
+        if self.profile is not None:
+            response["profile"] = self.profile
+        if self.last_failure_at_ms is not None:
+            response["last_failure_at_ms"] = self.last_failure_at_ms
         if self.synthetic_id is not None:
             if self.synthetic_kind == SyntheticTurnKind.SCHEDULED_JOB:
                 response["job_id"] = self.synthetic_id

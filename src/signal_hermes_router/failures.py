@@ -81,6 +81,16 @@ _STRUCTURED_CODE_MAP: dict[str, FailureCode] = {
     "unknown": FailureCode.UNKNOWN,
 }
 
+_MODEL_PROVIDER_FAILURE_CODES = frozenset(
+    {
+        FailureCode.MODEL_AUTH_FAILED,
+        FailureCode.MODEL_RATE_LIMITED,
+        FailureCode.MODEL_UNAVAILABLE,
+        FailureCode.MODEL_TIMEOUT,
+        FailureCode.ENDPOINT_UNREACHABLE,
+    }
+)
+
 _URL_RE = re.compile(r"\bhttps?://[^\s<>)\"']+", re.IGNORECASE)
 # These intentionally over-redact dotted tokens and IP-shaped values. Losing
 # some diagnostic precision is preferable to surfacing hostnames or local
@@ -170,6 +180,7 @@ def classify_exception(
     *,
     redactor: Callable[[str], str] | None = None,
     context: FailureCode | None = None,
+    prefer_structured_provider_failure: bool = False,
 ) -> FailureInfo:
     from .acp import JsonRpcError, JsonRpcPeerExited
 
@@ -180,6 +191,14 @@ def classify_exception(
         if isinstance(exc, JsonRpcError):
             error = exc.error if isinstance(getattr(exc, "error", None), dict) else {}
             data = error.get("data")
+            code = _structured_failure_code(data)
+            if prefer_structured_provider_failure and is_model_provider_failure_code(code):
+                return failure_info(
+                    code,
+                    provider_class=_structured_provider_class(data),
+                    provider_detail=_structured_provider_detail(error, data),
+                    redactor=redactor,
+                )
             return failure_info(
                 context,
                 provider_class=_structured_provider_class(data),
@@ -204,6 +223,14 @@ def classify_exception(
     if isinstance(exc, OSError):
         return _detail(FailureCode.ENDPOINT_UNREACHABLE)
     return _classify_text_fallback(_exception_detail(exc), redactor=redactor)
+
+
+def is_model_provider_failure_code(code: FailureCode | None) -> bool:
+    return code in _MODEL_PROVIDER_FAILURE_CODES
+
+
+def is_model_provider_failure(failure: FailureInfo) -> bool:
+    return is_model_provider_failure_code(failure.code)
 
 
 def preflight_failure_from_report(

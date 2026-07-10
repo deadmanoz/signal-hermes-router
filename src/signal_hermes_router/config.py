@@ -54,6 +54,10 @@ class RouterConfig:
     work_root: Path = Path("./private/work")
     maintenance_reply: str = "This route is temporarily under maintenance."
     failure_reply: str = "I hit an internal router error handling that message."
+    model_failure_reply: str = (
+        "The model service is temporarily unavailable, so I could not finish that request. "
+        "Please try again later."
+    )
     busy_notice_after_seconds: float = 120.0
     busy_notice: str = "Still working on this."
     acp_prompt_timeout_seconds: float = 300.0
@@ -313,6 +317,7 @@ def parse_router_config(raw: dict[str, Any]) -> RouterConfig:
         work_root=work_root,
         maintenance_reply=str(raw.get("maintenance_reply", defaults.maintenance_reply)),
         failure_reply=str(raw.get("failure_reply", defaults.failure_reply)),
+        model_failure_reply=str(raw.get("model_failure_reply", defaults.model_failure_reply)),
         busy_notice_after_seconds=float(
             raw.get("busy_notice_after_seconds", defaults.busy_notice_after_seconds)
         ),

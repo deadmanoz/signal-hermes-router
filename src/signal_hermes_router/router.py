@@ -26,6 +26,7 @@ from .failures import (
     FailureInfo,
     classify_exception,
     failure_info,
+    is_model_provider_failure,
     preflight_failure_from_report,
 )
 from .media import write_attachment
@@ -423,14 +424,15 @@ class SignalHermesRouter:
                     route, route.maintenance_reply or self.config.router.maintenance_reply
                 )
                 if not sent:
-                    failure = self._signal_send_failure(route)
+                    failure, last_failure_at_ms = self._signal_send_failure(route)
                     handled = turn.synthetic is None
                     return TurnOutcome(
                         TurnOutcomeStatus.ERROR,
                         route_state=state,
                         error=failure.code.value,
                         failure=failure,
-                        **self._synthetic_outcome_fields(turn),
+                        reply_sent=False,
+                        **self._synthetic_failure_fields(turn, route, last_failure_at_ms),
                     )
                 handled = turn.synthetic is None
                 return TurnOutcome(
@@ -495,6 +497,7 @@ class SignalHermesRouter:
                         exc,
                         redactor=self.redactor.redact,
                         context=FailureCode.ACP_SESSION_FAILED,
+                        prefer_structured_provider_failure=True,
                     )
                     outcome = await self._handle_hermes_failure(
                         turn,
@@ -525,7 +528,7 @@ class SignalHermesRouter:
                         reply_text,
                         attachments=frozen_attachments,
                     ):
-                        failure = self._signal_send_failure(route)
+                        failure, last_failure_at_ms = self._signal_send_failure(route)
                         handled = True
                         return TurnOutcome(
                             TurnOutcomeStatus.ERROR,
@@ -534,7 +537,7 @@ class SignalHermesRouter:
                             error=failure.code.value,
                             failure=failure,
                             reply_sent=False,
-                            **self._synthetic_outcome_fields(turn),
+                            **self._synthetic_failure_fields(turn, route, last_failure_at_ms),
                         )
                     reply_sent = bool(reply_text)
                     self.circuit.record_success(route.key)
@@ -844,6 +847,26 @@ class SignalHermesRouter:
             return {}
         return {"synthetic_id": turn.synthetic.id, "synthetic_kind": turn.synthetic.kind}
 
+    def _synthetic_failure_fields(
+        self,
+        turn: RoutedTurnInput,
+        route: Route,
+        last_failure_at_ms: int,
+    ) -> dict[str, Any]:
+        if turn.synthetic is None:
+            return {}
+        fields = self._synthetic_outcome_fields(turn)
+        fields["route_ref"] = self._route_ref_for_route(route)
+        fields["profile"] = route.profile
+        fields["last_failure_at_ms"] = last_failure_at_ms
+        return fields
+
+    def _route_ref_for_route(self, route: Route) -> str:
+        for index, candidate in enumerate(self.config.routes):
+            if candidate is route or candidate.key == route.key:
+                return _route_ref(index, candidate)
+        return "route:unknown"
+
     def _route_lock(self, route: Route) -> asyncio.Lock:
         return self._route_locks[route.key]
 
@@ -864,7 +887,7 @@ class SignalHermesRouter:
         # subprocess recovery. If restart or replace_after_restart fails (binary
         # missing, profile broken, cooldown), the user still gets a reply and the
         # breaker still moves; recovery is best-effort for the next event.
-        self._record_route_failure(route, failure)
+        last_failure_at_ms = self._record_route_failure(route, failure)
         trip = self.circuit.record_failure(route.key)
         if trip:
             self.route_state_overrides[route.key] = RouteState.MAINTENANCE
@@ -877,7 +900,7 @@ class SignalHermesRouter:
             )
             reply_text = route.maintenance_reply or self.config.router.maintenance_reply
         else:
-            reply_text = route.failure_reply or self.config.router.failure_reply
+            reply_text = self._failure_reply_for(route, failure)
         reply_sent = False
         if reply_text:
             reply_sent = await self._send_once(route, reply_text)
@@ -916,10 +939,17 @@ class SignalHermesRouter:
             error=failure.code.value,
             failure=failure,
             reply_sent=reply_sent,
-            **self._synthetic_outcome_fields(turn),
+            **self._synthetic_failure_fields(turn, route, last_failure_at_ms),
         )
 
-    def _signal_send_failure(self, route: Route) -> FailureInfo:
+    def _failure_reply_for(self, route: Route, failure: FailureInfo) -> str:
+        if route.failure_reply is not None:
+            return route.failure_reply
+        if is_model_provider_failure(failure) and self.config.router.model_failure_reply:
+            return self.config.router.model_failure_reply
+        return self.config.router.failure_reply
+
+    def _signal_send_failure(self, route: Route) -> tuple[FailureInfo, int]:
         failure = failure_info(
             FailureCode.SIGNAL_SEND_FAILED,
             detail="Signal reply send failed",
@@ -928,14 +958,16 @@ class SignalHermesRouter:
         # Signal transport-out failures are surfaced in route health, but they
         # do not feed the Hermes circuit breaker: maintenance replies would use
         # the same broken Signal send path and would not protect the profile.
-        self._record_route_failure(route, failure)
-        return failure
+        last_failure_at_ms = self._record_route_failure(route, failure)
+        return failure, last_failure_at_ms
 
     def _record_route_success(self, route: Route) -> None:
         self._last_success_ms[route.key] = self._clock_ms()
 
-    def _record_route_failure(self, route: Route, failure: FailureInfo) -> None:
-        self._last_failures[route.key] = (self._clock_ms(), failure)
+    def _record_route_failure(self, route: Route, failure: FailureInfo) -> int:
+        last_failure_at_ms = self._clock_ms()
+        self._last_failures[route.key] = (last_failure_at_ms, failure)
+        return last_failure_at_ms
 
     def _route_status_response(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:

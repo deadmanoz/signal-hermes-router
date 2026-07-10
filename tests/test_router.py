@@ -10,8 +10,10 @@ import time
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
+from signal_hermes_router.acp import JsonRpcError
 from signal_hermes_router.config import (
     AppConfig,
     CircuitBreakerConfig,
@@ -22,6 +24,7 @@ from signal_hermes_router.config import (
     SyntheticRouteJob,
 )
 from signal_hermes_router.dedupe import DedupeStore
+from signal_hermes_router.failures import FailureCode
 from signal_hermes_router.models import (
     ChatType,
     NormalizedEvent,
@@ -600,6 +603,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(outcome.route_state, RouteState.ACTIVE)
             self.assertEqual(signal.sends, [("group", "reply")])
             self.assertEqual(signal.typing, [("group", True), ("group", False)])
+            self.assertNotIn("last_failure_at_ms", outcome.to_control_response())
             self.assertTrue(profile.prompts[0][0]["text"].startswith("[route_context:"))
             self.assertTrue(profile.prompts[0][1]["text"].startswith("[scheduled_event:"))
             self.assertIn('"id":"daily-agenda"', profile.prompts[0][1]["text"])
@@ -655,6 +659,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
             self.assertEqual(duplicate.status, TurnOutcomeStatus.DEDUPED)
+            self.assertNotIn("last_failure_at_ms", outcome.to_control_response())
+            self.assertNotIn("last_failure_at_ms", duplicate.to_control_response())
             self.assertEqual(signal.sends, [("group", "reply")])
             self.assertTrue(profile.prompts[0][1]["text"].startswith("[scheduled_event:"))
             self.assertIn('"kind":"notification"', profile.prompts[0][1]["text"])
@@ -1764,6 +1770,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 outcome = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
 
                 self.assertEqual(profile.prompts, [])
+                self.assertNotIn("last_failure_at_ms", outcome.to_control_response())
                 if state == RouteState.MAINTENANCE:
                     self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
                     self.assertEqual(
@@ -1773,6 +1780,42 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     self.assertEqual(outcome.status, TurnOutcomeStatus.SKIPPED)
                     self.assertEqual(signal.sends, [])
+
+    async def test_synthetic_maintenance_send_failure_reports_metadata(self) -> None:
+        class FlakySignal(FakeSignal):
+            async def send_group(self, group_id: str, message: str) -> dict[str, int]:
+                raise RuntimeError("send failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.MAINTENANCE,
+            )
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=FlakySignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: 1714521600456,
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                outcome = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            response = outcome.to_control_response()
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["route_state"], "maintenance")
+            self.assertEqual(response["failure"]["code"], "signal_send_failed")
+            self.assertFalse(response["reply_sent"])
+            self.assertEqual(response["route_ref"], "route:agenda-route")
+            self.assertEqual(response["profile"], "profile")
+            self.assertEqual(response["last_failure_at_ms"], 1714521600456)
+            self.assertEqual(profile.prompts, [])
 
     async def test_synthetic_unknown_job_and_missing_route_return_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2057,6 +2100,293 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 ["I hit an internal router error handling that message.", "reply"],
             )
 
+    async def test_synthetic_session_model_failure_uses_model_reply_and_metadata(self) -> None:
+        class SessionFailProfile(FakeProfile):
+            async def new_session(self, cwd: Path) -> str:
+                raise JsonRpcError(
+                    {
+                        "code": -32000,
+                        "message": "session failed",
+                        "data": {
+                            "code": "quota_exceeded",
+                            "provider_class": "cloud_api",
+                            "provider_detail": "429 usage_limit_reached",
+                        },
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    model_failure_reply="The model is unavailable right now.",
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(SessionFailProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: 1714521600123,
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            response = failed.to_control_response()
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["error"], "model_rate_limited")
+            self.assertEqual(response["failure"]["code"], "model_rate_limited")
+            self.assertEqual(response["failure"]["provider_class"], "cloud_api")
+            self.assertEqual(response["route_ref"], "route:agenda-route")
+            self.assertEqual(response["profile"], "profile")
+            self.assertEqual(response["last_failure_at_ms"], 1714521600123)
+            self.assertTrue(response["reply_sent"])
+            self.assertEqual(signal.sends, [("group", "The model is unavailable right now.")])
+
+    async def test_synthetic_session_text_only_quota_failure_uses_generic_reply(self) -> None:
+        class SessionFailProfile(FakeProfile):
+            async def new_session(self, cwd: Path) -> str:
+                raise JsonRpcError(
+                    {
+                        "code": -32000,
+                        "message": "OpenAI Codex HTTP 429 usage_limit_reached",
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    failure_reply="Generic router fallback.",
+                    model_failure_reply="Model fallback should not be sent.",
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(SessionFailProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            response = failed.to_control_response()
+            self.assertEqual(response["error"], "acp_session_failed")
+            self.assertEqual(response["failure"]["code"], "acp_session_failed")
+            self.assertTrue(response["reply_sent"])
+            self.assertEqual(signal.sends, [("group", "Generic router fallback.")])
+
+    async def test_empty_model_failure_reply_falls_back_to_generic_failure_reply(self) -> None:
+        class ModelFailProfile(FakeProfile):
+            async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
+                self.prompt_session_ids.append(session_id)
+                self.prompts.append(blocks)
+                raise JsonRpcError(
+                    {
+                        "code": -32000,
+                        "message": "auth failed",
+                        "data": {
+                            "code": "model_auth_failed",
+                            "provider_class": "cloud_api",
+                        },
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    failure_reply="Generic router fallback.",
+                    model_failure_reply="",
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(ModelFailProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            self.assertEqual(failed.to_control_response()["failure"]["code"], "model_auth_failed")
+            self.assertTrue(failed.to_control_response()["reply_sent"])
+            self.assertEqual(signal.sends, [("group", "Generic router fallback.")])
+
+    async def test_route_failure_reply_overrides_model_failure_reply(self) -> None:
+        class ModelFailProfile(FakeProfile):
+            async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
+                self.prompt_session_ids.append(session_id)
+                self.prompts.append(blocks)
+                raise JsonRpcError(
+                    {
+                        "code": -32000,
+                        "message": "quota exceeded",
+                        "data": {
+                            "code": "model_rate_limited",
+                            "provider_class": "cloud_api",
+                        },
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                failure_reply="Route-specific failure.",
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.fail = True
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    failure_reply="Generic router fallback.",
+                    model_failure_reply="Model fallback should not be sent.",
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(ModelFailProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            self.assertEqual(
+                failed.to_control_response()["failure"]["code"],
+                "model_rate_limited",
+            )
+            self.assertTrue(failed.to_control_response()["reply_sent"])
+            self.assertEqual(signal.sends, [("group", "Route-specific failure.")])
+
+    async def test_signal_model_failure_uses_model_reply(self) -> None:
+        class ModelFailProfile(FakeProfile):
+            async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
+                self.prompt_session_ids.append(session_id)
+                self.prompts.append(blocks)
+                raise JsonRpcError(
+                    {
+                        "code": -32000,
+                        "message": "quota exceeded",
+                        "data": {
+                            "code": "model_rate_limited",
+                            "provider_class": "cloud_api",
+                        },
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            router = SignalHermesRouter(
+                make_app(
+                    tmp,
+                    RouteState.ACTIVE,
+                    failure_reply="Generic router fallback.",
+                    model_failure_reply="Model fallback.",
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(ModelFailProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                result = await router.handle_event(make_event())
+
+            self.assertIsNone(result)
+            self.assertEqual(signal.sends, [("group", "Model fallback.")])
+
+    async def test_model_provider_failure_codes_use_model_reply(self) -> None:
+        class ModelFailProfile(FakeProfile):
+            def __init__(self, structured_code: str) -> None:
+                super().__init__()
+                self.structured_code = structured_code
+
+            async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
+                self.prompt_session_ids.append(session_id)
+                self.prompts.append(blocks)
+                raise JsonRpcError(
+                    {
+                        "code": -32000,
+                        "message": "provider failure",
+                        "data": {
+                            "code": self.structured_code,
+                            "provider_class": "cloud_api",
+                        },
+                    }
+                )
+
+        cases = {
+            "model_auth_failed": FailureCode.MODEL_AUTH_FAILED,
+            "model_rate_limited": FailureCode.MODEL_RATE_LIMITED,
+            "model_unavailable": FailureCode.MODEL_UNAVAILABLE,
+            "model_timeout": FailureCode.MODEL_TIMEOUT,
+            "endpoint_unreachable": FailureCode.ENDPOINT_UNREACHABLE,
+        }
+        for structured_code, expected_code in cases.items():
+            with self.subTest(structured_code=structured_code):
+                with tempfile.TemporaryDirectory() as tmp:
+                    route = Route(
+                        platform="signal",
+                        name="agenda-route",
+                        group_id="group",
+                        profile="profile",
+                        session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                        state=RouteState.ACTIVE,
+                    )
+                    signal = FakeSignal()
+                    router = SignalHermesRouter(
+                        make_synthetic_app(
+                            tmp,
+                            route,
+                            failure_reply="Generic router fallback.",
+                            model_failure_reply="Model fallback.",
+                        ),
+                        signal_client=signal,  # type: ignore[arg-type]
+                        supervisor=FakeSupervisor(ModelFailProfile(structured_code)),  # type: ignore[arg-type]
+                        dedupe=DedupeStore(),
+                    )
+
+                    with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                        failed = await router.handle_synthetic_job(
+                            "daily-agenda", scheduled_at=1000
+                        )
+
+                    self.assertEqual(
+                        failed.to_control_response()["failure"]["code"],
+                        expected_code.value,
+                    )
+                    self.assertTrue(failed.to_control_response()["reply_sent"])
+                    self.assertEqual(signal.sends, [("group", "Model fallback.")])
+
     async def test_synthetic_maintenance_retry_does_not_mark_dedupe_handled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = Route(
@@ -2157,8 +2487,12 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(failed.status, TurnOutcomeStatus.ERROR)
             self.assertEqual(failed.error, "signal_send_failed")
-            self.assertEqual(failed.to_control_response()["failure"]["code"], "signal_send_failed")
-            self.assertFalse(failed.to_control_response()["reply_sent"])
+            response = failed.to_control_response()
+            self.assertEqual(response["failure"]["code"], "signal_send_failed")
+            self.assertFalse(response["reply_sent"])
+            self.assertEqual(response["route_ref"], "route:agenda-route")
+            self.assertEqual(response["profile"], "profile")
+            self.assertIsInstance(response["last_failure_at_ms"], int)
             self.assertEqual(retry.status, TurnOutcomeStatus.DEDUPED)
             self.assertEqual(len(profile.prompts), 1)
             self.assertEqual(signal.sends, [])
@@ -2193,12 +2527,65 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response["status"], "error")
             self.assertFalse(response["reply_sent"])
             self.assertEqual(response["failure"]["code"], "unknown")
+            self.assertEqual(response["route_ref"], "route:agenda-route")
+            self.assertEqual(response["profile"], "profile")
+            self.assertIsInstance(response["last_failure_at_ms"], int)
             self.assertEqual(
                 router._route_status_response({})["routes"][0]["last_failure"]["code"],
                 "unknown",
             )
 
-    async def test_synthetic_failure_with_empty_failure_reply_does_not_send(self) -> None:
+    async def test_synthetic_model_failure_with_empty_route_failure_reply_suppresses(self) -> None:
+        class ModelFailProfile(FakeProfile):
+            async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
+                self.prompt_session_ids.append(session_id)
+                self.prompts.append(blocks)
+                raise JsonRpcError(
+                    {
+                        "code": -32000,
+                        "message": "quota exceeded",
+                        "data": {
+                            "code": "model_rate_limited",
+                            "provider_class": "cloud_api",
+                        },
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                failure_reply="",
+            )
+            signal = FakeSignal()
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    failure_reply="Router fallback should not be sent.",
+                    model_failure_reply="Model fallback should not be sent.",
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(ModelFailProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            self.assertEqual(failed.status, TurnOutcomeStatus.ERROR)
+            self.assertEqual(
+                failed.to_control_response()["failure"]["code"],
+                "model_rate_limited",
+            )
+            self.assertFalse(failed.to_control_response()["reply_sent"])
+            self.assertEqual(signal.sends, [])
+
+    async def test_empty_router_failure_reply_suppresses_non_model_failure_send(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = Route(
                 platform="signal",
@@ -2213,7 +2600,12 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             profile = FakeProfile()
             profile.fail = True
             router = SignalHermesRouter(
-                make_synthetic_app(tmp, route, failure_reply=""),
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    failure_reply="",
+                    model_failure_reply="Model fallback should not be sent.",
+                ),
                 signal_client=signal,  # type: ignore[arg-type]
                 supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
                 dedupe=DedupeStore(),
@@ -2223,8 +2615,116 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
 
             self.assertEqual(failed.status, TurnOutcomeStatus.ERROR)
+            self.assertEqual(failed.to_control_response()["failure"]["code"], "unknown")
             self.assertFalse(failed.to_control_response()["reply_sent"])
             self.assertEqual(signal.sends, [])
+
+    async def test_empty_router_replies_suppress_model_failure_send(self) -> None:
+        class ModelFailProfile(FakeProfile):
+            async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
+                self.prompt_session_ids.append(session_id)
+                self.prompts.append(blocks)
+                raise JsonRpcError(
+                    {
+                        "code": -32000,
+                        "message": "quota exceeded",
+                        "data": {
+                            "code": "model_rate_limited",
+                            "provider_class": "cloud_api",
+                        },
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                failure_reply="",
+            )
+            signal = FakeSignal()
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    failure_reply="",
+                    model_failure_reply="",
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(ModelFailProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            self.assertEqual(failed.status, TurnOutcomeStatus.ERROR)
+            self.assertEqual(
+                failed.to_control_response()["failure"]["code"],
+                "model_rate_limited",
+            )
+            self.assertFalse(failed.to_control_response()["reply_sent"])
+            self.assertEqual(signal.sends, [])
+
+    async def test_synthetic_model_failure_trip_uses_maintenance_reply_and_metadata(
+        self,
+    ) -> None:
+        class ModelFailProfile(FakeProfile):
+            async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
+                self.prompt_session_ids.append(session_id)
+                self.prompts.append(blocks)
+                raise JsonRpcError(
+                    {
+                        "code": -32000,
+                        "message": "quota exceeded",
+                        "data": {
+                            "code": "model_rate_limited",
+                            "provider_class": "cloud_api",
+                        },
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    circuit_breaker=CircuitBreakerConfig(failures=1, window_seconds=60),
+                    maintenance_reply="Maintenance reply.",
+                    failure_reply="Generic router fallback.",
+                    model_failure_reply="Model fallback should not be sent.",
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(ModelFailProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: 1714521600123,
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            response = failed.to_control_response()
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["route_state"], "active")
+            self.assertEqual(response["failure"]["code"], "model_rate_limited")
+            self.assertEqual(response["route_ref"], "route:agenda-route")
+            self.assertEqual(response["profile"], "profile")
+            self.assertEqual(response["last_failure_at_ms"], 1714521600123)
+            self.assertTrue(response["reply_sent"])
+            self.assertEqual(signal.sends, [("group", "Maintenance reply.")])
+            self.assertEqual(router.route_state_overrides["signal:group"], RouteState.MAINTENANCE)
 
     async def test_synthetic_bare_manual_triggers_are_fresh_with_same_clock(self) -> None:
         nonces = iter(("nonce-one", "nonce-two"))

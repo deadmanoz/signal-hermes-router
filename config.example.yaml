@@ -12,6 +12,7 @@ router:
   work_root: "./private/work"
   maintenance_reply: "This route is temporarily under maintenance."
   failure_reply: "I hit an internal router error handling that message."
+  model_failure_reply: "The model service is temporarily unavailable, so I could not finish that request. Please try again later."
   busy_notice_after_seconds: 120
   busy_notice: "Still working on this."
   acp_prompt_timeout_seconds: 300

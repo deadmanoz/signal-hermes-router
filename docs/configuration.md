@@ -344,9 +344,12 @@ JSON. Last failures use stable provider-neutral codes such as
 are kept only as bounded sanitized `detail` / `provider_detail` fields. Model
 and endpoint classifications are most reliable when Hermes supplies structured
 JSON-RPC `error.data.code`; otherwise the router applies only conservative
-generic text fallbacks and may report `unknown`. `provider_class` is populated
-only from structured `error.data.provider_class` values of `cloud_api`,
-`local_endpoint`, or `unknown`.
+generic text fallbacks and may report `unknown`. ACP session acquisition is
+stricter: model/provider session failures are reclassified only from structured
+`error.data.code`, so text-only `429` or quota wording remains
+`acp_session_failed`. `provider_class` is populated only from structured
+`error.data.provider_class` values of `cloud_api`, `local_endpoint`, or
+`unknown`.
 
 CLI exit status is zero for `delivered`, `deduped`, `busy`, and expected
 `skipped` outcomes such as shadow or disabled routes. It is non-zero for an
@@ -453,9 +456,21 @@ and `failure_reply` only); otherwise the router-level default applies.
   breaker.
 - `router.failure_reply` (default `"I hit an internal router error handling
   that message."`) - sent when a Hermes turn fails but the failure did not
-  trip the circuit breaker.
+  trip the circuit breaker and was not classified as a structured
+  model/provider failure.
+- `router.model_failure_reply` (default `"The model service is temporarily
+  unavailable, so I could not finish that request. Please try again later."`)
+  - sent for non-trip model/provider failures such as model auth, quota,
+  rate-limit, unavailable, timeout, or endpoint failures when the route has no
+  `failure_reply` override. If this is configured as an empty string, the
+  router falls back to `router.failure_reply` instead of suppressing the reply.
 - `router.busy_notice` (default `"Still working on this."`) - the one-shot
   notice fired at `busy_notice_after_seconds` if the turn has not completed.
+
+Route `failure_reply` values are explicit overrides when the key is present,
+including an empty string. A route configured with `failure_reply: ""`
+intentionally suppresses non-trip failure replies for that route, even when
+`router.failure_reply` or `router.model_failure_reply` is non-empty.
 
 Per-route overrides in `routes.yaml`:
 
@@ -469,10 +484,10 @@ routes:
     failure_reply: "Custom failure text for this route."
 ```
 
-All four operational replies (`maintenance_reply`, `failure_reply`,
-`busy_notice`, and assistant replies from Hermes) flow through the same
-canary prefix and chunking pipeline as ordinary assistant text - see
-[Runtime size limits](#runtime-size-limits) above.
+Operational replies (`maintenance_reply`, `failure_reply`,
+`model_failure_reply`, `busy_notice`, and assistant replies from Hermes) flow
+through the same canary prefix and chunking pipeline as ordinary assistant
+text. See [Runtime size limits](#runtime-size-limits) above.
 
 Notification image attachments are attached only to the first Signal reply
 chunk. If Hermes returns empty text for an attachment-bearing notification, the
