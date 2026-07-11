@@ -1584,6 +1584,41 @@ class ProfileExitWatcherSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 replacement = await supervisor.get_profile(route)
             self.assertTrue(replacement.started)
 
+    async def test_supervisor_detects_real_child_death_right_after_initialize(self) -> None:
+        # End-to-end variant of the startup race: the child answers
+        # initialize, closes its stdout, and dies. get_profile() must observe
+        # the exit evidence during its post-start settle and refuse the dead
+        # profile instead of returning it for a doomed first turn.
+        agent_code = (
+            "import json, os, sys\n"
+            "message = json.loads(sys.stdin.readline())\n"
+            "sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': message['id'],"
+            " 'result': {'agentCapabilities': {}}}) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "os.close(1)\n"
+            "os._exit(9)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            agent_script = Path(tmp) / "startup_crash_agent.py"
+            agent_script.write_text(agent_code, encoding="utf-8")
+            route = make_route(profile="profile-a")
+            supervisor = ProfileSupervisor(
+                Path(tmp) / "work",
+                command_template=[sys.executable, str(agent_script)],
+            )
+            try:
+                with self.assertLogs("signal_hermes_router.sessions", level="ERROR"):
+                    with self.assertRaisesRegex(RuntimeError, "exited during startup"):
+                        await supervisor.get_profile(route)
+                    # Let the watcher's exit report land inside assertLogs.
+                    for _ in range(100):
+                        await asyncio.sleep(0.01)
+                        if "profile-a" not in supervisor._profiles:
+                            break
+                self.assertNotIn("profile-a", supervisor._profiles)
+            finally:
+                await supervisor.close()
+
     async def test_supervisor_eviction_survives_failing_close(self) -> None:
         # A failing close on the evicted dead profile is contained: the
         # acquisition still spawns the replacement.

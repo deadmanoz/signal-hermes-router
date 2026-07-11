@@ -120,6 +120,17 @@ class ProfileSupervisor:
                 # Cancellation is not a failed start and stamps no cooldown.
                 self._last_restart[route.profile] = time.monotonic()
             raise
+        # Let a post-initialize death that has already been signalled surface
+        # before the final evidence check: each yield gives the event loop a
+        # poll cycle, so a stdout EOF that raced start()'s return is processed
+        # by the reader task and becomes visible to exit_suspected(). Bounded
+        # and latency-free (sleep(0) yields, no real waiting); a child that
+        # dies after this window is caught by the exit watcher or the lazy
+        # write-failure path instead.
+        for _ in range(3):
+            if profile.exit_suspected():
+                break
+            await asyncio.sleep(0)
         if self._profiles.get(route.profile) is not profile or profile.exit_suspected():
             # Either the exit watcher evicted this instance while start() was
             # in flight, or the child is already demonstrably dead (a child
