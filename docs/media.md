@@ -98,6 +98,9 @@ attachments by age and/or total size. Its media-side guarantees:
 - Files referenced by an in-flight turn - stored inbound attachments and
   frozen `.outbound` images - are tracked as live and are never deleted
   mid-turn, regardless of how long the turn waits on locks or the prompt.
+  Sweep deletions are additionally deferred to the next interval while any
+  media write or copy is in flight, so a deletion pass can never interleave
+  with an in-progress store.
   Stale `.outbound` artifacts from a crashed process are removed once they
   are older than one day (a code constant), and no pass ever deletes a file
   younger than one hour.

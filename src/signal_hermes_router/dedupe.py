@@ -18,6 +18,11 @@ LOGGER = logging.getLogger(__name__)
 PRUNE_CHUNK_ROWS = 1000
 VACUUM_CHUNK_PAGES = 200
 MIGRATION_BACKUP_SUFFIX = ".migration-backup"
+# Explicit busy-timeout contract (sqlite3.connect's default timeout already
+# implies 5s; the pragma pins it deliberately). It rides out a predecessor
+# process releasing the file during a restart handoff, and it delays - but
+# never suppresses - the loud overlapping-owner startup failure below.
+BUSY_TIMEOUT_MS = 5000
 
 _AUTO_VACUUM_INCREMENTAL = 2
 
@@ -45,12 +50,12 @@ class DedupeStore:
             # A non-regular existing path (for example a directory) is left
             # untouched; sqlite3.connect below fails loudly on it.
         self._lock = threading.Lock()
-        # _state_lock guards the close/sweep handoff flags below. It is held
-        # only for flag reads/writes and the connection close itself, never
-        # across a statement, so DedupeStore.close() stays non-blocking with
-        # respect to an in-flight retention chunk.
+        # _state_lock guards the close/operation handoff state below. It is
+        # held only for counter/flag reads/writes and the connection close
+        # itself, never across a statement, so DedupeStore.close() stays
+        # non-blocking with respect to any in-flight worker operation.
         self._state_lock = threading.Lock()
-        self._sweep_active = False
+        self._active_operations = 0
         self._close_requested = False
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._closed = False
@@ -61,11 +66,38 @@ class DedupeStore:
             # fail loudly at startup instead of erasing this process's
             # in-flight claims.
             self._db.execute("PRAGMA locking_mode=EXCLUSIVE")
+            self._enable_wal()
+            self._db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
             self._ensure_schema()
             self._reclaim_orphaned_claims()
         except BaseException:
             self.close()
             raise
+
+    def _enable_wal(self) -> None:
+        if self.path == ":memory:":
+            # In-memory stores (test doubles) cannot use WAL; they keep the
+            # sqlite "memory" journal mode.
+            return
+        # "WAL without shared memory": with locking_mode=EXCLUSIVE set before
+        # the first database access, WAL uses a heap wal-index (no -shm file)
+        # and the exclusive single-owner lock is preserved - a second
+        # connection or process still fails loudly with "database is locked".
+        # Commits append + fsync the WAL instead of the rollback-journal
+        # double-write; `synchronous` stays at its FULL default so crash
+        # durability is unchanged. The locking mode is never changed back to
+        # NORMAL, so the WAL/EXCLUSIVE transition restriction never applies.
+        journal_mode = str(self._db.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+        if journal_mode.lower() != "wal":
+            raise RuntimeError(f"dedupe state DB refused WAL journal mode (got {journal_mode!r})")
+        # Pre-create the -wal sidecar with the private mode before sqlite
+        # touches it. sqlite would inherit the 0600 mode of the DB file, but
+        # that is implementation behaviour, not a contract; private_fs
+        # discipline is explicit enforcement. sqlite takes its POSIX locks on
+        # the main DB file, not the -wal, so creating/chmodding it here can
+        # never drop this connection's locks. A crash-persisted -wal is
+        # reused as-is (O_CREAT without truncation) and recovered by sqlite.
+        ensure_private_file(Path(self.path + "-wal"))
 
     def _ensure_schema(self) -> None:
         columns = {
@@ -192,60 +224,82 @@ class DedupeStore:
         return cursor.fetchone() is not None
 
     def claim(self, route_key: str, source_uuid: str, timestamp: int) -> bool:
-        with self._lock:
-            try:
+        self._begin_turn_operation()
+        try:
+            with self._lock:
+                try:
+                    self._db.execute(
+                        "INSERT INTO dedupe_events "
+                        "(route_key, source_uuid, timestamp, status, updated_at_ms) "
+                        "VALUES (?, ?, ?, 'processing', ?)",
+                        (route_key, source_uuid, int(timestamp), self._clock_ms()),
+                    )
+                    self._db.commit()
+                    return True
+                except sqlite3.IntegrityError:
+                    return False
+        finally:
+            self._end_operation()
+
+    def is_handled(self, route_key: str, source_uuid: str, timestamp: int) -> bool:
+        self._begin_turn_operation()
+        try:
+            with self._lock:
+                cursor = self._db.execute(
+                    "SELECT 1 FROM dedupe_events "
+                    "WHERE route_key = ? AND source_uuid = ? AND timestamp = ? "
+                    "AND status = 'handled'",
+                    (route_key, source_uuid, int(timestamp)),
+                )
+                return cursor.fetchone() is not None
+        finally:
+            self._end_operation()
+
+    def status(self, route_key: str, source_uuid: str, timestamp: int) -> str | None:
+        self._begin_turn_operation()
+        try:
+            with self._lock:
+                cursor = self._db.execute(
+                    "SELECT status FROM dedupe_events "
+                    "WHERE route_key = ? AND source_uuid = ? AND timestamp = ?",
+                    (route_key, source_uuid, int(timestamp)),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                return str(row[0])
+        finally:
+            self._end_operation()
+
+    def mark_handled(self, route_key: str, source_uuid: str, timestamp: int) -> None:
+        self._begin_turn_operation()
+        try:
+            with self._lock:
                 self._db.execute(
                     "INSERT INTO dedupe_events "
                     "(route_key, source_uuid, timestamp, status, updated_at_ms) "
-                    "VALUES (?, ?, ?, 'processing', ?)",
+                    "VALUES (?, ?, ?, 'handled', ?) "
+                    "ON CONFLICT(route_key, source_uuid, timestamp) "
+                    "DO UPDATE SET status = 'handled', updated_at_ms = excluded.updated_at_ms",
                     (route_key, source_uuid, int(timestamp), self._clock_ms()),
                 )
                 self._db.commit()
-                return True
-            except sqlite3.IntegrityError:
-                return False
-
-    def is_handled(self, route_key: str, source_uuid: str, timestamp: int) -> bool:
-        with self._lock:
-            cursor = self._db.execute(
-                "SELECT 1 FROM dedupe_events "
-                "WHERE route_key = ? AND source_uuid = ? AND timestamp = ? AND status = 'handled'",
-                (route_key, source_uuid, int(timestamp)),
-            )
-            return cursor.fetchone() is not None
-
-    def status(self, route_key: str, source_uuid: str, timestamp: int) -> str | None:
-        with self._lock:
-            cursor = self._db.execute(
-                "SELECT status FROM dedupe_events "
-                "WHERE route_key = ? AND source_uuid = ? AND timestamp = ?",
-                (route_key, source_uuid, int(timestamp)),
-            )
-            row = cursor.fetchone()
-            if row is None:
-                return None
-            return str(row[0])
-
-    def mark_handled(self, route_key: str, source_uuid: str, timestamp: int) -> None:
-        with self._lock:
-            self._db.execute(
-                "INSERT INTO dedupe_events "
-                "(route_key, source_uuid, timestamp, status, updated_at_ms) "
-                "VALUES (?, ?, ?, 'handled', ?) "
-                "ON CONFLICT(route_key, source_uuid, timestamp) "
-                "DO UPDATE SET status = 'handled', updated_at_ms = excluded.updated_at_ms",
-                (route_key, source_uuid, int(timestamp), self._clock_ms()),
-            )
-            self._db.commit()
+        finally:
+            self._end_operation()
 
     def release(self, route_key: str, source_uuid: str, timestamp: int) -> None:
-        with self._lock:
-            self._db.execute(
-                "DELETE FROM dedupe_events "
-                "WHERE route_key = ? AND source_uuid = ? AND timestamp = ? AND status = 'processing'",
-                (route_key, source_uuid, int(timestamp)),
-            )
-            self._db.commit()
+        self._begin_turn_operation()
+        try:
+            with self._lock:
+                self._db.execute(
+                    "DELETE FROM dedupe_events "
+                    "WHERE route_key = ? AND source_uuid = ? AND timestamp = ? "
+                    "AND status = 'processing'",
+                    (route_key, source_uuid, int(timestamp)),
+                )
+                self._db.commit()
+        finally:
+            self._end_operation()
 
     def seen_or_record(self, source_uuid: str, timestamp: int, route_key: str = "") -> bool:
         if not self.claim(route_key, source_uuid, timestamp):
@@ -280,7 +334,7 @@ class DedupeStore:
                     return total
                 total += cursor.rowcount
         finally:
-            self._end_sweep_operation()
+            self._end_operation()
 
     def incremental_vacuum(self) -> None:
         """Drain the freelist in bounded chunks (requires INCREMENTAL mode)."""
@@ -304,42 +358,51 @@ class DedupeStore:
                     return
                 previous_freelist = freelist
         finally:
-            self._end_sweep_operation()
+            self._end_operation()
+
+    def _begin_turn_operation(self) -> None:
+        # Turn operations run in event-loop worker threads. Once a close was
+        # requested, new operations are refused instead of extending the
+        # deferred close indefinitely; the error matches sqlite's own
+        # closed-connection failure so straggler handling stays uniform.
+        with self._state_lock:
+            if self._closed or self._close_requested:
+                raise sqlite3.ProgrammingError("Cannot operate on a closing dedupe store.")
+            self._active_operations += 1
 
     def _begin_sweep_operation(self) -> bool:
         with self._state_lock:
             if self._closed or self._close_requested:
                 return False
-            self._sweep_active = True
+            self._active_operations += 1
             return True
 
-    def _end_sweep_operation(self) -> None:
+    def _end_operation(self) -> None:
         with self._state_lock:
-            self._sweep_active = False
-            if self._close_requested and not self._closed:
+            self._active_operations -= 1
+            if self._active_operations == 0 and self._close_requested and not self._closed:
                 # Deferred finalizer: close() handed the connection close to
-                # this sweep worker instead of blocking the event loop.
-                # Acquire the statement lock first so a straggler dedupe
-                # write abandoned past the shutdown drain deadline can never
-                # race the connection close; only this worker thread blocks.
-                # Lock order _state_lock -> _lock is safe: no path acquires
-                # _state_lock while holding _lock.
+                # the last in-flight worker instead of blocking the event
+                # loop. Acquire the statement lock first so a straggler
+                # statement can never race the connection close; only this
+                # worker thread blocks. Lock order _state_lock -> _lock is
+                # safe: no path acquires _state_lock while holding _lock.
                 with self._lock:
                     self._db.close()
                 self._closed = True
 
     def close(self) -> bool:
-        """Close the store without blocking on an in-flight sweep chunk.
+        """Close the store without blocking on an in-flight operation.
 
         Returns True when the connection is closed on return. Returns False
-        when a retention operation is mid-statement: the close is then
-        deferred to that worker's completion, and callers must treat the
-        cleanup as incomplete rather than finished.
+        when a turn or retention operation is mid-statement: the close is
+        then deferred to the last such worker's completion, and callers must
+        treat the cleanup as incomplete rather than finished.
         """
         with self._state_lock:
             if self._closed:
                 return True
-            if self._sweep_active:
+            if self._active_operations > 0:
                 self._close_requested = True
                 return False
             self._db.close()

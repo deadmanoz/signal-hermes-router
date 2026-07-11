@@ -10,6 +10,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from collections.abc import Sequence
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
+from signal_hermes_router import router as router_module
 from signal_hermes_router.acp import JsonRpcError
 from signal_hermes_router.config import (
     AppConfig,
@@ -166,6 +168,20 @@ def make_synthetic_app(
         ),
         notifications=notifications,
     )
+
+
+def record_dedupe_call_threads(store: DedupeStore) -> list[tuple[str, int]]:
+    """Wrap the store's statement methods with executing-thread recorders."""
+    calls: list[tuple[str, int]] = []
+    for name in ("claim", "status", "is_handled", "mark_handled", "release"):
+        original = getattr(store, name)
+
+        def recorder(*args: Any, _name: str = name, _original: Any = original) -> Any:
+            calls.append((_name, threading.get_ident()))
+            return _original(*args)
+
+        setattr(store, name, recorder)
+    return calls
 
 
 def write_png(path: Path, body: bytes = b"png") -> Path:
@@ -1353,7 +1369,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 dedupe=DedupeStore(),
             )
 
-            frozen = router._freeze_outbound_attachments((router_owned_attachment,))
+            frozen = await router._freeze_outbound_attachments((router_owned_attachment,))
             router._cleanup_owned_outbound_attachments((source_attachment,))
             source_still_exists = source.exists()
             router._cleanup_owned_outbound_attachments(frozen)
@@ -1413,7 +1429,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 self.assertRaises(OutboundAttachmentError) as raised,
             ):
-                router._freeze_outbound_attachments((first_attachment, second_attachment))
+                await router._freeze_outbound_attachments((first_attachment, second_attachment))
 
             self.assertEqual(raised.exception.error_code, "attachment_too_large")
             self.assertFalse((app.router.media_root / ".outbound").exists())
@@ -1445,7 +1461,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             )
 
             with self.assertRaises(OutboundAttachmentError) as raised:
-                router._freeze_outbound_attachments((attachment,))
+                await router._freeze_outbound_attachments((attachment,))
 
             self.assertEqual(raised.exception.error_code, "attachment_not_image")
             self.assertFalse((app.router.media_root / ".outbound").exists())
@@ -1499,7 +1515,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 self.assertRaises(OutboundAttachmentError) as raised,
             ):
-                router._freeze_outbound_attachments((attachment,))
+                await router._freeze_outbound_attachments((attachment,))
 
             self.assertEqual(raised.exception.error_code, "attachment_not_found")
             self.assertFalse((app.router.media_root / ".outbound").exists())
@@ -1540,7 +1556,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(Path, "open", deny_source_open),
                 self.assertRaises(OutboundAttachmentError) as raised,
             ):
-                router._freeze_outbound_attachments((attachment,))
+                await router._freeze_outbound_attachments((attachment,))
 
             self.assertEqual(raised.exception.error_code, "attachment_not_readable")
             self.assertFalse((app.router.media_root / ".outbound").exists())
@@ -2123,6 +2139,225 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delivered["status"], "delivered")
         self.assertEqual(retried["status"], "deduped")
         self.assertEqual(signal.sends, [("group", "person detected")])
+
+    async def test_signal_turn_media_and_dedupe_io_runs_off_loop_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = make_router_harness(tmp)
+            router = harness.router
+            loop_thread = threading.get_ident()
+            media_write_threads: list[int] = []
+            dedupe_calls = record_dedupe_call_threads(harness.dedupe)
+            original_write = router_module.write_attachment
+
+            def recording_write(**kwargs: Any) -> Any:
+                media_write_threads.append(threading.get_ident())
+                return original_write(**kwargs)
+
+            with patch("signal_hermes_router.router.write_attachment", recording_write):
+                result = await router.handle_event(
+                    make_event(
+                        timestamp=10,
+                        text="file",
+                        attachments=(
+                            SignalAttachment(
+                                content_type="application/pdf",
+                                filename="report.pdf",
+                                body=b"%PDF synthetic",
+                            ),
+                        ),
+                    )
+                )
+                # Skipped-event path (empty text, no attachments): its dedupe
+                # claim/mark_handled must also run off the loop.
+                skipped = await router.handle_event(make_event(timestamp=11, text="   "))
+
+            self.assertIsNotNone(result)
+            self.assertIsNone(skipped)
+            self.assertTrue(media_write_threads)
+            recorded_methods = {name for name, _ident in dedupe_calls}
+            self.assertIn("claim", recorded_methods)
+            self.assertIn("mark_handled", recorded_methods)
+            for ident in media_write_threads:
+                self.assertNotEqual(ident, loop_thread)
+            for name, ident in dedupe_calls:
+                self.assertNotEqual(ident, loop_thread, name)
+            await router.close(drain_timeout=0.0)
+
+    async def test_notification_freeze_and_dedupe_io_runs_off_loop_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = "person detected"
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            dedupe = DedupeStore()
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+            )
+            loop_thread = threading.get_ident()
+            copy_threads: list[int] = []
+            dedupe_calls = record_dedupe_call_threads(dedupe)
+            original_copy = router_module._copy_outbound_attachment
+
+            def recording_copy(source: Path, destination: Path, max_bytes: int) -> int:
+                copy_threads.append(threading.get_ident())
+                return original_copy(source, destination, max_bytes)
+
+            request = {
+                "command": "notify_route",
+                "notification_id": "camera-person",
+                "payload": {"camera": "front"},
+                "attachments": [str(image)],
+                "idempotency_key": "camera-person-1",
+            }
+            with patch("signal_hermes_router.router._copy_outbound_attachment", recording_copy):
+                delivered = await router._handle_control_line(encode_control_message(request))
+                image.unlink()
+                # Idempotent fast path: served from the is_handled read alone.
+                retried = await router._handle_control_line(encode_control_message(request))
+
+            self.assertEqual(delivered["status"], "delivered")
+            self.assertEqual(retried["status"], "deduped")
+            self.assertTrue(copy_threads)
+            recorded_methods = {name for name, _ident in dedupe_calls}
+            self.assertIn("is_handled", recorded_methods)
+            for ident in copy_threads:
+                self.assertNotEqual(ident, loop_thread)
+            for name, ident in dedupe_calls:
+                self.assertNotEqual(ident, loop_thread, name)
+            await router.close(drain_timeout=0.0)
+
+    async def test_cancelled_claim_is_released_by_worker_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            loop_thread = threading.get_ident()
+            started = threading.Event()
+            release = threading.Event()
+
+            def gated_clock() -> int:
+                if threading.get_ident() != loop_thread:
+                    started.set()
+                    release.wait(timeout=30)
+                return int(time.time() * 1000)
+
+            harness = make_router_harness(
+                tmp,
+                dedupe=DedupeStore(clock_ms=gated_clock),
+                retention=RetentionConfig(dedupe_handled_seconds=None),
+            )
+            router = harness.router
+            route = router.config.routes[0]
+            event = make_event(timestamp=10, text="hello")
+            turn = asyncio.create_task(router.handle_event(event))
+            try:
+                async with asyncio.timeout(5):
+                    while not started.is_set():
+                        await asyncio.sleep(0.01)
+                # Cancel while the claim statement is mid-commit in its
+                # worker thread: the coroutine never records the claim.
+                turn.cancel()
+                with suppress(asyncio.CancelledError):
+                    await turn
+            finally:
+                release.set()
+            # The abandoned claim committed anyway; the worker's done
+            # callback releases it so the identity is not wedged as a
+            # duplicate until the next startup reclaim.
+            sender_id = router_module._routed_sender_id(route, event)
+            async with asyncio.timeout(5):
+                while router.dedupe.status(route.key, sender_id, 10) is not None:
+                    await asyncio.sleep(0.01)
+            await router.close(drain_timeout=0.0)
+
+    async def test_cancelled_finalization_still_marks_all_synthetic_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            loop_thread = threading.get_ident()
+            worker_clock_calls = {"count": 0}
+            started = threading.Event()
+            release = threading.Event()
+
+            def gated_clock() -> int:
+                if threading.get_ident() != loop_thread:
+                    worker_clock_calls["count"] += 1
+                    # Calls 1 and 2 are the two claims; call 3 is the first
+                    # mark_handled finalizer.
+                    if worker_clock_calls["count"] == 3:
+                        started.set()
+                        release.wait(timeout=30)
+                return int(time.time() * 1000)
+
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(clock_ms=gated_clock),
+            )
+            job = router.config.find_synthetic_job("daily-agenda")
+            assert job is not None
+            task = asyncio.create_task(
+                router.handle_synthetic_job(
+                    "daily-agenda",
+                    scheduled_at=1000,
+                    idempotency_key="stable-fire",
+                )
+            )
+            try:
+                async with asyncio.timeout(5):
+                    while not started.is_set():
+                        await asyncio.sleep(0.01)
+                # Cancel while the first mark_handled finalizer is mid-commit:
+                # the second identity's finalizer was already dispatched, so
+                # it must still complete. The cancellation is recorded on the
+                # awaited outer future before the gate is released, so the
+                # observation loop sees it; releasing before awaiting the
+                # task lets the still-dispatched finalizers drain.
+                task.cancel()
+                release.set()
+                with suppress(asyncio.CancelledError):
+                    await task
+            finally:
+                release.set()
+            key_sender, key_timestamp = router._synthetic_dedupe_identity(
+                job.namespace,
+                scheduled_at=None,
+                idempotency_key="stable-fire",
+                triggered_at_ms=0,
+            )
+            async with asyncio.timeout(5):
+                while (
+                    router.dedupe.status(route.key, key_sender, key_timestamp) != "handled"
+                    or router.dedupe.status(route.key, job.namespace, 1000) != "handled"
+                ):
+                    await asyncio.sleep(0.01)
+            await router.close(drain_timeout=0.0)
 
     async def test_notify_route_processing_idempotency_skips_attachment_validation(
         self,
@@ -7316,12 +7551,12 @@ class RetentionSweepRouterTests(unittest.IsolatedAsyncioTestCase):
             ensure_private_dir_tree(media_root, staged.parent)
             write_private_bytes(staged, b"\x89PNG synthetic")
 
-            outer = router._freeze_outbound_attachments([str(staged)])
+            outer = await router._freeze_outbound_attachments([str(staged)])
             self.assertEqual(len(outer), 1)
             frozen_path = outer[0].path
             self.assertEqual(router._live_media[frozen_path], 1)
 
-            inner = router._freeze_outbound_attachments(outer)
+            inner = await router._freeze_outbound_attachments(outer)
             self.assertEqual(router._live_media[frozen_path], 2)
 
             router._cleanup_owned_outbound_attachments(inner)
@@ -7332,6 +7567,172 @@ class RetentionSweepRouterTests(unittest.IsolatedAsyncioTestCase):
             router._cleanup_owned_outbound_attachments(outer)
             self.assertEqual(len(router._live_media), 0)
             await router.close(drain_timeout=0.0)
+
+    async def test_media_sweep_defers_while_media_write_worker_in_flight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_media = self._write_archive_file(
+                tmp, "signal/2024/01/abc123/old.pdf", 40 * self.DAY_SECONDS
+            )
+            harness = make_router_harness(
+                tmp,
+                retention=self._retention_config(dedupe_handled_seconds=None),
+            )
+            router = harness.router
+            started = threading.Event()
+            release = threading.Event()
+            original_write = router_module.write_attachment
+
+            def gated_write(**kwargs: Any) -> Any:
+                started.set()
+                release.wait(timeout=30)
+                return original_write(**kwargs)
+
+            with patch("signal_hermes_router.router.write_attachment", gated_write):
+                turn = asyncio.create_task(
+                    router.handle_event(
+                        make_event(
+                            timestamp=10,
+                            text="file",
+                            attachments=(
+                                SignalAttachment(
+                                    content_type="application/pdf",
+                                    filename="report.pdf",
+                                    body=b"%PDF synthetic",
+                                ),
+                            ),
+                        )
+                    )
+                )
+                try:
+                    async with asyncio.timeout(5):
+                        while not started.is_set():
+                            await asyncio.sleep(0.01)
+                    # Cancel the awaiting turn: the sweep guard must stay
+                    # held by the worker, not the coroutine.
+                    turn.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await turn
+                    self.assertEqual(router._media_io_inflight, 1)
+                    await router._run_retention_sweep_once()
+                    # The deletion batch was deferred, not executed.
+                    self.assertTrue(old_media.exists())
+                finally:
+                    release.set()
+                async with asyncio.timeout(5):
+                    while router._media_io_inflight:
+                        await asyncio.sleep(0.01)
+            await router._run_retention_sweep_once()
+            self.assertFalse(old_media.exists())
+            await router.close(drain_timeout=0.0)
+
+    async def test_cancelled_freeze_cleans_completed_and_pending_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = make_router_harness(tmp, retention=self._retention_config())
+            router = harness.router
+            media_root = Path(tmp) / "media"
+            first = media_root / "camera" / "one.png"
+            second = media_root / "camera" / "two.png"
+            ensure_private_dir_tree(media_root, first.parent)
+            write_private_bytes(first, b"\x89PNG one")
+            write_private_bytes(second, b"\x89PNG two")
+            attachments = [
+                OutboundAttachment(
+                    path=path,
+                    content_type="image/png",
+                    size=path.stat().st_size,
+                )
+                for path in (first, second)
+            ]
+            started = threading.Event()
+            release = threading.Event()
+            copies = {"count": 0}
+            original_copy = router_module._copy_outbound_attachment
+
+            def gated_second_copy(source: Path, destination: Path, max_bytes: int) -> int:
+                copies["count"] += 1
+                if copies["count"] >= 2:
+                    started.set()
+                    release.wait(timeout=30)
+                return original_copy(source, destination, max_bytes)
+
+            with patch("signal_hermes_router.router._copy_outbound_attachment", gated_second_copy):
+                freeze = asyncio.create_task(router._freeze_outbound_attachments(attachments))
+                try:
+                    async with asyncio.timeout(5):
+                        while not started.is_set():
+                            await asyncio.sleep(0.01)
+                    freeze.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await freeze
+                finally:
+                    release.set()
+                async with asyncio.timeout(5):
+                    while router._media_io_inflight:
+                        await asyncio.sleep(0.01)
+                # One extra tick for the abandoned-artifact done callback.
+                await asyncio.sleep(0)
+            # The completed first copy and the abandoned second copy are both
+            # cleaned; no live-media references leak.
+            self.assertEqual(len(router._live_media), 0)
+            self.assertFalse((media_root / ".outbound").exists())
+            self.assertTrue(first.exists())
+            self.assertTrue(second.exists())
+            await router.close(drain_timeout=0.0)
+
+    async def test_close_reports_blocked_turn_dedupe_worker_and_defers_store_close(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            loop_thread = threading.get_ident()
+            started = threading.Event()
+            release = threading.Event()
+
+            def gated_clock() -> int:
+                if threading.get_ident() != loop_thread:
+                    started.set()
+                    release.wait(timeout=30)
+                return int(time.time() * 1000)
+
+            harness = make_router_harness(
+                tmp,
+                dedupe=DedupeStore(clock_ms=gated_clock),
+                retention=RetentionConfig(dedupe_handled_seconds=None),
+            )
+            router = harness.router
+            with patch("signal_hermes_router.router.SHUTDOWN_SETTLE_TIMEOUT_SECONDS", 0.2):
+                worker = asyncio.create_task(
+                    router._run_io_worker(
+                        lambda: router.dedupe.mark_handled("signal:group", "uuid", 1)
+                    )
+                )
+                try:
+                    async with asyncio.timeout(5):
+                        while not started.is_set():
+                            await asyncio.sleep(0.01)
+                    # Abandon the awaiting task; the worker thread keeps the
+                    # store operation in flight.
+                    worker.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await worker
+                    with self.assertLogs("signal_hermes_router.router", level="ERROR") as logs:
+                        begun = time.monotonic()
+                        incomplete = await router.close(drain_timeout=0.0)
+                        elapsed = time.monotonic() - begun
+                    # Bounded: the blocked worker is reported and the store
+                    # close is deferred to it, never awaited unboundedly.
+                    self.assertLess(elapsed, 5.0)
+                    self.assertTrue(incomplete)
+                    self.assertTrue(any("turn I/O workers" in line for line in logs.output))
+                    self.assertTrue(
+                        any("dedupe store close deferred" in line for line in logs.output)
+                    )
+                finally:
+                    release.set()
+            # The released worker finishes its write and runs the deferred
+            # finalizer; the store ends closed.
+            async with asyncio.timeout(5):
+                while not router.dedupe.close():
+                    await asyncio.sleep(0.01)
 
 
 if __name__ == "__main__":
