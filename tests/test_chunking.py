@@ -3,10 +3,12 @@ from __future__ import annotations
 import unittest
 
 from signal_hermes_router.outbound import (
+    NO_REPLY_SENTINEL,
     _byte_prefix,
     _chunk_for_signal_bytes,
     _hard_byte_cut,
     _split_greedy_bytes,
+    is_no_reply_sentinel,
 )
 
 
@@ -167,6 +169,23 @@ class BytePrefixTests(unittest.TestCase):
         self.assertEqual(_byte_prefix("🌍ascii", 4), "🌍")
         # limit=5 fits emoji + one ASCII char.
         self.assertEqual(_byte_prefix("🌍ascii", 5), "🌍a")
+
+
+class NoReplySentinelTests(unittest.TestCase):
+    def test_exact_sentinel_matches(self) -> None:
+        self.assertTrue(is_no_reply_sentinel(NO_REPLY_SENTINEL))
+
+    def test_whitespace_padded_sentinel_matches(self) -> None:
+        self.assertTrue(is_no_reply_sentinel(f"  \n{NO_REPLY_SENTINEL}\t\n "))
+
+    def test_sentinel_embedded_in_longer_reply_does_not_match(self) -> None:
+        self.assertFalse(is_no_reply_sentinel(f"Nothing to add. {NO_REPLY_SENTINEL}"))
+        self.assertFalse(is_no_reply_sentinel(f"{NO_REPLY_SENTINEL} but here is more"))
+
+    def test_empty_and_unrelated_text_do_not_match(self) -> None:
+        self.assertFalse(is_no_reply_sentinel(""))
+        self.assertFalse(is_no_reply_sentinel("   "))
+        self.assertFalse(is_no_reply_sentinel("no-reply"))
 
 
 if __name__ == "__main__":
