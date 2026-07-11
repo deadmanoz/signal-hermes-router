@@ -944,6 +944,11 @@ class PeerExitWatcherTests(unittest.IsolatedAsyncioTestCase):
             assert peer._reader_task is not None and peer._stderr_task is not None
             self.assertTrue(peer._reader_task.done())
             self.assertTrue(peer._stderr_task.done())
+            # The router-side pipe fds are released even though the grandchild
+            # still holds the child-side ends: an evicted peer must retain no
+            # OS resources, and a stdin-reading grandchild must see EOF.
+            assert peer.process is not None and peer.process.stdin is not None
+            self.assertTrue(peer.process.stdin.transport.is_closing())
         finally:
             await peer.close()
 

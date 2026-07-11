@@ -161,6 +161,20 @@ class JsonRpcStdioPeer:
             if self.process and self.process.returncode is None:
                 with suppress(ProcessLookupError):
                     self.process.kill()
+            self._close_pipe_transports()
+
+    def _close_pipe_transports(self) -> None:
+        # Release the router-side pipe fds explicitly. Pipe transports are
+        # normally torn down by EOF at child exit, but a grandchild that
+        # inherited the child's stdio holds them open indefinitely: the
+        # retained fds leak per crash, and the open stdin write end keeps a
+        # stdin-reading grandchild blocked forever instead of seeing EOF.
+        # Closing the subprocess transport is idempotent, closes every pipe,
+        # and never revives a process (it only kills a still-running child,
+        # which close() has already handled by this point).
+        transport = getattr(self.process, "_transport", None)
+        if transport is not None:
+            transport.close()
 
     async def request(
         self, method: str, params: dict[str, Any] | None = None, *, timeout: float = 300.0
@@ -258,6 +272,10 @@ class JsonRpcStdioPeer:
                 task.cancel()
             if pending:
                 await asyncio.wait(pending)
+        # The child is gone: release the router-side pipe fds so an evicted
+        # peer retains no OS resources and a grandchild that inherited the
+        # child's stdin sees EOF instead of blocking forever.
+        self._close_pipe_transports()
         if self._expected_exit or self.on_exit is None:
             return
         try:
