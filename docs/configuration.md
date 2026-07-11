@@ -498,12 +498,15 @@ routes:
   bursts up to `max_turns`. Turns beyond the rate are dropped:
   dedupe-claimed, marked handled, and logged as a content-free INFO line
   carrying only the redacted route reference. The cap counts only turns
-  that would actually prompt Hermes: turns gated by route state
-  (`maintenance`, `disabled`, `shadow`) and deduplicated redeliveries do
-  not consume tokens, so a route that accumulates traffic while inactive
-  does not drop its first turns after (re)activation. `max_turns` must be
-  an integer >= 1 (booleans and fractional values are rejected);
-  `window_seconds` must be a positive finite number.
+  that actually reach the Hermes prompt: a token is consumed immediately
+  before the prompt call, after every other gate has passed, so turns
+  gated by route state (`maintenance`, `disabled`, `shadow`),
+  deduplicated redeliveries, and turns that fail earlier in the pipeline
+  (attachment storage, session acquisition) never consume tokens. A route
+  that accumulates traffic while inactive therefore does not drop its
+  first turns after (re)activation. `max_turns` must be an integer >= 1
+  (booleans and fractional values are rejected); `window_seconds` must be
+  a positive finite number.
 
 Dropped and skipped events are permanent for that event identity: the router
 deliberately declines the turn and records it as handled. Operators who need

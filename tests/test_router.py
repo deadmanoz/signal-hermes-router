@@ -821,6 +821,43 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(capped_result)
             self.assertEqual(len(profile.prompts), 1)
 
+    async def test_inbound_rate_cap_does_not_burn_tokens_on_session_failure(self) -> None:
+        # A turn that fails before the prompt (here: session acquisition)
+        # never consumes a token; the cap counts prompted turns only.
+        class FlakySupervisor(FakeSupervisor):
+            def __init__(self, profile: FakeProfile) -> None:
+                super().__init__(profile)
+                self.fail_next = True
+
+            async def get_profile(self, route: Route) -> FakeProfile:
+                if self.fail_next:
+                    self.fail_next = False
+                    raise RuntimeError("session setup failed")
+                return self.profile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            route = make_route(
+                inbound_rate_limit=InboundRateLimitConfig(max_turns=1, window_seconds=60),
+            )
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, routes=(route,), failures=5),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FlakySupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_event(make_event(timestamp=1))
+            recovered = await router.handle_event(make_event(timestamp=2))
+            capped = await router.handle_event(make_event(timestamp=3))
+
+            self.assertIsNone(failed)
+            self.assertEqual(recovered, TurnResult("reply"))
+            self.assertIsNone(capped)
+            self.assertEqual(len(profile.prompts), 1)
+
     async def test_shadow_route_with_rate_limit_never_creates_bucket(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             signal = FakeSignal()
