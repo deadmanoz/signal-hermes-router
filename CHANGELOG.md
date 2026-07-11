@@ -5,7 +5,7 @@
 
 ### Features
 
-* **sessions:** rotate persistent-route sessions by age and turn count ([#48](https://github.com/deadmanoz/signal-hermes-router/issues/48)) ([e50a5db](https://github.com/deadmanoz/signal-hermes-router/commit/e50a5dbf51a006ddb0a72a7bf87b3cc083b13ab0))
+* **sessions:** rotate persistent-route sessions by age and turn count ([#48](https://github.com/deadmanoz/signal-hermes-router/issues/48))
 
 ## [0.1.21](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.20...v0.1.21) (2026-07-11)
 
