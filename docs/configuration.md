@@ -47,7 +47,12 @@ from the router's perspective and is not created or chmodded by the router.
   is created `0700`. This must be a filesystem path: `:memory:` is not
   supported for a running router, because dedupe would not survive restarts
   and the store's exclusive-ownership lock cannot span processes (in-memory
-  stores exist only as injected test doubles).
+  stores exist only as injected test doubles). The store runs in WAL journal
+  mode (compatible with, and subordinate to, its exclusive single-owner
+  lock), so a transient `<state_db>-wal` sidecar - also `0600` - exists
+  while the router runs. It is removed on clean shutdown; after a crash it
+  persists and is recovered automatically at the next startup. No `-shm`
+  file is created.
 - `router.media_root` (default `./private/media`) - root for attachments and
   their sidecar manifests written by `signal_hermes_router.media`. See
   [media handling](media.md) for the on-disk layout.

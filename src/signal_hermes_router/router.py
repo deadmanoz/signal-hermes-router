@@ -13,6 +13,7 @@ from collections import Counter, defaultdict
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
@@ -199,6 +200,18 @@ class SignalHermesRouter:
         # inbound manifests and frozen outbound artifacts). Event-loop-only
         # mutation; the sweep's execute phase consults it at deletion time.
         self._live_media: Counter[Path] = Counter()
+        # Executor futures for turn-path blocking I/O (dedupe statements,
+        # media writes/copies). Cancelling an awaiting task abandons - never
+        # interrupts - the thread work, so ownership follows the future:
+        # close() observes outstanding members before finalizing the dedupe
+        # store, and each future's done callback retrieves late failures.
+        self._io_worker_futures: set[asyncio.Future[Any]] = set()
+        # Count of media write/copy workers in flight. Event-loop-only
+        # mutation; the decrement rides each worker future's done callback,
+        # so a cancelled awaiting turn cannot release the guard while its
+        # thread still writes. The sweep's execute phase defers deletions
+        # while this is nonzero.
+        self._media_io_inflight = 0
 
     async def run_forever(self) -> None:
         if self._closing:
@@ -307,6 +320,18 @@ class SignalHermesRouter:
                     settle_deadline,
                     "retention sweep worker",
                 )
+            io_workers = {future for future in self._io_worker_futures if not future.done()}
+            if io_workers:
+                # Task settlement is not worker completion here either: a
+                # cancelled turn abandons its executor future without
+                # stopping the thread. Observe the tracked futures (bounded)
+                # before the dedupe store is finalized; awaiting them never
+                # cancels the underlying thread work.
+                incomplete += await self._observe_cleanup(
+                    self._wait_io_workers(io_workers),
+                    settle_deadline,
+                    "turn I/O workers",
+                )
             incomplete += await self._observe_cleanup(
                 self._wait_control_server_closed(),
                 settle_deadline,
@@ -327,12 +352,12 @@ class SignalHermesRouter:
             # step raised unexpectedly; abandoned tasks cannot write to a
             # closed store, and the replacement router's startup reclaim
             # recovers any orphaned processing claim. The close never blocks
-            # the event loop on a sweep statement: a mid-chunk retention
-            # worker receives the deferred finalizer instead.
+            # the event loop on a worker-held statement: a mid-statement
+            # retention or turn I/O worker receives the deferred finalizer
+            # instead.
             if not self.dedupe.close():
                 LOGGER.error(
-                    "dedupe store close deferred to an in-flight retention worker; "
-                    "cleanup is incomplete"
+                    "dedupe store close deferred to an in-flight worker; cleanup is incomplete"
                 )
         return tuple(incomplete)
 
@@ -519,6 +544,90 @@ class SignalHermesRouter:
         with suppress(Exception):
             await asyncio.shield(worker)
 
+    @staticmethod
+    async def _wait_io_workers(workers: set[asyncio.Future[Any]]) -> None:
+        # asyncio.wait never cancels the awaited futures, so a deadline
+        # cancellation of this observer leaves the workers running (and
+        # tracked) rather than corrupting them mid-statement.
+        with suppress(Exception):
+            await asyncio.wait(workers)
+
+    def _dispatch_io_worker(self, work: Callable[[], _T]) -> asyncio.Future[_T]:
+        # Blocking turn-path I/O runs in executor worker threads. The future
+        # is tracked until completion so close() can observe real worker
+        # completion even after the awaiting task was cancelled.
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, work)
+        self._io_worker_futures.add(future)
+        future.add_done_callback(self._settle_io_worker)
+        return future
+
+    def _dispatch_media_io_worker(self, work: Callable[[], _T]) -> asyncio.Future[_T]:
+        # Media writes/copies additionally hold the sweep-deferral guard
+        # until the worker actually finishes: the decrement rides the done
+        # callback (loop-side), so a cancelled awaiting turn cannot release
+        # the guard while its thread still writes.
+        self._media_io_inflight += 1
+        try:
+            future = self._dispatch_io_worker(work)
+        except BaseException:
+            self._media_io_inflight -= 1
+            raise
+        future.add_done_callback(self._release_media_io_guard)
+        return future
+
+    async def _run_io_worker(self, work: Callable[[], _T]) -> _T:
+        return await self._await_io_worker(self._dispatch_io_worker(work))
+
+    async def _run_media_io_worker(self, work: Callable[[], _T]) -> _T:
+        return await self._await_io_worker(self._dispatch_media_io_worker(work))
+
+    @staticmethod
+    def _await_io_worker(future: asyncio.Future[_T]) -> asyncio.Future[_T]:
+        # Shield-equivalent await: cancelling the awaiting task cancels only
+        # this outer future - the worker future (and its thread) keeps
+        # running, tracked and observable by close(). asyncio.shield is
+        # deliberately not used: it reports an abandoned inner future's late
+        # exception through the loop exception handler unredacted; here that
+        # failure stays with _settle_io_worker's redacted observer.
+        outer: asyncio.Future[_T] = asyncio.get_running_loop().create_future()
+
+        def _propagate(worker: asyncio.Future[_T]) -> None:
+            if outer.cancelled():
+                # Abandoned awaiter; _settle_io_worker already retrieved any
+                # failure.
+                return
+            if worker.cancelled():
+                outer.cancel()
+                return
+            exc = worker.exception()
+            if exc is not None:
+                outer.set_exception(exc)
+            else:
+                outer.set_result(worker.result())
+
+        future.add_done_callback(_propagate)
+        return outer
+
+    def _settle_io_worker(self, future: asyncio.Future[Any]) -> None:
+        self._io_worker_futures.discard(future)
+        if future.cancelled():
+            return
+        exc = future.exception()
+        if exc is None:
+            return
+        # Retrieving the exception here silences the unretrieved-exception
+        # warning for workers whose awaiter was cancelled (abandoned
+        # stragglers); a live awaiting turn observes and logs the failure
+        # itself.
+        LOGGER.debug(
+            "turn I/O worker failed: %s",
+            self.redactor.redact(exc.__class__.__name__),
+        )
+
+    def _release_media_io_guard(self, _future: asyncio.Future[Any]) -> None:
+        self._media_io_inflight -= 1
+
     async def _execute_media_sweep_plan(self, plan: MediaSweepPlan) -> MediaSweepResult:
         # Deletions run on the event loop so the pre-unlink mtime recheck
         # and live-path check cannot interleave with media writes; bounded
@@ -529,16 +638,28 @@ class SignalHermesRouter:
         for start in range(0, len(plan.groups), RETENTION_EXECUTE_BATCH_ITEMS):
             if self._closing:
                 break
-            partial = execute_media_sweep_groups(
+            if self._media_io_inflight:
+                # A media write/copy worker is running: its utime refresh or
+                # in-progress artifact could race this batch's pre-unlink
+                # recheck. Defer the rest of the sweep; the next interval
+                # recomputes the plan. Each batch runs synchronously on the
+                # loop and workers are only dispatched from the loop, so a
+                # zero check here holds for the whole batch.
+                LOGGER.debug("deferring media sweep deletions: media I/O in flight")
+                break
+            batch = execute_media_sweep_groups(
                 plan.groups[start : start + RETENTION_EXECUTE_BATCH_ITEMS],
                 is_live=self._is_live_media,
             )
-            files_removed += partial.files_removed
-            bytes_removed += partial.bytes_removed
+            files_removed += batch.files_removed
+            bytes_removed += batch.bytes_removed
             await asyncio.sleep(0)
         media_root = Path(self.config.router.media_root)
         for start in range(0, len(plan.candidate_dirs), RETENTION_EXECUTE_BATCH_ITEMS):
             if self._closing:
+                break
+            if self._media_io_inflight:
+                LOGGER.debug("deferring media sweep dir cleanup: media I/O in flight")
                 break
             dirs_removed += remove_empty_sweep_dirs(
                 plan.candidate_dirs[start : start + RETENTION_EXECUTE_BATCH_ITEMS],
@@ -603,14 +724,14 @@ class SignalHermesRouter:
         lock = self._route_lock(route)
         async with lock:
             if self._is_empty_signal_event(event):
-                self._mark_signal_turn_skipped(turn, reason="empty")
+                await self._mark_signal_turn_skipped(turn, reason="empty")
                 return None
             # Early freshness check: an event that is already stale is
             # discarded without waiting on the shared profile lock, so a
             # backlog drain does not queue behind another route's long turn
             # just to be thrown away.
             if self._is_stale_signal_event(route, event):
-                self._mark_signal_turn_skipped(turn, reason="stale")
+                await self._mark_signal_turn_skipped(turn, reason="stale")
                 return None
             profile_lock = self._profile_lock(route.profile)
             async with profile_lock:
@@ -618,7 +739,7 @@ class SignalHermesRouter:
                 # share a profile, so an event fresh at route-lock acquisition
                 # can age out waiting behind another route's turn.
                 if self._is_stale_signal_event(route, event):
-                    self._mark_signal_turn_skipped(turn, reason="stale")
+                    await self._mark_signal_turn_skipped(turn, reason="stale")
                     return None
                 outcome = await self._run_turn(turn)
         return outcome.result if outcome.status == TurnOutcomeStatus.DELIVERED else None
@@ -718,12 +839,12 @@ class SignalHermesRouter:
         frozen_attachments: tuple[OutboundAttachment, ...] = ()
         try:
             if outbound_attachments:
-                if self._turn_dedupe_has_status(turn, "handled"):
+                if await self._turn_dedupe_has_status(turn, "handled"):
                     return _synthetic_outcome(
                         TurnOutcomeStatus.DEDUPED,
                         route_state=self.route_state_overrides.get(route.key, route.state),
                     )
-                if not self._turn_dedupe_has_status(turn, "processing"):
+                if not await self._turn_dedupe_has_status(turn, "processing"):
                     self._maybe_clear_breaker_override(route)
                     state = self.route_state_overrides.get(route.key, route.state)
                     if state == RouteState.ACTIVE:
@@ -738,11 +859,11 @@ class SignalHermesRouter:
                                 error="attachment_signal_daemon_not_local",
                             )
                         try:
-                            frozen_attachments = self._freeze_outbound_attachments(
+                            frozen_attachments = await self._freeze_outbound_attachments(
                                 outbound_attachments
                             )
                         except OutboundAttachmentError as exc:
-                            if self._turn_dedupe_has_status(turn, "handled"):
+                            if await self._turn_dedupe_has_status(turn, "handled"):
                                 return _synthetic_outcome(
                                     TurnOutcomeStatus.DEDUPED,
                                     route_state=self.route_state_overrides.get(
@@ -782,9 +903,15 @@ class SignalHermesRouter:
         dedupe_identities = self._turn_dedupe_identities(turn)
         claimed_dedupe: list[tuple[str, int]] = []
         for dedupe_sender_id, dedupe_timestamp in dedupe_identities:
-            if not self.dedupe.claim(route.key, dedupe_sender_id, dedupe_timestamp):
+            if not await self._run_io_worker(
+                partial(self.dedupe.claim, route.key, dedupe_sender_id, dedupe_timestamp)
+            ):
                 for claimed_sender_id, claimed_timestamp in claimed_dedupe:
-                    self.dedupe.release(route.key, claimed_sender_id, claimed_timestamp)
+                    await self._run_io_worker(
+                        partial(
+                            self.dedupe.release, route.key, claimed_sender_id, claimed_timestamp
+                        )
+                    )
                 event_ref = f"{route.key}:{dedupe_sender_id}:{dedupe_timestamp}"
                 LOGGER.info("deduped routed turn %s", self.redactor.ref("event", event_ref))
                 return TurnOutcome(
@@ -858,7 +985,7 @@ class SignalHermesRouter:
 
             manifests: list[MediaManifest] = []
             if turn.signal_event is not None:
-                manifests = self._store_media(route, turn.signal_event)
+                manifests = await self._store_media(route, turn.signal_event)
                 for manifest in manifests:
                     # Keep stored attachments exempt from retention deletion
                     # for the duration of this turn, however long it waits
@@ -888,7 +1015,7 @@ class SignalHermesRouter:
                         **self._synthetic_outcome_fields(turn),
                     )
                 try:
-                    frozen_attachments = self._freeze_outbound_attachments(
+                    frozen_attachments = await self._freeze_outbound_attachments(
                         turn.outbound_attachments
                     )
                 except OutboundAttachmentError as exc:
@@ -1028,10 +1155,16 @@ class SignalHermesRouter:
                 self._refund_inbound_rate_token(route)
             if handled:
                 for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
-                    self.dedupe.mark_handled(route.key, dedupe_sender_id, dedupe_timestamp)
+                    await self._run_io_worker(
+                        partial(
+                            self.dedupe.mark_handled, route.key, dedupe_sender_id, dedupe_timestamp
+                        )
+                    )
             else:
                 for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
-                    self.dedupe.release(route.key, dedupe_sender_id, dedupe_timestamp)
+                    await self._run_io_worker(
+                        partial(self.dedupe.release, route.key, dedupe_sender_id, dedupe_timestamp)
+                    )
 
     @staticmethod
     def _turn_dedupe_identities(turn: RoutedTurnInput) -> tuple[tuple[str, int], ...]:
@@ -1040,13 +1173,16 @@ class SignalHermesRouter:
             identities.append(turn.secondary_dedupe)
         return tuple(identities)
 
-    def _turn_dedupe_has_status(self, turn: RoutedTurnInput, status: str) -> bool:
-        return any(
-            self.dedupe.status(turn.route.key, dedupe_sender_id, dedupe_timestamp) == status
-            for dedupe_sender_id, dedupe_timestamp in self._turn_dedupe_identities(turn)
-        )
+    async def _turn_dedupe_has_status(self, turn: RoutedTurnInput, status: str) -> bool:
+        for dedupe_sender_id, dedupe_timestamp in self._turn_dedupe_identities(turn):
+            found = await self._run_io_worker(
+                partial(self.dedupe.status, turn.route.key, dedupe_sender_id, dedupe_timestamp)
+            )
+            if found == status:
+                return True
+        return False
 
-    def _freeze_outbound_attachments(
+    async def _freeze_outbound_attachments(
         self,
         attachments: Any,
     ) -> tuple[OutboundAttachment, ...]:
@@ -1089,35 +1225,37 @@ class SignalHermesRouter:
                 send_dirs.append(send_dir)
                 suffix = validated.path.suffix.lower()
                 destination = send_dir / f"attachment{suffix}"
-                try:
-                    with validated.path.open("rb") as handle:
-                        body = handle.read(self.config.router.max_attachment_bytes + 1)
-                except FileNotFoundError as exc:
-                    raise OutboundAttachmentError(
-                        "attachment_not_found",
-                        "attachment path does not exist",
-                    ) from exc
-                except PermissionError as exc:
-                    raise OutboundAttachmentError(
-                        "attachment_not_readable",
-                        "attachment path is not readable",
-                    ) from exc
-                except OSError as exc:
-                    raise OutboundAttachmentError(
-                        "attachment_not_found",
-                        "attachment path could not be read",
-                    ) from exc
-                if len(body) > self.config.router.max_attachment_bytes:
-                    raise OutboundAttachmentError(
-                        "attachment_too_large",
-                        f"attachment exceeds {self.config.router.max_attachment_bytes} bytes",
+                # The blocking read+copy runs in a media worker thread;
+                # validation, dir creation, and live-media accounting stay
+                # loop-side.
+                copy_future = self._dispatch_media_io_worker(
+                    partial(
+                        _copy_outbound_attachment,
+                        validated.path,
+                        destination,
+                        self.config.router.max_attachment_bytes,
                     )
-                write_private_bytes(destination, body)
+                )
+                try:
+                    size = await self._await_io_worker(copy_future)
+                except asyncio.CancelledError:
+                    # The abandoned worker may still be writing; hand the
+                    # pending artifact's cleanup to its completion (runs on
+                    # the loop). Everything already frozen is cleaned by the
+                    # BaseException handler below.
+                    copy_future.add_done_callback(
+                        partial(
+                            self._discard_abandoned_freeze_artifact,
+                            destination,
+                            send_dir,
+                        )
+                    )
+                    raise
                 frozen.append(
                     OutboundAttachment(
                         path=destination.resolve(),
                         content_type=validated.content_type,
-                        size=len(body),
+                        size=size,
                         owned_by_router=True,
                     )
                 )
@@ -1138,7 +1276,12 @@ class SignalHermesRouter:
                     size=frozen_validated.size,
                     owned_by_router=True,
                 )
-        except Exception:
+        except BaseException:
+            # BaseException so a CancelledError delivered at the new await
+            # points cleans the partial freeze too: the callers only ever
+            # receive the frozen tuple from a successful return, so this is
+            # the sole owner of every completed copy and pass-through
+            # registration.
             self._cleanup_owned_outbound_attachments(tuple(frozen))
             for send_dir in reversed(send_dirs):
                 with suppress(OSError):
@@ -1147,6 +1290,23 @@ class SignalHermesRouter:
                 (media_root / ".outbound").rmdir()
             raise
         return tuple(frozen)
+
+    def _discard_abandoned_freeze_artifact(
+        self,
+        destination: Path,
+        send_dir: Path,
+        _future: asyncio.Future[Any],
+    ) -> None:
+        # The freeze that dispatched this copy was cancelled before the
+        # worker finished. Runs on the loop after worker completion, so it
+        # cannot race the copy itself; no live-media release is needed
+        # because registration only ever happens after a successful await.
+        with suppress(OSError):
+            destination.unlink(missing_ok=True)
+        with suppress(OSError):
+            send_dir.rmdir()
+        with suppress(OSError):
+            (Path(self.config.router.media_root).expanduser() / ".outbound").rmdir()
 
     def _cleanup_owned_outbound_attachments(
         self,
@@ -1212,14 +1372,20 @@ class SignalHermesRouter:
         if bucket is not None:
             bucket.refund()
 
-    def _mark_signal_turn_skipped(self, turn: RoutedTurnInput, *, reason: str) -> None:
+    async def _mark_signal_turn_skipped(self, turn: RoutedTurnInput, *, reason: str) -> None:
         route = turn.route
         dedupe_identities = self._turn_dedupe_identities(turn)
         claimed_dedupe: list[tuple[str, int]] = []
         for dedupe_sender_id, dedupe_timestamp in dedupe_identities:
-            if not self.dedupe.claim(route.key, dedupe_sender_id, dedupe_timestamp):
+            if not await self._run_io_worker(
+                partial(self.dedupe.claim, route.key, dedupe_sender_id, dedupe_timestamp)
+            ):
                 for claimed_sender_id, claimed_timestamp in claimed_dedupe:
-                    self.dedupe.release(route.key, claimed_sender_id, claimed_timestamp)
+                    await self._run_io_worker(
+                        partial(
+                            self.dedupe.release, route.key, claimed_sender_id, claimed_timestamp
+                        )
+                    )
                 event_ref = f"{route.key}:{dedupe_sender_id}:{dedupe_timestamp}"
                 LOGGER.info("deduped routed turn %s", self.redactor.ref("event", event_ref))
                 return
@@ -1230,7 +1396,9 @@ class SignalHermesRouter:
             self.redactor.ref("route", route.key),
         )
         for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
-            self.dedupe.mark_handled(route.key, dedupe_sender_id, dedupe_timestamp)
+            await self._run_io_worker(
+                partial(self.dedupe.mark_handled, route.key, dedupe_sender_id, dedupe_timestamp)
+            )
 
     def _synthetic_turn_input(
         self,
@@ -1524,8 +1692,7 @@ class SignalHermesRouter:
         except TimeoutError:
             return False
 
-    def _store_media(self, route: Route, event: NormalizedEvent) -> list[MediaManifest]:
-        manifests: list[MediaManifest] = []
+    async def _store_media(self, route: Route, event: NormalizedEvent) -> list[MediaManifest]:
         if event.chat_type == ChatType.DIRECT:
             group_ref = self.redactor.ref("direct", _routed_sender_id(route, event))
         else:
@@ -1533,19 +1700,25 @@ class SignalHermesRouter:
                 raise ValueError("group event requires group_id")
             group_ref = self.redactor.ref("group", event.group_id)
         sender_ref = self.redactor.ref("sender", event.sender_id)
-        for attachment in event.attachments:
-            manifests.append(
-                write_attachment(
-                    media_root=Path(self.config.router.media_root),
-                    platform=event.platform,
-                    timestamp=event.timestamp,
-                    attachment=self._resolve_signal_attachment(attachment),
-                    group_ref=group_ref,
-                    sender_ref=sender_ref,
-                    max_bytes=self.config.router.max_attachment_bytes,
-                )
+        attachments = [
+            self._resolve_signal_attachment(attachment) for attachment in event.attachments
+        ]
+        if not attachments:
+            return []
+        # Redactor refs and attachment resolution stay loop-side; the
+        # blocking read/hash/write work runs in a media worker thread.
+        return await self._run_media_io_worker(
+            partial(
+                _write_attachments,
+                media_root=Path(self.config.router.media_root),
+                platform=event.platform,
+                timestamp=event.timestamp,
+                attachments=attachments,
+                group_ref=group_ref,
+                sender_ref=sender_ref,
+                max_bytes=self.config.router.max_attachment_bytes,
             )
-        return manifests
+        )
 
     def _resolve_signal_attachment(self, attachment: SignalAttachment) -> SignalAttachment:
         if attachment.body is not None or attachment.path is not None or not attachment.signal_id:
@@ -1850,7 +2023,7 @@ class SignalHermesRouter:
         timeout, error = _parse_control_timeout(payload.get("timeout"))
         if error is not None:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": error}
-        deduped_response = self._deduped_notification_control_response(
+        deduped_response = await self._deduped_notification_control_response(
             notification_id,
             idempotency_key,
         )
@@ -1885,7 +2058,7 @@ class SignalHermesRouter:
             }
         return outcome.to_control_response()
 
-    def _deduped_notification_control_response(
+    async def _deduped_notification_control_response(
         self,
         notification_id: str,
         idempotency_key: str | None,
@@ -1904,7 +2077,9 @@ class SignalHermesRouter:
             idempotency_key=idempotency_key,
             triggered_at_ms=0,
         )
-        if not self.dedupe.is_handled(route.key, dedupe_sender_id, dedupe_timestamp):
+        if not await self._run_io_worker(
+            partial(self.dedupe.is_handled, route.key, dedupe_sender_id, dedupe_timestamp)
+        ):
             return None
         return TurnOutcome(
             TurnOutcomeStatus.DEDUPED,
@@ -2014,6 +2189,65 @@ class SignalHermesRouter:
         notice_task.cancel()
         with suppress(asyncio.CancelledError):
             await notice_task
+
+
+def _write_attachments(
+    *,
+    media_root: Path,
+    platform: str,
+    timestamp: int,
+    attachments: Sequence[SignalAttachment],
+    group_ref: str,
+    sender_ref: str,
+    max_bytes: int | None,
+) -> list[MediaManifest]:
+    # Blocking read/hash/write; runs in a media I/O worker thread
+    # (_run_media_io_worker), never on the event loop.
+    return [
+        write_attachment(
+            media_root=media_root,
+            platform=platform,
+            timestamp=timestamp,
+            attachment=attachment,
+            group_ref=group_ref,
+            sender_ref=sender_ref,
+            max_bytes=max_bytes,
+        )
+        for attachment in attachments
+    ]
+
+
+def _copy_outbound_attachment(source: Path, destination: Path, max_bytes: int) -> int:
+    """Blocking outbound-attachment copy; runs in a media I/O worker thread.
+
+    Returns the byte size written. The destination is written only after the
+    size check passes, so a failed copy never leaves a partial file.
+    """
+    try:
+        with source.open("rb") as handle:
+            body = handle.read(max_bytes + 1)
+    except FileNotFoundError as exc:
+        raise OutboundAttachmentError(
+            "attachment_not_found",
+            "attachment path does not exist",
+        ) from exc
+    except PermissionError as exc:
+        raise OutboundAttachmentError(
+            "attachment_not_readable",
+            "attachment path is not readable",
+        ) from exc
+    except OSError as exc:
+        raise OutboundAttachmentError(
+            "attachment_not_found",
+            "attachment path could not be read",
+        ) from exc
+    if len(body) > max_bytes:
+        raise OutboundAttachmentError(
+            "attachment_too_large",
+            f"attachment exceeds {max_bytes} bytes",
+        )
+    write_private_bytes(destination, body)
+    return len(body)
 
 
 def _discard_event(summary: SignalEventSummary) -> None:

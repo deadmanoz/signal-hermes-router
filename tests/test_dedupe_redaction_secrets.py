@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from signal_hermes_router.dedupe import MIGRATION_BACKUP_SUFFIX, DedupeStore
+from signal_hermes_router.dedupe import BUSY_TIMEOUT_MS, MIGRATION_BACKUP_SUFFIX, DedupeStore
 from signal_hermes_router.redaction import Redactor, sanitize_subprocess_output
 from signal_hermes_router.secrets import resolve_secret_refs, resolve_secret_uri
 from tests.support import file_mode
@@ -161,6 +161,37 @@ class DedupeTests(unittest.TestCase):
 
         store.close = fail_close  # type: ignore[method-assign]
         store.__del__()
+
+    def test_file_backed_store_enables_wal_with_busy_timeout_and_private_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "router.db"
+            with DedupeStore(path) as store:
+                journal = str(store._db.execute("PRAGMA journal_mode").fetchone()[0])
+                locking = str(store._db.execute("PRAGMA locking_mode").fetchone()[0])
+                busy = int(store._db.execute("PRAGMA busy_timeout").fetchone()[0])
+                self.assertEqual(journal.lower(), "wal")
+                self.assertEqual(locking.lower(), "exclusive")
+                self.assertEqual(busy, BUSY_TIMEOUT_MS)
+                store.mark_handled("signal:route", "uuid", 1)
+                wal_path = Path(str(path) + "-wal")
+                self.assertTrue(wal_path.is_file())
+                self.assertEqual(file_mode(wal_path), 0o600)
+                # Exclusive-locking WAL uses a heap wal-index; no shared
+                # memory sidecar may appear.
+                self.assertFalse(Path(str(path) + "-shm").exists())
+            # WAL is persistent: a reopened store is still in WAL mode and
+            # reads the previous owner's rows.
+            with DedupeStore(path) as reopened:
+                journal = str(reopened._db.execute("PRAGMA journal_mode").fetchone()[0])
+                self.assertEqual(journal.lower(), "wal")
+                self.assertTrue(reopened.is_handled("signal:route", "uuid", 1))
+
+    def test_memory_store_keeps_memory_journal_mode(self) -> None:
+        with DedupeStore() as store:
+            journal = str(store._db.execute("PRAGMA journal_mode").fetchone()[0])
+            self.assertEqual(journal.lower(), "memory")
+            store.mark_handled("signal:route", "uuid", 1)
+            self.assertTrue(store.is_handled("signal:route", "uuid", 1))
 
 
 class _GatedLock:
@@ -452,6 +483,35 @@ class DedupeRetentionTests(unittest.TestCase):
             with DedupeStore(path, clock_ms=lambda: 1_000) as reopened:
                 self.assertIsNone(reopened.status("signal:route", "uuid", 1))
                 self.assertTrue(reopened.claim("signal:route", "uuid", 1))
+
+    def test_close_defers_to_in_flight_turn_write_and_refuses_new_operations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "router.db"
+            store = DedupeStore(path)
+            gated = _GatedLock(store._lock)
+            store._lock = gated  # type: ignore[assignment]
+
+            worker = threading.Thread(target=store.mark_handled, args=("signal:route", "uuid", 1))
+            worker.start()
+            try:
+                self.assertTrue(gated.entered.wait(timeout=10))
+                # The turn write is mid-statement: close() must defer without
+                # blocking the caller on the worker-held statement lock.
+                self.assertFalse(store.close())
+                # Once a close was requested, a straggler operation is
+                # refused instead of extending the deferral indefinitely.
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    store.claim("signal:route", "late-uuid", 2)
+            finally:
+                gated.resume.set()
+                worker.join(timeout=10)
+            self.assertFalse(worker.is_alive())
+            # The worker executed the deferred finalizer after its write.
+            self.assertTrue(store.close())
+            # The exclusive lock was released; the write committed before the
+            # deferred close.
+            with DedupeStore(path) as reopened:
+                self.assertTrue(reopened.is_handled("signal:route", "uuid", 1))
 
 
 class RedactionTests(unittest.TestCase):
