@@ -5,6 +5,8 @@ import hashlib
 import logging
 import time
 import uuid
+from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from .acp import (
 from .config import Route
 from .models import ChatType, NormalizedEvent, SessionKeyInput, SessionPolicy, SessionStatus
 from .permissions import StaticPermissionPolicy
+from .redaction import sanitize_subprocess_output
 
 LOGGER = logging.getLogger(__name__)
 
@@ -50,11 +53,32 @@ class ProfileSupervisor:
         self.restart_cooldown_seconds = restart_cooldown_seconds
         self._profiles: dict[str, ACPProfile] = {}
         self._last_restart: dict[str, float] = {}
+        self._acquire_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._redact: Callable[[str], str] = lambda text: text
+
+    def set_redactor(self, redact: Callable[[str], str]) -> None:
+        """Route the free-form exit-log content (profile name, stderr tail)
+        through the caller's redactor. Identity by default."""
+        self._redact = redact
 
     async def get_profile(self, route: Route) -> ACPProfile:
+        # Serialized per profile name so a concurrent acquisition can never
+        # observe the provisional (still-starting) cache entry below.
+        async with self._acquire_locks[route.profile]:
+            return await self._acquire_profile(route)
+
+    async def _acquire_profile(self, route: Route) -> ACPProfile:
         profile = self._profiles.get(route.profile)
         if profile is not None:
-            return profile
+            if not profile.exit_suspected():
+                return profile
+            # The child died but the exit watcher is still inside its settle
+            # window and has not evicted the entry yet. Evict now and fall
+            # through to spawn a fresh child so this turn recovers
+            # transparently; the watcher still logs the exit.
+            if self._profiles.get(route.profile) is profile:
+                del self._profiles[route.profile]
+            await self._close_evicted_profile(profile)
         last = self._last_restart.get(route.profile)
         if last is not None and self.restart_cooldown_seconds > 0:
             elapsed = time.monotonic() - last
@@ -75,15 +99,92 @@ class ProfileSupervisor:
             prompt_timeout_seconds=self.prompt_timeout_seconds,
             initialize_timeout_seconds=self.initialize_timeout_seconds,
         )
+
+        def _on_exit(returncode: int | None, stderr_tail: tuple[str, ...]) -> None:
+            self._handle_profile_exit(route.profile, profile, returncode, stderr_tail)
+
+        profile.on_exit = _on_exit
+        # Provisional registration BEFORE start(): a child that answers
+        # initialize and dies immediately must be evictable by the exit
+        # watcher; a post-start cache write could store a corpse the watcher
+        # already reported.
+        self._profiles[route.profile] = profile
         try:
             await profile.start()
-        except Exception:
-            # Record so the next get_profile within the cooldown window
-            # refuses fast rather than spawning another doomed subprocess.
-            self._last_restart[route.profile] = time.monotonic()
+        except BaseException as exc:
+            if self._profiles.get(route.profile) is profile:
+                del self._profiles[route.profile]
+            if isinstance(exc, Exception):
+                # Record so the next get_profile within the cooldown window
+                # refuses fast rather than spawning another doomed subprocess.
+                # Cancellation is not a failed start and stamps no cooldown.
+                self._last_restart[route.profile] = time.monotonic()
             raise
-        self._profiles[route.profile] = profile
+        # Let a post-initialize death that has already been signalled surface
+        # before the final evidence check: each yield gives the event loop a
+        # poll cycle, so a stdout EOF that raced start()'s return is processed
+        # by the reader task and becomes visible to exit_suspected(). Bounded
+        # and latency-free (sleep(0) yields, no real waiting); a child that
+        # dies after this window is caught by the exit watcher or the lazy
+        # write-failure path instead.
+        for _ in range(3):
+            if profile.exit_suspected():
+                break
+            await asyncio.sleep(0)
+        if self._profiles.get(route.profile) is not profile or profile.exit_suspected():
+            # Either the exit watcher evicted this instance while start() was
+            # in flight, or the child is already demonstrably dead (a child
+            # can answer initialize and die before the watcher gets CPU);
+            # never hand out a known-dead profile.
+            if self._profiles.get(route.profile) is profile:
+                del self._profiles[route.profile]
+            await self._close_evicted_profile(profile)
+            raise RuntimeError(f"Hermes profile {route.profile!r} exited during startup")
         return profile
+
+    async def _close_evicted_profile(self, profile: ACPProfile) -> None:
+        # Exit evidence can come from broken pipes on a child that has not
+        # fully exited (for example one that closed its stdout while wedged).
+        # Close the evicted profile so eviction never orphans a subprocess
+        # that _profiles no longer owns; close() is safe on an already-dead
+        # peer and still lets the watcher report the exit first.
+        try:
+            await profile.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.warning("evicted Hermes profile close failed")
+            LOGGER.debug("evicted Hermes profile close failure details", exc_info=True)
+
+    def _handle_profile_exit(
+        self,
+        profile_name: str,
+        profile: ACPProfile,
+        returncode: int | None,
+        stderr_tail: tuple[str, ...],
+    ) -> None:
+        if self._profiles.get(profile_name) is profile:
+            # Mark dead: the next acquisition spawns a fresh subprocess. No
+            # eager respawn (a crash loop must not spin without traffic) and
+            # no failed-start cooldown stamp (the next turn must recover
+            # transparently; a genuinely broken binary still trips the
+            # cooldown on its next failed start).
+            del self._profiles[profile_name]
+        LOGGER.error(
+            "Hermes profile %s subprocess exited unexpectedly with returncode %s; "
+            "marked dead, will respawn on next acquisition",
+            self._redact(profile_name),
+            returncode,
+        )
+        if stderr_tail:
+            # Sanitize per line so a credential assignment masks the rest of
+            # its own stderr line, not everything joined after it.
+            sanitized_tail = " | ".join(sanitize_subprocess_output(line) for line in stderr_tail)
+            LOGGER.error(
+                "Hermes profile %s stderr tail near exit: %s",
+                self._redact(profile_name),
+                self._redact(sanitized_tail),
+            )
 
     async def restart_profile(self, profile_name: str) -> None:
         existing = self._profiles.pop(profile_name, None)

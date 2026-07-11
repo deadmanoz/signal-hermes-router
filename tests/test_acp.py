@@ -14,7 +14,10 @@ from signal_hermes_router import acp as acp_module
 from signal_hermes_router.acp import (
     ACPProfile,
     JsonRpcError,
+    JsonRpcPeerExited,
     JsonRpcStdioPeer,
+    STDERR_TAIL_MAX_LINE_CHARS,
+    STDERR_TAIL_MAX_LINES,
     _collect_assistant_text,
     default_hermes_command,
 )
@@ -347,6 +350,9 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
     async def test_json_rpc_start_merges_environment(self) -> None:
         captured: dict[str, object] = {}
 
+        async def fake_wait() -> int:
+            return 0
+
         async def fake_create_subprocess_exec(*command: str, **kwargs: object):
             captured["command"] = command
             captured["env"] = kwargs["env"]
@@ -355,6 +361,7 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
                 stdout=FakeLineReader([]),
                 stderr=FakeLineReader([]),
                 returncode=0,
+                wait=fake_wait,
             )
 
         peer = JsonRpcStdioPeer(["hermes", "acp"], env={"ROUTER_TEST_ENV": "yes"})
@@ -827,6 +834,233 @@ class PeerCloseCancellationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await close_task
         self.assertEqual(process.kill_calls, 0)
+
+
+class PeerExitWatcherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_peer_exit_watcher_reports_returncode_and_stderr_tail(self) -> None:
+        exits: list[tuple[int | None, tuple[str, ...]]] = []
+        peer = JsonRpcStdioPeer(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stderr.write('boom-detail\\n'); sys.stderr.flush(); sys.exit(3)",
+            ],
+            on_exit=lambda returncode, tail: exits.append((returncode, tail)),
+        )
+        await peer.start()
+        try:
+            for _ in range(200):
+                if exits:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(len(exits), 1)
+            returncode, tail = exits[0]
+            self.assertEqual(returncode, 3)
+            self.assertIn("boom-detail", tail)
+        finally:
+            await peer.close()
+
+    async def test_peer_close_suppresses_exit_callback(self) -> None:
+        exits: list[tuple[int | None, tuple[str, ...]]] = []
+        peer = JsonRpcStdioPeer(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            on_exit=lambda returncode, tail: exits.append((returncode, tail)),
+        )
+        await peer.start()
+        await peer.close()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertEqual(exits, [])
+
+    async def test_peer_close_reports_exit_of_already_dead_child(self) -> None:
+        # Crash-then-close race: the child died on its own and was reaped,
+        # but the watcher task has not had CPU yet when close() is called
+        # (recovery reacts to the failed request first). close() must hand
+        # the exit report off to the watcher before suppressing it.
+        exits: list[tuple[int | None, tuple[str, ...]]] = []
+
+        class DeadProcess:
+            returncode = -9
+
+            async def wait(self) -> int:
+                return -9
+
+        peer = JsonRpcStdioPeer(
+            ["unused"],
+            on_exit=lambda returncode, tail: exits.append((returncode, tail)),
+        )
+        peer.process = DeadProcess()  # type: ignore[assignment]
+        peer._exit_watcher_task = asyncio.create_task(peer._watch_exit())
+
+        await peer.close()
+
+        self.assertEqual(exits, [(-9, ())])
+
+    async def test_peer_close_reports_crash_discovered_by_failed_request(self) -> None:
+        # The production incident shape: the child is dead, the router only
+        # notices when the next request fails, and recovery immediately
+        # closes the peer -- without ever awaiting process.wait() first.
+        exits: list[tuple[int | None, tuple[str, ...]]] = []
+        peer = JsonRpcStdioPeer(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            on_exit=lambda returncode, tail: exits.append((returncode, tail)),
+        )
+        await peer.start()
+        assert peer.process is not None
+        peer.process.kill()
+        with self.assertRaises((JsonRpcPeerExited, ConnectionResetError, BrokenPipeError)):
+            await peer.request("ping", timeout=5)
+        await peer.close()
+
+        self.assertEqual(len(exits), 1)
+        self.assertEqual(exits[0][0], -9)
+
+    async def test_watcher_cleans_up_stale_pipe_tasks_when_grandchild_holds_stderr(self) -> None:
+        # A grandchild inheriting the child's pipes holds EOF open past the
+        # child's death. The watcher must still report the exit after the
+        # settle bound and must cancel the drain tasks so an evicted peer
+        # cannot leak permanently-pending tasks.
+        script = (
+            "import os, subprocess, sys\n"
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)'])\n"
+            "sys.stderr.write('dying\\n')\n"
+            "sys.stderr.flush()\n"
+            "os._exit(7)\n"
+        )
+        exits: list[tuple[int | None, tuple[str, ...]]] = []
+        peer = JsonRpcStdioPeer(
+            [sys.executable, "-c", script],
+            on_exit=lambda returncode, tail: exits.append((returncode, tail)),
+        )
+        await peer.start()
+        try:
+            for _ in range(300):
+                if exits:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(len(exits), 1)
+            self.assertEqual(exits[0][0], 7)
+            self.assertIn("dying", exits[0][1])
+            assert peer._reader_task is not None and peer._stderr_task is not None
+            self.assertTrue(peer._reader_task.done())
+            self.assertTrue(peer._stderr_task.done())
+            # The router-side pipe fds are released even though the grandchild
+            # still holds the child-side ends: an evicted peer must retain no
+            # OS resources, and a stdin-reading grandchild must see EOF.
+            assert peer.process is not None and peer.process.stdin is not None
+            self.assertTrue(peer.process.stdin.transport.is_closing())
+        finally:
+            await peer.close()
+
+    async def test_peer_close_cancelled_during_exit_handoff_still_kills_child(self) -> None:
+        # Cancellation while close() waits for the watcher handoff (live
+        # child with stdout-EOF evidence) must still reach the kill backstop:
+        # no exit path of close() may leave a running subprocess.
+        wait_gate = asyncio.Event()
+
+        class LiveProcess:
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+                self.killed = False
+
+            def terminate(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self) -> int | None:
+                await wait_gate.wait()
+                return self.returncode
+
+        peer = JsonRpcStdioPeer(["unused"])
+        process = LiveProcess()
+        peer.process = process  # type: ignore[assignment]
+        # Evidence without a reaped exit: the child closed its own stdout.
+        peer._stdout_eof = True
+        peer._exit_watcher_task = asyncio.create_task(peer._watch_exit())
+
+        close_task = asyncio.create_task(peer.close())
+        for _ in range(10):
+            await asyncio.sleep(0)
+        self.assertFalse(close_task.done(), "close() must be parked in the handoff wait")
+
+        close_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await close_task
+        self.assertTrue(process.killed, "kill backstop must run despite handoff cancellation")
+        wait_gate.set()
+        assert peer._exit_watcher_task is not None
+        await asyncio.wait_for(peer._exit_watcher_task, timeout=5)
+
+    async def test_peer_exit_callback_failure_does_not_break_close(self) -> None:
+        def bad_callback(_returncode: int | None, _tail: tuple[str, ...]) -> None:
+            raise RuntimeError("callback boom")
+
+        peer = JsonRpcStdioPeer(
+            [sys.executable, "-c", "import sys; sys.exit(1)"],
+            on_exit=bad_callback,
+        )
+        with self.assertLogs("signal_hermes_router.acp", level="WARNING") as logs:
+            await peer.start()
+            assert peer._exit_watcher_task is not None
+            await asyncio.wait_for(peer._exit_watcher_task, timeout=5)
+        await peer.close()
+        self.assertIn("exit callback failed", "\n".join(logs.output))
+
+    async def test_read_loop_eof_sets_stdout_exit_evidence(self) -> None:
+        peer = JsonRpcStdioPeer(["unused"])
+        peer.process = SimpleNamespace(  # type: ignore[assignment]
+            stdout=FakeLineReader([]), returncode=None
+        )
+
+        await peer._read_loop()
+
+        self.assertTrue(peer._stdout_eof)
+        self.assertTrue(peer.exit_evidence())
+
+    async def test_write_frame_broken_pipe_sets_stdin_exit_evidence(self) -> None:
+        class BrokenStdin:
+            def write(self, _data: bytes) -> None:
+                raise ConnectionResetError
+
+            async def drain(self) -> None:
+                return None
+
+        peer = JsonRpcStdioPeer(["unused"])
+        peer.process = SimpleNamespace(stdin=BrokenStdin(), returncode=None)  # type: ignore[assignment]
+
+        with self.assertRaises(ConnectionResetError):
+            await peer._write_frame({"jsonrpc": "2.0"})
+
+        self.assertTrue(peer._stdin_write_failed)
+        self.assertTrue(peer.exit_evidence())
+
+    async def test_drain_stderr_bounds_tail_lines_and_line_length(self) -> None:
+        lines = [f"line-{index}\n".encode() for index in range(STDERR_TAIL_MAX_LINES + 5)]
+        lines.append(b"x" * (STDERR_TAIL_MAX_LINE_CHARS + 100) + b"\n")
+        lines.append(b"")
+        peer = JsonRpcStdioPeer(["unused"])
+        peer.process = SimpleNamespace(stderr=FakeLineReader(lines))  # type: ignore[assignment]
+
+        await peer._drain_stderr()
+
+        tail = peer.stderr_tail()
+        self.assertEqual(len(tail), STDERR_TAIL_MAX_LINES)
+        self.assertEqual(tail[-1], "x" * STDERR_TAIL_MAX_LINE_CHARS)
+        self.assertNotIn("line-0", tail)
+        self.assertIn(f"line-{STDERR_TAIL_MAX_LINES + 4}", tail)
+
+    def test_acp_profile_notify_exit_forwards_and_guards_none(self) -> None:
+        profile = ACPProfile(profile="synthetic", work_root=Path("/tmp"))
+        profile._notify_exit(1, ("ignored",))  # no callback registered: no-op
+
+        seen: list[tuple[int | None, tuple[str, ...]]] = []
+        profile.on_exit = lambda returncode, tail: seen.append((returncode, tail))
+        profile._notify_exit(2, ("boom",))
+
+        self.assertEqual(seen, [(2, ("boom",))])
 
 
 if __name__ == "__main__":

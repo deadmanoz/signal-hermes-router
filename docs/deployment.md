@@ -57,6 +57,23 @@ writes, so that enforcement cannot protect a mixed-version overlap: when
 upgrading from such a version, confirm the old process has exited before
 starting the new one.
 
+## Hermes Subprocess Crash Detection
+
+The router watches every supervised Hermes subprocess and notices an
+unexpected exit the moment it happens, instead of discovering it on the next
+turn's failed write. A crash produces an ERROR log with the (redacted) profile
+reference, the child's returncode, and the respawn marker
+`will respawn on next acquisition`, plus a second ERROR line carrying the last
+stderr the child wrote before dying (bounded, credential-shapes masked, ANSI
+control sequences stripped).
+
+Recovery is deliberately lazy: the dead profile is marked for respawn and the
+next turn on any of its routes transparently starts a fresh subprocess - there
+is no eager restart loop, so a crash-looping profile only respawns as fast as
+traffic arrives, and a profile whose respawn itself fails still trips the
+existing failed-start cooldown. Graceful shutdown, `restart_profile` recovery,
+and upgrades do not produce these logs; only a child that died on its own does.
+
 ## Graceful Shutdown
 
 The serve process handles SIGTERM itself. The first SIGTERM fences new work

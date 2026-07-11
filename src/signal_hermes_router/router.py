@@ -123,23 +123,6 @@ class SignalHermesRouter:
         nonce_factory: Callable[[], str] | None = None,
     ) -> None:
         self.config = config
-        self.signal = signal_client or SignalHttpClient(
-            config.router.signal_base_url,
-            max_event_bytes=config.router.max_signal_event_bytes,
-        )
-        self.supervisor = supervisor or ProfileSupervisor(
-            config.router.work_root,
-            max_acp_line_bytes=config.router.max_acp_line_bytes,
-            prompt_timeout_seconds=config.router.acp_prompt_timeout_seconds,
-            initialize_timeout_seconds=config.router.acp_initialize_timeout_seconds,
-        )
-        self.sessions = SessionRegistry(config.router.work_root, self.supervisor)
-        self.dedupe = dedupe or DedupeStore(config.router.state_db)
-        self.circuit = CircuitBreaker(
-            failures=config.router.circuit_breaker.failures,
-            window_seconds=config.router.circuit_breaker.window_seconds,
-        )
-        self.recovery_seconds = config.router.circuit_breaker.recovery_seconds
         self.redactor = Redactor()
         for route in config.routes:
             self.redactor.add(
@@ -150,6 +133,29 @@ class SignalHermesRouter:
                 route.profile,
                 route.friendly_name,
             )
+        self.signal = signal_client or SignalHttpClient(
+            config.router.signal_base_url,
+            max_event_bytes=config.router.max_signal_event_bytes,
+        )
+        self.supervisor = supervisor or ProfileSupervisor(
+            config.router.work_root,
+            max_acp_line_bytes=config.router.max_acp_line_bytes,
+            prompt_timeout_seconds=config.router.acp_prompt_timeout_seconds,
+            initialize_timeout_seconds=config.router.acp_initialize_timeout_seconds,
+        )
+        # Every router-owned real supervisor (default-constructed or injected)
+        # gets redaction-safe exit logs; feature detection keeps bare test
+        # doubles working.
+        set_redactor = getattr(self.supervisor, "set_redactor", None)
+        if set_redactor is not None:
+            set_redactor(self.redactor.redact)
+        self.sessions = SessionRegistry(config.router.work_root, self.supervisor)
+        self.dedupe = dedupe or DedupeStore(config.router.state_db)
+        self.circuit = CircuitBreaker(
+            failures=config.router.circuit_breaker.failures,
+            window_seconds=config.router.circuit_breaker.window_seconds,
+        )
+        self.recovery_seconds = config.router.circuit_breaker.recovery_seconds
         self.route_state_overrides: dict[str, RouteState] = {}
         self._trip_times: dict[str, float] = {}
         self._trip_times_ms: dict[str, int] = {}

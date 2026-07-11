@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -28,6 +29,21 @@ DEFAULT_MAX_ACP_LINE_BYTES = 8 * 1024 * 1024
 DEFAULT_ACP_PROMPT_TIMEOUT_SECONDS = 300.0
 DEFAULT_ACP_INITIALIZE_TIMEOUT_SECONDS = 30.0
 DEFAULT_ACP_TOOL_SURFACE_TIMEOUT_SECONDS = 30.0
+STDERR_TAIL_MAX_LINES = 20
+STDERR_TAIL_MAX_LINE_CHARS = 400
+# Post-exit settle bound for the pipe-drain tasks: long enough to capture the
+# stderr written just before death and a final buffered stdout response, short
+# enough that the exit is reported well within a second of the child dying
+# even when a grandchild inherited the pipes and holds EOF open.
+EXIT_SETTLE_TIMEOUT_SECONDS = 0.5
+# asyncio's Process.wait() waiters are only woken once the child is reaped AND
+# all of its pipes have disconnected, so a grandchild that inherited the pipes
+# can delay wait() long past the actual death. The watcher therefore also
+# polls the transport's returncode (set at reap time) on this interval.
+EXIT_POLL_INTERVAL_SECONDS = 0.2
+# Close-side bound for handing the exit report off to the watcher when the
+# child demonstrably died on its own before close() was requested.
+CLOSE_EXIT_REPORT_TIMEOUT_SECONDS = 2.0
 
 
 class JsonRpcError(RuntimeError):
@@ -41,6 +57,7 @@ class JsonRpcPeerExited(RuntimeError):
 
 
 RequestHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+ExitCallback = Callable[[int | None, tuple[str, ...]], None]
 
 
 def default_hermes_command(profile: str) -> list[str]:
@@ -58,18 +75,27 @@ class JsonRpcStdioPeer:
         env: dict[str, str] | None = None,
         max_line_bytes: int | None = DEFAULT_MAX_ACP_LINE_BYTES,
         request_handlers: dict[str, RequestHandler] | None = None,
+        on_exit: ExitCallback | None = None,
     ) -> None:
         self.command = command
         self.cwd = cwd
         self.env = env
         self.max_line_bytes = max_line_bytes
         self.request_handlers = request_handlers or {}
+        self.on_exit = on_exit
         self.process: asyncio.subprocess.Process | None = None
         self._ids = itertools.count(1)
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._write_lock = asyncio.Lock()
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
+        self._exit_watcher_task: asyncio.Task[None] | None = None
+        self._expected_exit = False
+        # Lazy-discovery exit evidence: the child's pipes broke on their own
+        # (stdout EOF or a failed stdin write) before the exit was reaped.
+        self._stdout_eof = False
+        self._stdin_write_failed = False
+        self._stderr_tail: deque[str] = deque(maxlen=STDERR_TAIL_MAX_LINES)
         self._session_updates: dict[str, asyncio.Queue[dict[str, Any]]] = {}
 
     async def start(self) -> None:
@@ -90,9 +116,28 @@ class JsonRpcStdioPeer:
         )
         self._reader_task = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
+        self._exit_watcher_task = asyncio.create_task(self._watch_exit())
 
     async def close(self) -> None:
+        watcher = self._exit_watcher_task
         try:
+            if watcher is not None and not watcher.done() and self.exit_evidence():
+                # The child's exit (or its broken pipes) predates this close:
+                # let the watcher report the unexpected exit before it is
+                # suppressed. This is the lazy-discovery incident class, where
+                # recovery closes the peer as soon as a request fails and
+                # would otherwise reclassify the crash as an intentional
+                # shutdown. The bound covers the one non-death way evidence
+                # can exist (a live child that closed its own stdout is never
+                # reaped); such a child is terminated below as a normal
+                # expected exit. Inside the try block so cancellation during
+                # this wait still reaches the kill backstop.
+                await asyncio.wait({watcher}, timeout=CLOSE_EXIT_REPORT_TIMEOUT_SECONDS)
+            self._expected_exit = True
+            if watcher is not None:
+                watcher.cancel()
+                with suppress(asyncio.CancelledError):
+                    await watcher
             if self._reader_task:
                 self._reader_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -116,6 +161,20 @@ class JsonRpcStdioPeer:
             if self.process and self.process.returncode is None:
                 with suppress(ProcessLookupError):
                     self.process.kill()
+            self._close_pipe_transports()
+
+    def _close_pipe_transports(self) -> None:
+        # Release the router-side pipe fds explicitly. Pipe transports are
+        # normally torn down by EOF at child exit, but a grandchild that
+        # inherited the child's stdio holds them open indefinitely: the
+        # retained fds leak per crash, and the open stdin write end keeps a
+        # stdin-reading grandchild blocked forever instead of seeing EOF.
+        # Closing the subprocess transport is idempotent, closes every pipe,
+        # and never revives a process (it only kills a still-running child,
+        # which close() has already handled by this point).
+        transport = getattr(self.process, "_transport", None)
+        if transport is not None:
+            transport.close()
 
     async def request(
         self, method: str, params: dict[str, Any] | None = None, *, timeout: float = 300.0
@@ -135,8 +194,15 @@ class JsonRpcStdioPeer:
             self._pending.pop(request_id, None)
 
     async def _write_frame(self, message: dict[str, Any]) -> None:
-        self.process.stdin.write(json.dumps(message).encode("utf-8") + b"\n")
-        await self.process.stdin.drain()
+        try:
+            self.process.stdin.write(json.dumps(message).encode("utf-8") + b"\n")
+            await self.process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            # Exit evidence recorded before re-raising, so close() can hand
+            # the exit report off to the watcher even when the child has not
+            # been reaped yet.
+            self._stdin_write_failed = True
+            raise
 
     async def _drain_stderr(self) -> None:
         assert self.process and self.process.stderr
@@ -154,6 +220,71 @@ class JsonRpcStdioPeer:
                 continue
             if not line:
                 break
+            text = line.decode("utf-8", errors="replace").strip()
+            if text:
+                self._stderr_tail.append(text[:STDERR_TAIL_MAX_LINE_CHARS])
+
+    def stderr_tail(self) -> tuple[str, ...]:
+        return tuple(self._stderr_tail)
+
+    def exit_evidence(self) -> bool:
+        process = self.process
+        return (
+            (process is not None and process.returncode is not None)
+            or self._stdout_eof
+            or self._stdin_write_failed
+        )
+
+    async def _wait_for_exit(self) -> int | None:
+        # Process.wait() alone is not a reliable exit signal: its waiters are
+        # woken only after every pipe has disconnected, so a grandchild that
+        # inherited the child's stdio can postpone it long past the death.
+        # The returncode attribute is set at reap time, so poll it alongside.
+        assert self.process
+        process = self.process
+        wait_task = asyncio.ensure_future(process.wait())
+        try:
+            while True:
+                done, _pending = await asyncio.wait({wait_task}, timeout=EXIT_POLL_INTERVAL_SECONDS)
+                if done:
+                    return wait_task.result()
+                if process.returncode is not None:
+                    # Reaped, but held-open pipes keep wait() from resolving.
+                    return process.returncode
+        finally:
+            if not wait_task.done():
+                wait_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await wait_task
+
+    async def _watch_exit(self) -> None:
+        assert self.process
+        returncode = await self._wait_for_exit()
+        # Settle bound: let the pipe drains deliver a final buffered stdout
+        # response and the stderr written just before death, then cancel
+        # whatever is still pending -- a grandchild that inherited the child's
+        # pipes can hold EOF open indefinitely, and an evicted peer must not
+        # leak permanently-pending drain tasks.
+        drains = {task for task in (self._reader_task, self._stderr_task) if task is not None}
+        if drains:
+            _done, pending = await asyncio.wait(drains, timeout=EXIT_SETTLE_TIMEOUT_SECONDS)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.wait(pending)
+        # The child is gone: release the router-side pipe fds so an evicted
+        # peer retains no OS resources and a grandchild that inherited the
+        # child's stdin sees EOF instead of blocking forever.
+        self._close_pipe_transports()
+        if self._expected_exit or self.on_exit is None:
+            return
+        try:
+            self.on_exit(returncode, self.stderr_tail())
+        except Exception:
+            # The callback is observability plumbing; its failure must not
+            # kill the watcher task or propagate into a close() awaiting it.
+            LOGGER.warning("ACP exit callback failed")
+            LOGGER.debug("ACP exit callback failure details", exc_info=True)
 
     async def _read_loop(self) -> None:
         assert self.process and self.process.stdout
@@ -167,6 +298,9 @@ class JsonRpcStdioPeer:
                     )
                     continue
                 if not line:
+                    # Genuine EOF: exit evidence for close(), recorded before
+                    # the pending futures are failed in the finally below.
+                    self._stdout_eof = True
                     break
                 try:
                     payload = json.loads(line.decode("utf-8"))
@@ -246,12 +380,14 @@ class ACPProfile:
     agent_capabilities: dict[str, Any] = field(default_factory=dict)
     permission_policies: dict[str, StaticPermissionPolicy] = field(default_factory=dict)
     prompt_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    on_exit: ExitCallback | None = None
 
     async def start(self) -> None:
         command = self.command or default_hermes_command(self.profile)
         self.peer = JsonRpcStdioPeer(
             command,
             max_line_bytes=self.max_line_bytes,
+            on_exit=self._notify_exit,
             request_handlers={
                 "session/request_permission": self._request_permission,
                 "fs/read_text_file": self._unsupported_client_request,
@@ -300,6 +436,17 @@ class ACPProfile:
     async def close(self) -> None:
         if self.peer:
             await self.peer.close()
+
+    def _notify_exit(self, returncode: int | None, stderr_tail: tuple[str, ...]) -> None:
+        callback = self.on_exit
+        if callback is not None:
+            callback(returncode, stderr_tail)
+
+    def exit_suspected(self) -> bool:
+        """Best-effort synchronous check that the supervised child already
+        died (reaped returncode, stdout EOF, or a failed stdin write) --
+        usable before the exit watcher has had a chance to run."""
+        return self.peer is not None and self.peer.exit_evidence()
 
     async def new_session(self, cwd: Path) -> str:
         assert self.peer

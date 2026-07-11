@@ -9,6 +9,11 @@ from urllib.parse import unquote, urlparse
 
 
 next_session = 1
+# With --reject-unknown-resume the agent models an in-memory child that loses
+# session state on exit: session/resume succeeds only for ids created by THIS
+# process. Default behaviour (accept every resume) is unchanged.
+REJECT_UNKNOWN_RESUME = "--reject-unknown-resume" in sys.argv[1:]
+known_sessions: set[str] = set()
 
 
 def send(payload: dict) -> None:
@@ -42,9 +47,20 @@ for line in sys.stdin:
     elif method == "session/new":
         sid = f"session-{next_session}"
         next_session += 1
+        known_sessions.add(sid)
         send({"jsonrpc": "2.0", "id": request_id, "result": {"sessionId": sid}})
     elif method == "session/resume":
-        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+        sid = str(params.get("sessionId"))
+        if REJECT_UNKNOWN_RESUME and sid not in known_sessions:
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32000, "message": f"unknown session {sid}"},
+                }
+            )
+        else:
+            send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     elif method == "session/prompt":
         sid = params["sessionId"]
         prompt = params.get("prompt") or []
