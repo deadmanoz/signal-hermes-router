@@ -72,6 +72,7 @@ from .private_fs import (
     validate_path_component,
     write_private_bytes,
 )
+from .ratelimit import TokenBucket
 from .redaction import Redactor
 from .sessions import ProfileSupervisor, RoutedSession, SessionRegistry
 from .signal import SignalHttpClient
@@ -164,6 +165,8 @@ class SignalHermesRouter:
         self._last_failures: dict[str, tuple[int, FailureInfo]] = {}
         self._route_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._profile_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._inbound_rate_buckets: dict[str, TokenBucket] = {}
+        self._last_busy_notice_ms: dict[str, int] = {}
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self._nonce_factory = nonce_factory or (lambda: uuid.uuid4().hex)
         self._control_server: asyncio.Server | None = None
@@ -428,10 +431,23 @@ class SignalHermesRouter:
         lock = self._route_lock(route)
         async with lock:
             if self._is_empty_signal_event(event):
-                self._mark_empty_signal_turn_handled(turn)
+                self._mark_signal_turn_skipped(turn, reason="empty")
+                return None
+            # Early freshness check: an event that is already stale is
+            # discarded without waiting on the shared profile lock, so a
+            # backlog drain does not queue behind another route's long turn
+            # just to be thrown away.
+            if self._is_stale_signal_event(route, event):
+                self._mark_signal_turn_skipped(turn, reason="stale")
                 return None
             profile_lock = self._profile_lock(route.profile)
             async with profile_lock:
+                # Re-check freshness at the real admission point: routes can
+                # share a profile, so an event fresh at route-lock acquisition
+                # can age out waiting behind another route's turn.
+                if self._is_stale_signal_event(route, event):
+                    self._mark_signal_turn_skipped(turn, reason="stale")
+                    return None
                 outcome = await self._run_turn(turn)
         return outcome.result if outcome.status == TurnOutcomeStatus.DELIVERED else None
 
@@ -607,6 +623,8 @@ class SignalHermesRouter:
             claimed_dedupe.append((dedupe_sender_id, dedupe_timestamp))
 
         handled = False
+        rate_token_reserved = False
+        prompt_attempted = False
         try:
             self._maybe_clear_breaker_override(route)
             state = self.route_state_overrides.get(route.key, route.state)
@@ -639,6 +657,31 @@ class SignalHermesRouter:
                     route_state=state,
                     **self._synthetic_outcome_fields(turn),
                 )
+
+            # Rate admission for inbound Signal turns happens here: after the
+            # route-state gate (only active turns can prompt; shadow routes
+            # store media by design and stay uncapped) but before media
+            # storage and session acquisition, so over-limit turns shed
+            # before consuming attachment I/O or ACP session work. The token
+            # is refunded in the finally below if the turn fails before the
+            # prompt, keeping the cap a prompt cap.
+            if (
+                turn.origin == TurnOrigin.SIGNAL
+                and route.inbound_rate_limit is not None
+                and state == RouteState.ACTIVE
+            ):
+                if not self._reserve_inbound_rate_token(route):
+                    handled = True
+                    LOGGER.info(
+                        "discarding rate_limited Signal event for route %s",
+                        self.redactor.ref("route", route.key),
+                    )
+                    return TurnOutcome(
+                        TurnOutcomeStatus.SKIPPED,
+                        route_state=state,
+                        **self._synthetic_outcome_fields(turn),
+                    )
+                rate_token_reserved = True
 
             manifests: list[MediaManifest] = []
             if turn.signal_event is not None:
@@ -715,6 +758,7 @@ class SignalHermesRouter:
                 turn_done = asyncio.Event()
                 notice_task = asyncio.create_task(self._long_running_notice(route, turn_done))
                 try:
+                    prompt_attempted = True
                     result = await session.profile.prompt(session.session_id, blocks)
                     # Stop the busy-notice task immediately so it cannot fire
                     # while a long chunked reply is still being sent.
@@ -786,6 +830,11 @@ class SignalHermesRouter:
             finally:
                 self._cleanup_owned_outbound_attachments(frozen_attachments)
         finally:
+            if rate_token_reserved and not prompt_attempted:
+                # The turn was admitted but failed before the prompt (media
+                # storage, attachment freeze, or session acquisition), so it
+                # did not spend Hermes capacity; return the token.
+                self._refund_inbound_rate_token(route)
             if handled:
                 for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
                     self.dedupe.mark_handled(route.key, dedupe_sender_id, dedupe_timestamp)
@@ -929,7 +978,34 @@ class SignalHermesRouter:
     def _is_empty_signal_event(event: NormalizedEvent) -> bool:
         return not event.text.strip() and not event.attachments
 
-    def _mark_empty_signal_turn_handled(self, turn: RoutedTurnInput) -> None:
+    def _is_stale_signal_event(self, route: Route, event: NormalizedEvent) -> bool:
+        if route.max_event_age_seconds is None:
+            return False
+        if event.timestamp <= 0:
+            # The normalizer emits timestamp=0 for events with no envelope or
+            # data-message timestamp; an unknown timestamp bypasses the
+            # freshness policy rather than being treated as infinitely old.
+            return False
+        return self._clock_ms() - event.timestamp > route.max_event_age_seconds * 1000.0
+
+    def _reserve_inbound_rate_token(self, route: Route) -> bool:
+        bucket = self._inbound_rate_buckets.get(route.key)
+        if bucket is None:
+            limit = route.inbound_rate_limit
+            assert limit is not None
+            bucket = TokenBucket(
+                capacity=float(limit.max_turns),
+                refill_per_second=limit.max_turns / limit.window_seconds,
+            )
+            self._inbound_rate_buckets[route.key] = bucket
+        return bucket.try_acquire(self._clock_ms())
+
+    def _refund_inbound_rate_token(self, route: Route) -> None:
+        bucket = self._inbound_rate_buckets.get(route.key)
+        if bucket is not None:
+            bucket.refund()
+
+    def _mark_signal_turn_skipped(self, turn: RoutedTurnInput, *, reason: str) -> None:
         route = turn.route
         dedupe_identities = self._turn_dedupe_identities(turn)
         claimed_dedupe: list[tuple[str, int]] = []
@@ -942,7 +1018,8 @@ class SignalHermesRouter:
                 return
             claimed_dedupe.append((dedupe_sender_id, dedupe_timestamp))
         LOGGER.info(
-            "discarding empty Signal event for route %s",
+            "discarding %s Signal event for route %s",
+            reason,
             self.redactor.ref("route", route.key),
         )
         for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
@@ -1707,7 +1784,22 @@ class SignalHermesRouter:
             pass
         if turn_done.is_set():
             return
-        await self._send_once(route, self.config.router.busy_notice)
+        cooldown_seconds = self.config.router.busy_notice_cooldown_seconds
+        if cooldown_seconds > 0:
+            last_notice_ms = self._last_busy_notice_ms.get(route.key)
+            if (
+                last_notice_ms is not None
+                and self._clock_ms() - last_notice_ms < cooldown_seconds * 1000.0
+            ):
+                LOGGER.debug(
+                    "suppressing busy notice for route %s during cooldown",
+                    self.redactor.ref("route", route.key),
+                )
+                return
+        if await self._send_once(route, self.config.router.busy_notice):
+            # A failed send does not start a cooldown window, so the next slow
+            # turn retries the notice as before.
+            self._last_busy_notice_ms[route.key] = self._clock_ms()
 
     @staticmethod
     async def _stop_busy_notice(turn_done: asyncio.Event, notice_task: asyncio.Task[None]) -> None:

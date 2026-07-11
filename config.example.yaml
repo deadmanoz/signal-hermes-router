@@ -15,6 +15,9 @@ router:
   model_failure_reply: "The model service is temporarily unavailable, so I could not finish that request. Please try again later."
   busy_notice_after_seconds: 120
   busy_notice: "Still working on this."
+  # Minimum seconds between busy notices per route. 0 disables the cooldown:
+  # every slow turn sends its own notice.
+  busy_notice_cooldown_seconds: 0
   acp_prompt_timeout_seconds: 300
   acp_initialize_timeout_seconds: 30
   circuit_breaker:
