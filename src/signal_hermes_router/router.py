@@ -902,30 +902,28 @@ class SignalHermesRouter:
         route = turn.route
         dedupe_identities = self._turn_dedupe_identities(turn)
         claimed_dedupe: list[tuple[str, int]] = []
-        for dedupe_sender_id, dedupe_timestamp in dedupe_identities:
-            if not await self._run_io_worker(
-                partial(self.dedupe.claim, route.key, dedupe_sender_id, dedupe_timestamp)
-            ):
-                for claimed_sender_id, claimed_timestamp in claimed_dedupe:
-                    await self._run_io_worker(
-                        partial(
-                            self.dedupe.release, route.key, claimed_sender_id, claimed_timestamp
-                        )
-                    )
-                event_ref = f"{route.key}:{dedupe_sender_id}:{dedupe_timestamp}"
-                LOGGER.info("deduped routed turn %s", self.redactor.ref("event", event_ref))
-                return TurnOutcome(
-                    TurnOutcomeStatus.DEDUPED,
-                    route_state=self.route_state_overrides.get(route.key, route.state),
-                    **self._synthetic_outcome_fields(turn),
-                )
-            claimed_dedupe.append((dedupe_sender_id, dedupe_timestamp))
-
         handled = False
         rate_token_reserved = False
         prompt_attempted = False
         live_manifest_paths: list[Path] = []
         try:
+            # The claim loop runs inside the try so a cancellation delivered
+            # at these awaits still releases every already-claimed identity
+            # through the finally (handled is still False here); the deduped
+            # early return relies on the same release path.
+            for dedupe_sender_id, dedupe_timestamp in dedupe_identities:
+                if not await self._claim_dedupe_identity(
+                    route.key, dedupe_sender_id, dedupe_timestamp
+                ):
+                    event_ref = f"{route.key}:{dedupe_sender_id}:{dedupe_timestamp}"
+                    LOGGER.info("deduped routed turn %s", self.redactor.ref("event", event_ref))
+                    return TurnOutcome(
+                        TurnOutcomeStatus.DEDUPED,
+                        route_state=self.route_state_overrides.get(route.key, route.state),
+                        **self._synthetic_outcome_fields(turn),
+                    )
+                claimed_dedupe.append((dedupe_sender_id, dedupe_timestamp))
+
             self._maybe_clear_breaker_override(route)
             state = self.route_state_overrides.get(route.key, route.state)
             LOGGER.info("route %s in state %s", self.redactor.ref("route", route.key), state)
@@ -1153,18 +1151,7 @@ class SignalHermesRouter:
                 # storage, attachment freeze, or session acquisition), so it
                 # did not spend Hermes capacity; return the token.
                 self._refund_inbound_rate_token(route)
-            if handled:
-                for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
-                    await self._run_io_worker(
-                        partial(
-                            self.dedupe.mark_handled, route.key, dedupe_sender_id, dedupe_timestamp
-                        )
-                    )
-            else:
-                for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
-                    await self._run_io_worker(
-                        partial(self.dedupe.release, route.key, dedupe_sender_id, dedupe_timestamp)
-                    )
+            await self._finalize_dedupe_claims(route.key, claimed_dedupe, handled=handled)
 
     @staticmethod
     def _turn_dedupe_identities(turn: RoutedTurnInput) -> tuple[tuple[str, int], ...]:
@@ -1172,6 +1159,64 @@ class SignalHermesRouter:
         if turn.secondary_dedupe is not None:
             identities.append(turn.secondary_dedupe)
         return tuple(identities)
+
+    async def _claim_dedupe_identity(self, route_key: str, sender_id: str, timestamp: int) -> bool:
+        claim_future = self._dispatch_io_worker(
+            partial(self.dedupe.claim, route_key, sender_id, timestamp)
+        )
+        try:
+            return await self._await_io_worker(claim_future)
+        except asyncio.CancelledError:
+            # The abandoned worker may still commit the processing row after
+            # this coroutine unwinds, and the caller never saw the claim so
+            # its cleanup cannot release it. Hand the release to the worker's
+            # completion so the identity is not wedged until the next startup
+            # reclaim.
+            claim_future.add_done_callback(
+                partial(self._release_abandoned_claim, route_key, sender_id, timestamp)
+            )
+            raise
+
+    def _release_abandoned_claim(
+        self,
+        route_key: str,
+        sender_id: str,
+        timestamp: int,
+        future: asyncio.Future[bool],
+    ) -> None:
+        # Runs on the loop after an abandoned claim worker completed. Only a
+        # claim that actually committed (returned True) needs releasing.
+        if future.cancelled() or future.exception() is not None or not future.result():
+            return
+        with suppress(RuntimeError):
+            self._dispatch_io_worker(partial(self.dedupe.release, route_key, sender_id, timestamp))
+
+    async def _finalize_dedupe_claims(
+        self,
+        route_key: str,
+        claimed: Sequence[tuple[str, int]],
+        *,
+        handled: bool,
+    ) -> None:
+        if not claimed:
+            return
+        finalize = self.dedupe.mark_handled if handled else self.dedupe.release
+        futures = [
+            self._dispatch_io_worker(partial(finalize, route_key, sender_id, timestamp))
+            for sender_id, timestamp in claimed
+        ]
+        # Every finalizer is dispatched before any await, so a cancellation
+        # delivered during observation cannot leave a subset of the claimed
+        # identities unfinalized: the workers run to completion regardless
+        # and close() observes them.
+        interrupted = False
+        for future in futures:
+            try:
+                await self._await_io_worker(future)
+            except asyncio.CancelledError:
+                interrupted = True
+        if interrupted:
+            raise asyncio.CancelledError
 
     async def _turn_dedupe_has_status(self, turn: RoutedTurnInput, status: str) -> bool:
         for dedupe_sender_id, dedupe_timestamp in self._turn_dedupe_identities(turn):
@@ -1374,31 +1419,27 @@ class SignalHermesRouter:
 
     async def _mark_signal_turn_skipped(self, turn: RoutedTurnInput, *, reason: str) -> None:
         route = turn.route
-        dedupe_identities = self._turn_dedupe_identities(turn)
         claimed_dedupe: list[tuple[str, int]] = []
-        for dedupe_sender_id, dedupe_timestamp in dedupe_identities:
-            if not await self._run_io_worker(
-                partial(self.dedupe.claim, route.key, dedupe_sender_id, dedupe_timestamp)
-            ):
-                for claimed_sender_id, claimed_timestamp in claimed_dedupe:
-                    await self._run_io_worker(
-                        partial(
-                            self.dedupe.release, route.key, claimed_sender_id, claimed_timestamp
-                        )
-                    )
-                event_ref = f"{route.key}:{dedupe_sender_id}:{dedupe_timestamp}"
-                LOGGER.info("deduped routed turn %s", self.redactor.ref("event", event_ref))
-                return
-            claimed_dedupe.append((dedupe_sender_id, dedupe_timestamp))
-        LOGGER.info(
-            "discarding %s Signal event for route %s",
-            reason,
-            self.redactor.ref("route", route.key),
-        )
-        for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
-            await self._run_io_worker(
-                partial(self.dedupe.mark_handled, route.key, dedupe_sender_id, dedupe_timestamp)
+        marked = False
+        try:
+            for dedupe_sender_id, dedupe_timestamp in self._turn_dedupe_identities(turn):
+                if not await self._claim_dedupe_identity(
+                    route.key, dedupe_sender_id, dedupe_timestamp
+                ):
+                    event_ref = f"{route.key}:{dedupe_sender_id}:{dedupe_timestamp}"
+                    LOGGER.info("deduped routed turn %s", self.redactor.ref("event", event_ref))
+                    return
+                claimed_dedupe.append((dedupe_sender_id, dedupe_timestamp))
+            LOGGER.info(
+                "discarding %s Signal event for route %s",
+                reason,
+                self.redactor.ref("route", route.key),
             )
+            marked = True
+        finally:
+            # Marks handled on the success path; releases every claimed
+            # identity on the deduped early return and on cancellation.
+            await self._finalize_dedupe_claims(route.key, claimed_dedupe, handled=marked)
 
     def _synthetic_turn_input(
         self,

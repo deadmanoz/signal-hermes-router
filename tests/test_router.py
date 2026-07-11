@@ -2248,6 +2248,117 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotEqual(ident, loop_thread, name)
             await router.close(drain_timeout=0.0)
 
+    async def test_cancelled_claim_is_released_by_worker_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            loop_thread = threading.get_ident()
+            started = threading.Event()
+            release = threading.Event()
+
+            def gated_clock() -> int:
+                if threading.get_ident() != loop_thread:
+                    started.set()
+                    release.wait(timeout=30)
+                return int(time.time() * 1000)
+
+            harness = make_router_harness(
+                tmp,
+                dedupe=DedupeStore(clock_ms=gated_clock),
+                retention=RetentionConfig(dedupe_handled_seconds=None),
+            )
+            router = harness.router
+            route = router.config.routes[0]
+            event = make_event(timestamp=10, text="hello")
+            turn = asyncio.create_task(router.handle_event(event))
+            try:
+                async with asyncio.timeout(5):
+                    while not started.is_set():
+                        await asyncio.sleep(0.01)
+                # Cancel while the claim statement is mid-commit in its
+                # worker thread: the coroutine never records the claim.
+                turn.cancel()
+                with suppress(asyncio.CancelledError):
+                    await turn
+            finally:
+                release.set()
+            # The abandoned claim committed anyway; the worker's done
+            # callback releases it so the identity is not wedged as a
+            # duplicate until the next startup reclaim.
+            sender_id = router_module._routed_sender_id(route, event)
+            async with asyncio.timeout(5):
+                while router.dedupe.status(route.key, sender_id, 10) is not None:
+                    await asyncio.sleep(0.01)
+            await router.close(drain_timeout=0.0)
+
+    async def test_cancelled_finalization_still_marks_all_synthetic_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            loop_thread = threading.get_ident()
+            worker_clock_calls = {"count": 0}
+            started = threading.Event()
+            release = threading.Event()
+
+            def gated_clock() -> int:
+                if threading.get_ident() != loop_thread:
+                    worker_clock_calls["count"] += 1
+                    # Calls 1 and 2 are the two claims; call 3 is the first
+                    # mark_handled finalizer.
+                    if worker_clock_calls["count"] == 3:
+                        started.set()
+                        release.wait(timeout=30)
+                return int(time.time() * 1000)
+
+            route = Route(
+                platform="signal",
+                name="agenda-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(clock_ms=gated_clock),
+            )
+            job = router.config.find_synthetic_job("daily-agenda")
+            assert job is not None
+            task = asyncio.create_task(
+                router.handle_synthetic_job(
+                    "daily-agenda",
+                    scheduled_at=1000,
+                    idempotency_key="stable-fire",
+                )
+            )
+            try:
+                async with asyncio.timeout(5):
+                    while not started.is_set():
+                        await asyncio.sleep(0.01)
+                # Cancel while the first mark_handled finalizer is mid-commit:
+                # the second identity's finalizer was already dispatched, so
+                # it must still complete. The cancellation is recorded on the
+                # awaited outer future before the gate is released, so the
+                # observation loop sees it; releasing before awaiting the
+                # task lets the still-dispatched finalizers drain.
+                task.cancel()
+                release.set()
+                with suppress(asyncio.CancelledError):
+                    await task
+            finally:
+                release.set()
+            key_sender, key_timestamp = router._synthetic_dedupe_identity(
+                job.namespace,
+                scheduled_at=None,
+                idempotency_key="stable-fire",
+                triggered_at_ms=0,
+            )
+            async with asyncio.timeout(5):
+                while (
+                    router.dedupe.status(route.key, key_sender, key_timestamp) != "handled"
+                    or router.dedupe.status(route.key, job.namespace, 1000) != "handled"
+                ):
+                    await asyncio.sleep(0.01)
+            await router.close(drain_timeout=0.0)
+
     async def test_notify_route_processing_idempotency_skips_attachment_validation(
         self,
     ) -> None:
