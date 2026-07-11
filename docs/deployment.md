@@ -56,3 +56,57 @@ A router built before this lock existed releases its file locks between
 writes, so that enforcement cannot protect a mixed-version overlap: when
 upgrading from such a version, confirm the old process has exited before
 starting the new one.
+
+## Graceful Shutdown
+
+The serve process handles SIGTERM itself. The first SIGTERM fences new work
+(new control requests get a `busy` / `router_shutting_down` response and the
+control listener stops accepting), drains in-flight turns so they finish
+through the normal delivery path, then closes the Signal client, terminates
+each supervised Hermes subprocess gracefully (SIGTERM, a 5 second grace, then
+SIGKILL), removes the control socket file, and releases the exclusive state-DB
+lock before exiting 0. A second SIGTERM forces immediate exit for an operator
+who cannot wait out the drain.
+
+Shutdown is deadline-bounded by code constants, not configuration: up to 15
+seconds of graceful drain, up to 5 more seconds settling work that had to be
+cancelled at the drain deadline, and a supervisor-close phase that never gets
+less than 10 seconds so the per-child terminate grace is not cut short. Worst
+case is roughly 30 seconds; if any cleanup cannot settle even then, the
+process logs the incomplete cleanup and exits hard rather than hanging, so a
+stop never reaches systemd's `TimeoutStopSec` under the defaults.
+
+Turns interrupted at the hard deadline follow the crash semantics: an
+externally retried synthetic request with a stable idempotency key is
+at-least-once (the replacement router reclaims the orphaned claim and the
+retry delivers), but a Signal-origin turn abandoned at the deadline may be
+lost unless upstream `signal-cli` happens to replay the event - the router
+keeps no replay queue.
+
+This design assumes the service unit delivers the stop signal to the router
+process only, leaving the Hermes children alive for the router's own graceful
+drain and terminate sequence:
+
+- `KillMode=mixed` is required. The systemd default (`control-group`) sends
+  SIGTERM to every process in the cgroup at once, so Hermes children would be
+  signalled concurrently with the router and the drain-before-terminate
+  ordering cannot hold.
+- `TimeoutStopSec` must comfortably exceed the roughly 30 second worst-case
+  budget; the 90 second default qualifies. systemd's final SIGKILL sweep at
+  that timeout remains the backstop for an externally wedged process.
+
+### Shutdown smoke test
+
+After deploying, verify the graceful path on the real unit:
+
+1. Inspect the unit contract first:
+   `systemctl --user show <unit> -p KillMode -p TimeoutStopUSec` and confirm
+   `KillMode=mixed` and a stop timeout above the shutdown budget.
+2. With the router running and at least one route exercised, record the
+   supervised Hermes child PIDs (`systemctl --user status <unit>` shows the
+   control group).
+3. `systemctl --user restart <unit>`.
+4. Confirm the old child PIDs are gone, `journalctl --user -u <unit>` shows a
+   clean stop (no `SIGKILL` cleanup entries for the old main process or its
+   children), and the replacement router started and recreated its control
+   socket.

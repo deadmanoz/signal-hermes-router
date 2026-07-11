@@ -8,6 +8,8 @@ from contextlib import suppress
 from datetime import datetime, timezone
 import json
 import logging
+import os
+import signal
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +118,21 @@ async def _main_async(args: argparse.Namespace) -> int:
     raise ValueError(f"unknown command {args.command!r}")
 
 
+def _force_immediate_exit(loop: asyncio.AbstractEventLoop) -> None:
+    # Restore the default disposition and re-deliver SIGTERM so the process
+    # dies immediately and reports killed-by-SIGTERM to systemd.
+    loop.remove_signal_handler(signal.SIGTERM)
+    signal.raise_signal(signal.SIGTERM)
+
+
+def _hard_exit_after_incomplete_shutdown() -> None:
+    # asyncio.run's Runner ends by gathering every remaining task without a
+    # timeout; a shutdown-abandoned task could wedge that gather past
+    # systemd's stop timeout. Exiting hard keeps the stop bounded, and status
+    # 0 keeps `systemctl stop` clean.
+    os._exit(0)
+
+
 async def _run(config_path: Path, routes_path: Path) -> None:
     config = load_app_config(config_path, routes_path)
     route_counts = Counter(route.state.value for route in config.routes)
@@ -125,10 +142,46 @@ async def _run(config_path: Path, routes_path: Path) -> None:
         config.router.allow_remote_signal_base_url,
     )
     router = SignalHermesRouter(config)
+    loop = asyncio.get_running_loop()
+    serve_task = asyncio.current_task()
+    assert serve_task is not None
+    sigterm_requested = False
+
+    def _on_sigterm() -> None:
+        nonlocal sigterm_requested
+        if sigterm_requested:
+            logging.warning("second SIGTERM received; forcing immediate exit")
+            _force_immediate_exit(loop)
+            return
+        sigterm_requested = True
+        logging.info("SIGTERM received; shutting down gracefully")
+        router.begin_shutdown()
+        serve_task.cancel()
+
+    loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+    incomplete: tuple[asyncio.Task[Any], ...] = ()
     try:
-        await router.run_forever()
+        try:
+            await router.run_forever()
+        except asyncio.CancelledError:
+            # Only the SIGTERM-marked cancellation is ours to absorb; Runner's
+            # SIGINT cancel (and any external cancel) re-raises unchanged
+            # after close() runs in the finally below.
+            if not sigterm_requested:
+                raise
+            serve_task.uncancel()
+        finally:
+            incomplete = await router.close()
     finally:
-        await router.close()
+        # Removed only after close() completes so a second SIGTERM stays
+        # available as the escape hatch while the drain runs.
+        loop.remove_signal_handler(signal.SIGTERM)
+    if sigterm_requested and incomplete:
+        logging.error(
+            "shutdown cleanup incomplete (%d task(s)); forcing process exit",
+            len(incomplete),
+        )
+        _hard_exit_after_incomplete_shutdown()
 
 
 _CONTROL_SUCCESS_STATUSES = frozenset(

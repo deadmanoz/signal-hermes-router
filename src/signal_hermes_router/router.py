@@ -81,6 +81,15 @@ LOGGER = logging.getLogger(__name__)
 SYNTHETIC_DEDUPE_TIMESTAMP_SENTINEL = 0
 PREFLIGHT_PROFILE_LOCK_TIMEOUT_SECONDS = 0.0
 ATTACHMENT_ONLY_FALLBACK_TEXT = "Image attached."
+# Shutdown budget: graceful drain of in-flight work, then bounded settlement of
+# cancelled stragglers, then supervisor close (never below its floor so the ACP
+# peer's terminate grace is not cut short). Worst case is roughly
+# drain + settle + supervisor floor, well inside systemd's default 90s stop
+# timeout. These are code constants by design, not configuration.
+SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 15.0
+SHUTDOWN_SETTLE_TIMEOUT_SECONDS = 5.0
+SHUTDOWN_SUPERVISOR_FLOOR_SECONDS = 10.0
+SHUTDOWN_CLEANUP_CANCEL_GRACE_SECONDS = 1.0
 _MISSING = object()
 
 
@@ -153,51 +162,226 @@ class SignalHermesRouter:
         self._nonce_factory = nonce_factory or (lambda: uuid.uuid4().hex)
         self._control_server: asyncio.Server | None = None
         self._control_socket_path: Path | None = None
+        self._closing = False
+        self._shutdown_event = asyncio.Event()
+        self._signal_turn_tasks: set[asyncio.Task[Any]] = set()
+        self._control_client_tasks: set[asyncio.Task[None]] = set()
+        self._signal_events_task: asyncio.Task[None] | None = None
+        self._control_server_task: asyncio.Task[None] | None = None
 
     async def run_forever(self) -> None:
+        if self._closing:
+            raise RuntimeError("router is shutting down")
+        signal_events_task = asyncio.create_task(self._run_signal_events())
+        self._signal_events_task = signal_events_task
+        tasks = {signal_events_task}
         if self.config.router.control.enabled:
-            tasks = {
-                asyncio.create_task(self._run_signal_events()),
-                asyncio.create_task(self._run_control_server()),
-            }
-            try:
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for task in pending:
+            control_server_task = asyncio.create_task(self._run_control_server())
+            self._control_server_task = control_server_task
+            tasks.add(control_server_task)
+        try:
+            done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                if task.cancelled() and self._closing:
+                    # begin_shutdown() cancelled the consumer under a direct
+                    # close(); treat it as a clean shutdown, not a failure.
+                    continue
+                task.result()
+        finally:
+            # Request shutdown of the sibling lifecycle task(s) but do not
+            # gather them here: close() is the sole bounded settlement owner,
+            # so a resistant child can never wedge run_forever() teardown.
+            for task in tasks:
+                if not task.done():
                     task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await asyncio.gather(*pending)
-                for task in done:
-                    task.result()
-                return
-            finally:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await asyncio.gather(*tasks, return_exceptions=True)
-        await self._run_signal_events()
 
     async def _run_signal_events(self) -> None:
         async for raw in self.signal.events():
+            # Each accepted event runs as a tracked task awaited through
+            # shield: cancelling this consumer (SIGTERM/SIGINT teardown or
+            # begin_shutdown) does not abort the accepted turn, which close()
+            # then drains to normal delivery.
+            task = asyncio.create_task(self.handle_raw_event(raw))
+            self._signal_turn_tasks.add(task)
+            task.add_done_callback(self._settle_tracked_task)
             try:
-                await self.handle_raw_event(raw)
+                await asyncio.shield(task)
             except Exception as exc:
                 LOGGER.error("event handler crashed; continuing: %s", exc.__class__.__name__)
                 LOGGER.debug("event handler crash details", exc_info=True)
 
-    async def close(self) -> None:
-        await self._close_control_server()
-        await self.signal.close()
-        await self.supervisor.close()
-        # Every turn holds its route lock through dedupe finalization, so
-        # acquiring each known lock waits out in-flight turns before close()
-        # releases the store's exclusive state-DB lock. A replacement router
-        # starting on this DB therefore cannot reclaim a claim this process
-        # is still working.
-        for lock in list(self._route_locks.values()):
-            async with lock:
-                pass
-        self.dedupe.close()
+    def begin_shutdown(self) -> None:
+        """Synchronously fence new work: gate control lines, stop the control
+        listener, and cancel the Signal consumer. Idempotent; safe to call
+        from a signal handler callback before any teardown starts."""
+        self._closing = True
+        self._shutdown_event.set()
+        events_task = self._signal_events_task
+        if events_task is not None and not events_task.done():
+            events_task.cancel()
+        self._close_control_listener()
+
+    async def close(
+        self,
+        *,
+        drain_timeout: float = SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+    ) -> tuple[asyncio.Task[Any], ...]:
+        """Bounded, ordered shutdown. Returns the tasks whose cleanup did not
+        complete (empty on a clean shutdown); a still-pending entry means the
+        caller must not rely on the event loop reaching idle."""
+        drain_deadline = time.monotonic() + max(drain_timeout, 0.0)
+        settle_deadline = drain_deadline + SHUTDOWN_SETTLE_TIMEOUT_SECONDS
+        self.begin_shutdown()
+        incomplete: list[asyncio.Task[Any]] = []
+        try:
+            stragglers = await self._drain_tasks(
+                set(self._signal_turn_tasks), drain_deadline, "Signal turn"
+            )
+            # Every turn holds its route lock through dedupe finalization, so
+            # acquiring each known lock waits out in-flight turns before
+            # close() releases the store's exclusive state-DB lock — while the
+            # Signal client and supervisor are still open, so drained turns
+            # finish via the normal delivery path.
+            await self._drain_route_locks(drain_deadline)
+            stragglers |= await self._drain_tasks(
+                set(self._control_client_tasks), drain_deadline, "control client"
+            )
+            for task in (self._signal_events_task, self._control_server_task):
+                if task is not None and not task.done():
+                    task.cancel()
+                    stragglers.add(task)
+            incomplete += await self._settle_cancelled(stragglers, settle_deadline)
+            incomplete += await self._observe_cleanup(
+                self._wait_control_server_closed(),
+                settle_deadline,
+                "control server close",
+            )
+            incomplete += await self._observe_cleanup(
+                self.signal.close(), settle_deadline, "Signal client close"
+            )
+            supervisor_deadline = max(
+                settle_deadline,
+                time.monotonic() + SHUTDOWN_SUPERVISOR_FLOOR_SECONDS,
+            )
+            incomplete += await self._observe_cleanup(
+                self.supervisor.close(), supervisor_deadline, "supervisor close"
+            )
+        finally:
+            # Always release the exclusive state-DB lock, even if a cleanup
+            # step raised unexpectedly; abandoned tasks cannot write to a
+            # closed store, and the replacement router's startup reclaim
+            # recovers any orphaned processing claim.
+            self.dedupe.close()
+        return tuple(incomplete)
+
+    async def _drain_tasks(
+        self,
+        tasks: set[asyncio.Task[Any]],
+        deadline: float,
+        kind: str,
+    ) -> set[asyncio.Task[Any]]:
+        pending = {task for task in tasks if not task.done()}
+        if not pending:
+            return set()
+        timeout = max(0.0, deadline - time.monotonic())
+        _done, pending = await asyncio.wait(pending, timeout=timeout)
+        if pending:
+            LOGGER.warning(
+                "cancelling %d %s task(s) still running at the shutdown drain deadline",
+                len(pending),
+                kind,
+            )
+            for task in pending:
+                task.cancel()
+        return set(pending)
+
+    async def _settle_cancelled(
+        self,
+        tasks: set[asyncio.Task[Any]],
+        settle_deadline: float,
+    ) -> list[asyncio.Task[Any]]:
+        pending = {task for task in tasks if not task.done()}
+        if pending:
+            timeout = max(0.0, settle_deadline - time.monotonic())
+            _done, pending = await asyncio.wait(pending, timeout=timeout)
+        if pending:
+            LOGGER.error(
+                "abandoning %d task(s) that did not settle by the shutdown settlement deadline",
+                len(pending),
+            )
+        return list(pending)
+
+    async def _observe_cleanup(
+        self,
+        cleanup: Any,
+        deadline: float,
+        kind: str,
+    ) -> list[asyncio.Task[Any]]:
+        # asyncio.wait (unlike wait_for) does not block on cancellation
+        # settlement, so a cleanup step that resists cancellation is recorded
+        # as incomplete instead of wedging close() past its bound.
+        task: asyncio.Task[Any] = asyncio.ensure_future(cleanup)
+        timeout = max(0.0, deadline - time.monotonic())
+        _done, pending = await asyncio.wait({task}, timeout=timeout)
+        if pending:
+            LOGGER.error("%s did not finish by its shutdown deadline; cancelling", kind)
+            task.cancel()
+            _done, pending = await asyncio.wait(
+                {task}, timeout=SHUTDOWN_CLEANUP_CANCEL_GRACE_SECONDS
+            )
+        if pending:
+            LOGGER.error("%s resisted cancellation; abandoning", kind)
+            task.add_done_callback(self._settle_tracked_task)
+            return [task]
+        if task.cancelled():
+            LOGGER.error("%s was cancelled before completing; cleanup is incomplete", kind)
+            return [task]
+        exc = task.exception()
+        if exc is not None:
+            LOGGER.error("%s failed: %s", kind, self.redactor.redact(exc.__class__.__name__))
+            LOGGER.debug("%s failure details", kind, exc_info=exc)
+            return [task]
+        return []
+
+    def _settle_tracked_task(self, task: asyncio.Task[Any]) -> None:
+        self._signal_turn_tasks.discard(task)
+        self._control_client_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        # Retrieving the exception here silences the unretrieved-exception
+        # warning for tasks that finish after their awaiter stopped listening
+        # (shutdown races, abandoned stragglers). Outside shutdown the awaiter
+        # logs the failure itself, so keep this at debug there.
+        level = logging.WARNING if self._closing else logging.DEBUG
+        LOGGER.log(
+            level,
+            "tracked task failed while unobserved: %s",
+            self.redactor.redact(exc.__class__.__name__),
+        )
+        LOGGER.debug("tracked task failure details", exc_info=exc)
+
+    async def _drain_route_locks(self, deadline: float) -> None:
+        for key, lock in list(self._route_locks.items()):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if lock.locked():
+                    LOGGER.warning(
+                        "shutdown drain deadline reached with route %s still busy",
+                        self.redactor.ref("route", key),
+                    )
+                continue
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=remaining)
+            except TimeoutError:
+                LOGGER.warning(
+                    "shutdown drain timed out waiting for in-flight turn on route %s",
+                    self.redactor.ref("route", key),
+                )
+                continue
+            lock.release()
 
     async def handle_raw_event(self, raw: dict) -> TurnResult | None:
         probe = probe_signal_route(raw)
@@ -1163,23 +1347,62 @@ class SignalHermesRouter:
     async def _run_control_server(self) -> None:
         path = self.config.router.control_socket_path.expanduser()
         self._prepare_control_socket(path)
+        # start_serving=False so the server and socket path are published for
+        # begin_shutdown() before any connection can be accepted; the park on
+        # the shutdown event (never serve_forever, whose cancellation path
+        # embeds an unbounded wait_closed) keeps teardown synchronous here and
+        # leaves connection draining to close().
         server = await asyncio.start_unix_server(
-            self._handle_control_client,
+            self._accept_control_client,
             path=str(path),
             limit=self.config.router.control_request_line_limit_bytes,
+            start_serving=False,
         )
         self._control_server = server
         self._control_socket_path = path
         try:
-            path.chmod(0o600)
-        except OSError:
-            LOGGER.debug("control socket chmod unsupported for %s", path)
-        LOGGER.info("router control socket listening at %s", self.redactor.ref("socket", str(path)))
-        try:
-            async with server:
-                await server.serve_forever()
+            try:
+                path.chmod(0o600)
+            except OSError:
+                LOGGER.debug("control socket chmod unsupported for %s", path)
+            if not self._closing:
+                await server.start_serving()
+                LOGGER.info(
+                    "router control socket listening at %s",
+                    self.redactor.ref("socket", str(path)),
+                )
+                await self._shutdown_event.wait()
         finally:
-            await self._close_control_server()
+            self._close_control_listener()
+
+    def _accept_control_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        # Plain synchronous accept callback: the handler task is created and
+        # registered before this returns, so there is no accept-to-entry
+        # window where a live connection is unknown to the tracking set.
+        task = asyncio.get_running_loop().create_task(self._handle_control_client(reader, writer))
+        self._control_client_tasks.add(task)
+        task.add_done_callback(self._settle_tracked_task)
+
+    def _close_control_listener(self) -> None:
+        server = self._control_server
+        if server is not None:
+            server.close()
+        path = self._control_socket_path
+        if path is not None:
+            with suppress(FileNotFoundError):
+                path.unlink()
+
+    async def _wait_control_server_closed(self) -> None:
+        server = self._control_server
+        self._control_server = None
+        self._control_socket_path = None
+        if server is not None:
+            server.close()
+            await server.wait_closed()
 
     def _prepare_control_socket(self, path: Path) -> None:
         if path.parent == Path("."):
@@ -1250,6 +1473,14 @@ class SignalHermesRouter:
         return True
 
     async def _handle_control_line(self, line: bytes) -> dict[str, Any]:
+        if self._closing:
+            # Admission gate: busy is the success-class "retry later" status,
+            # so the caller's retry lands on the replacement router. Turns
+            # admitted before shutdown are unaffected; they drain via close().
+            return {
+                "status": TurnOutcomeStatus.BUSY.value,
+                "error": "router_shutting_down",
+            }
         try:
             payload = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1441,19 +1672,6 @@ class SignalHermesRouter:
             if fallback is None and route.state == RouteState.SHADOW:
                 fallback = route
         return fallback
-
-    async def _close_control_server(self) -> None:
-        server = self._control_server
-        self._control_server = None
-        if server is not None:
-            server.close()
-            with suppress(Exception):
-                await server.wait_closed()
-        path = self._control_socket_path
-        self._control_socket_path = None
-        if path is not None:
-            with suppress(FileNotFoundError):
-                path.unlink()
 
     def _maybe_clear_breaker_override(self, route: Route) -> None:
         if self.route_state_overrides.get(route.key) is not RouteState.MAINTENANCE:

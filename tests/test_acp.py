@@ -757,5 +757,77 @@ class SessionRegistryTests(unittest.TestCase):
                 registry._cwd("../../outside", "session-key")
 
 
+class PeerCloseCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_close_kills_process_when_cancelled_during_terminate_grace(self) -> None:
+        wait_gate = asyncio.Event()
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+                self.terminated = False
+                self.killed = False
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def kill(self) -> None:
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self) -> int | None:
+                await wait_gate.wait()
+                return self.returncode
+
+        peer = JsonRpcStdioPeer(["unused"])
+        process = FakeProcess()
+        peer.process = process  # type: ignore[assignment]
+
+        close_task = asyncio.create_task(peer.close())
+        for _ in range(10):
+            await asyncio.sleep(0)
+        self.assertTrue(process.terminated)
+        self.assertFalse(process.killed)
+
+        # Cancellation during the terminate grace must still kill the child:
+        # no exit path of close() may leave a running subprocess.
+        close_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await close_task
+        self.assertTrue(process.killed)
+
+    async def test_close_leaves_exited_process_alone_when_cancelled(self) -> None:
+        wait_gate = asyncio.Event()
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+                self.kill_calls = 0
+
+            def terminate(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+                self.returncode = -9
+
+            async def wait(self) -> int | None:
+                await wait_gate.wait()
+                return self.returncode
+
+        peer = JsonRpcStdioPeer(["unused"])
+        process = FakeProcess()
+        peer.process = process  # type: ignore[assignment]
+
+        close_task = asyncio.create_task(peer.close())
+        for _ in range(10):
+            await asyncio.sleep(0)
+        # The child exits on its own during the grace wait.
+        process.returncode = 0
+        close_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await close_task
+        self.assertEqual(process.kill_calls, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
