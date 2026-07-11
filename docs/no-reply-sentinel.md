@@ -36,6 +36,16 @@ collision-resistant contract that profiles can rely on across deployments.
   (`suppressing Signal reply for route_<ref>: profile emitted no-reply
   sentinel`) with the stable route ref, never the raw group ID or reply
   content.
+- **The busy notice is outside this contract.** The router-owned busy notice
+  (`router.busy_notice_after_seconds`) fires while the profile is still
+  generating, before the router can know the reply will be the sentinel. On a
+  deployment with busy notices enabled, a turn that runs past the threshold
+  and then ends in the sentinel will already have posted the configured
+  "still working" message; the sentinel suppresses only the turn's reply.
+  Operators who need strict silence on routes whose profiles use the sentinel
+  should set `busy_notice_after_seconds` at or above
+  `acp_prompt_timeout_seconds` so the notice can never fire before the turn
+  resolves.
 
 ## Profile adoption
 
