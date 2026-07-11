@@ -102,6 +102,8 @@ class Route:
     maintenance_reply: str | None = None
     failure_reply: str | None = None
     recreate_session_on_resume_failure: bool = False
+    session_max_turns: int | None = None
+    session_max_age_seconds: float | None = None
     max_event_age_seconds: float | None = None
     inbound_rate_limit: InboundRateLimitConfig | None = None
 
@@ -520,11 +522,31 @@ def parse_route(raw: dict[str, Any]) -> Route:
         max_event_age_seconds = _as_positive_finite_float(
             raw["max_event_age_seconds"], "route max_event_age_seconds"
         )
+    session_policy = SessionPolicy(raw.get("session_policy", SessionPolicy.PERSISTENT_ROUTE))
+    session_max_turns = None
+    if raw.get("session_max_turns") is not None:
+        session_max_turns = _as_strict_positive_int(
+            raw["session_max_turns"], "route session_max_turns"
+        )
+    session_max_age_seconds = None
+    if raw.get("session_max_age_seconds") is not None:
+        session_max_age_seconds = _as_positive_finite_float(
+            raw["session_max_age_seconds"], "route session_max_age_seconds"
+        )
+    if session_policy == SessionPolicy.EPHEMERAL and (
+        session_max_turns is not None or session_max_age_seconds is not None
+    ):
+        # Every ephemeral turn already gets a fresh session; accepting the
+        # rotation knobs there would be a silent no-op hiding an operator
+        # misconfiguration.
+        raise ValueError(
+            "session_max_turns/session_max_age_seconds require a persistent session_policy"
+        )
     return Route(
         platform=platform,
         name=normalize_safe_token(route_name, "route name") if route_name is not None else None,
         profile=normalize_profile_name(raw.get("profile")),
-        session_policy=SessionPolicy(raw.get("session_policy", SessionPolicy.PERSISTENT_ROUTE)),
+        session_policy=session_policy,
         state=RouteState(raw.get("state", RouteState.SHADOW)),
         chat_type=chat_type,
         group_id=group_id,
@@ -538,6 +560,8 @@ def parse_route(raw: dict[str, Any]) -> Route:
         recreate_session_on_resume_failure=_as_bool(
             raw.get("recreate_session_on_resume_failure", False)
         ),
+        session_max_turns=session_max_turns,
+        session_max_age_seconds=session_max_age_seconds,
         max_event_age_seconds=max_event_age_seconds,
         inbound_rate_limit=_parse_inbound_rate_limit(raw.get("inbound_rate_limit")),
     )

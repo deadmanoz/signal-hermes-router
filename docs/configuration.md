@@ -103,6 +103,18 @@ Hermes profile advertises `sessionCapabilities.resume`, the router will call
 route can opt into discarding that stale cached session and creating a fresh
 one by setting `recreate_session_on_resume_failure: true`.
 
+A persistent session otherwise lives forever, so conversation context
+accumulates turn after turn until the model backend fails on a busy route. A
+persistent route can bound this with session rotation via `session_max_turns`
+and/or `session_max_age_seconds`: when a cached session has served that many
+turns, or is older than that many seconds, the router drops it and the next
+turn starts a fresh session (`session/new`) on the same running Hermes
+subprocess. No restart, no resume; the rotation is logged as a content-free
+line carrying the hashed route reference. For `persistent_sender` routes the
+limits apply per cached `(route, sender)` session. A session that survives a
+subprocess restart through `session/resume` keeps its accumulated context, so
+its rotation budget carries over; a recreated session starts a new budget.
+
 ## Route schema
 
 Each entry in `routes.yaml` is parsed by `signal_hermes_router.config.parse_route`.
@@ -132,6 +144,13 @@ Required keys are listed first; optional keys carry their defaults.
   if `session/resume` raises after a Hermes subprocess restart. This does not
   change `ephemeral` routes, and it does not affect the existing fallback where
   Hermes returns "resume unsupported" and the router creates a fresh session.
+- `session_max_turns` (optional, default off) - integer >= 1. Rotate the
+  cached persistent session after it has served this many turns; the next
+  turn gets a fresh session without a subprocess restart. Rejected on
+  `ephemeral` routes. See [session policies](#session-policies).
+- `session_max_age_seconds` (optional, default off) - positive number of
+  seconds. Rotate the cached persistent session once it is at least this old.
+  Rejected on `ephemeral` routes. See [session policies](#session-policies).
 - `state` (optional, default `shadow`) - one of the [route state](#route-states)
   values.
 - `name` (optional) - stable private selector used by `scheduled_jobs` and
