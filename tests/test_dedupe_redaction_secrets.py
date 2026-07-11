@@ -359,9 +359,24 @@ class DedupeRetentionTests(unittest.TestCase):
             backup = Path(str(path) + MIGRATION_BACKUP_SUFFIX)
             self.assertTrue(backup.is_file())
             self.assertEqual(file_mode(backup), 0o600)
-            # The original store is recoverable and a later attempt migrates.
-            with DedupeStore(path, clock_ms=lambda: 1_000) as store:
+            # The original store is recoverable, a later attempt repairs the
+            # interrupted backfill (the row must not look ancient to the
+            # first sweep), and the retry keeps the original pre-migration
+            # backup instead of overwriting it with the half-migrated state.
+            retry_now_ms = 5_000_000
+            with DedupeStore(path, clock_ms=lambda: retry_now_ms) as store:
                 self.assertTrue(store.is_handled("signal:route", "uuid", 7))
+                self.assertEqual(store.prune_handled_before(retry_now_ms - 1), 0)
+                self.assertTrue(store.is_handled("signal:route", "uuid", 7))
+            backup_db = sqlite3.connect(backup)
+            try:
+                backup_columns = {
+                    str(row[1])
+                    for row in backup_db.execute("PRAGMA table_info(dedupe_events)").fetchall()
+                }
+            finally:
+                backup_db.close()
+            self.assertNotIn("updated_at_ms", backup_columns)
 
     def test_no_backup_written_when_schema_is_current(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

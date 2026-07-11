@@ -95,13 +95,24 @@ class DedupeStore:
             "PRIMARY KEY (route_key, source_uuid, timestamp))"
         )
         if columns and "updated_at_ms" not in columns:
-            # Backfill pre-migration rows with a fresh retention clock so
-            # they are not pruned on the first sweep. This deliberately
-            # covers idempotency-key identities whose event `timestamp` is
-            # the sentinel 0.
             self._db.execute(
                 "ALTER TABLE dedupe_events ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0"
             )
+        # Backfill any zero retention clock with "now" so pre-migration rows
+        # are not pruned on the first sweep. This deliberately covers
+        # idempotency-key identities whose event `timestamp` is the sentinel
+        # 0, and it runs on every startup (not only in the branch above) so
+        # a startup that failed between the ALTER and this UPDATE is
+        # repaired on retry instead of leaving rows that look ancient.
+        # Live rows never carry 0: claim/mark_handled always stamp the
+        # wall clock.
+        needs_backfill = (
+            self._db.execute(
+                "SELECT 1 FROM dedupe_events WHERE updated_at_ms = 0 LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+        if needs_backfill:
             self._db.execute(
                 "UPDATE dedupe_events SET updated_at_ms = ? WHERE updated_at_ms = 0",
                 (self._clock_ms(),),
@@ -137,6 +148,11 @@ class DedupeStore:
         if self.path == ":memory:":
             return
         backup_path = Path(self.path + MIGRATION_BACKUP_SUFFIX)
+        if backup_path.is_file() and backup_path.stat().st_size > 0:
+            # A retried migration must not overwrite the original
+            # pre-migration snapshot with a partially migrated state.
+            LOGGER.info("keeping existing dedupe state DB migration backup")
+            return
         ensure_private_file(backup_path)
         target = sqlite3.connect(backup_path)
         try:
