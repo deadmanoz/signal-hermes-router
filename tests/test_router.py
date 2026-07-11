@@ -43,6 +43,7 @@ from signal_hermes_router.models import (
     TurnOrigin,
     TurnOutcomeStatus,
 )
+from signal_hermes_router.outbound import NO_REPLY_SENTINEL
 from signal_hermes_router.payloads import canonicalize_notification_payload, encode_control_message
 from signal_hermes_router.permissions import StaticPermissionPolicy
 from signal_hermes_router.preflight import ToolSurface
@@ -4411,6 +4412,122 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(signal.sends, [])
             self.assertFalse(dedupe.claim("signal:group", "sender", 1))
+
+    async def test_sentinel_reply_suppresses_send_and_marks_handled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = NO_REPLY_SENTINEL
+            dedupe = DedupeStore()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="INFO") as logs:
+                result = await router.handle_event(make_event())
+
+            # The turn is delivered/recorded normally; only the send is skipped.
+            self.assertEqual(result, TurnResult(NO_REPLY_SENTINEL))
+            self.assertEqual(signal.sends, [])
+            self.assertEqual(dedupe.status("signal:group", "sender", 1), "handled")
+            suppression_lines = [
+                line for line in logs.output if "profile emitted no-reply sentinel" in line
+            ]
+            self.assertEqual(len(suppression_lines), 1)
+            # Redaction-safe: the raw route key must not appear in the line.
+            self.assertNotIn("signal:group", suppression_lines[0])
+
+    async def test_whitespace_padded_sentinel_reply_suppresses_send(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = f"  \n{NO_REPLY_SENTINEL}\t\n "
+            dedupe = DedupeStore()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+            )
+
+            await router.handle_event(make_event())
+
+            self.assertEqual(signal.sends, [])
+            self.assertEqual(dedupe.status("signal:group", "sender", 1), "handled")
+
+    async def test_reply_embedding_sentinel_is_delivered_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = f"Quiet day so far. {NO_REPLY_SENTINEL}"
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            result = await router.handle_event(make_event())
+
+            self.assertEqual(result, TurnResult(profile.reply_text))
+            self.assertEqual(signal.sends, [("group", profile.reply_text)])
+
+    async def test_notification_attachment_with_sentinel_reply_suppresses_whole_send(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = NO_REPLY_SENTINEL
+            app = make_synthetic_app(
+                tmp,
+                route,
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="camera-person",
+                        route_name="camera-route",
+                        prompt="Summarize the camera alert.",
+                    ),
+                ),
+            )
+            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            attachments = validate_outbound_attachments(
+                [str(image)],
+                media_root=app.router.media_root,
+                max_bytes=app.router.max_attachment_bytes,
+            )
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            outcome = await router.handle_notification(
+                "camera-person",
+                canonicalize_notification_payload({"camera": "front"}, max_bytes=1024),
+                outbound_attachments=attachments,
+            )
+
+            # Deliberate silence wins over the attachment-only fallback:
+            # neither text nor attachment is sent, and the frozen outbound
+            # copy is still cleaned up.
+            self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+            self.assertFalse(outcome.reply_sent)
+            self.assertEqual(signal.sends, [])
+            self.assertEqual(signal.send_attachments, [])
+            self.assertFalse((app.router.media_root / ".outbound").exists())
 
     async def test_unrouted_and_duplicate_events_do_not_call_backend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

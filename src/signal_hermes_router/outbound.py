@@ -4,6 +4,21 @@ from .config import Route
 
 TRUNCATED_REPLY_SUFFIX = "\n\n[truncated by signal-hermes-router]"
 
+# Documented no-reply contract (docs/no-reply-sentinel.md): a profile that
+# emits exactly this string as its whole reply deliberately stays silent and
+# the router suppresses the outbound Signal send. Code-controlled by design,
+# never config-driven, on the same principle as PROMPT_SAFE_CONTEXT_KEYS.
+NO_REPLY_SENTINEL = "[[signal-hermes-router:no-reply]]"
+
+
+def is_no_reply_sentinel(message: str) -> bool:
+    """True when the whole reply is the no-reply sentinel (whitespace allowed).
+
+    Strip-then-exact-equality keeps near-miss text (the sentinel embedded in a
+    longer reply) deliverable.
+    """
+    return message.strip() == NO_REPLY_SENTINEL
+
 
 def prepare_outgoing_message(route: Route, message: str, *, max_reply_chars: int) -> str:
     return _limit_reply_chars(_apply_canary_prefix(route, message), max_reply_chars)

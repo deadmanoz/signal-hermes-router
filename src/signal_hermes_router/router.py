@@ -54,7 +54,7 @@ from .models import (
     TurnOutcomeStatus,
     TurnResult,
 )
-from .outbound import chunk_for_signal_bytes, prepare_outgoing_message
+from .outbound import chunk_for_signal_bytes, is_no_reply_sentinel, prepare_outgoing_message
 from .outbound_media import (
     OutboundAttachmentError,
     signal_base_url_supports_local_attachment_paths,
@@ -943,7 +943,17 @@ class SignalHermesRouter:
                     # while a long chunked reply is still being sent.
                     await self._stop_busy_notice(turn_done, notice_task)
                     reply_text = result.text
-                    if frozen_attachments and not reply_text.strip():
+                    if is_no_reply_sentinel(reply_text):
+                        # Deliberate silence wins over the attachment-only
+                        # fallback: suppress the whole outbound send. The
+                        # frozen attachments stay bound to the cleanup in the
+                        # enclosing finally.
+                        LOGGER.info(
+                            "suppressing Signal reply for %s: profile emitted no-reply sentinel",
+                            self.redactor.ref("route", route.key),
+                        )
+                        reply_text = ""
+                    elif frozen_attachments and not reply_text.strip():
                         reply_text = ATTACHMENT_ONLY_FALLBACK_TEXT
                     if reply_text and not await self._send_once(
                         route,

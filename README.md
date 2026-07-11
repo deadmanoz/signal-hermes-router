@@ -141,6 +141,7 @@ that profile as busy instead of waiting behind the turn.
 - [docs/route-context.md](docs/route-context.md) - prompt-safe context keys, nonce delimiter, escaping
 - [docs/permissions.md](docs/permissions.md) - what the static ACP permission handler and permission preflight are (and aren't)
 - [docs/media.md](docs/media.md) - attachment storage layout, manifests, ACP content blocks
+- [docs/no-reply-sentinel.md](docs/no-reply-sentinel.md) - the whole-reply marker a profile emits to deliberately stay silent on a turn
 - [docs/scheduled-synthetic-events.md](docs/scheduled-synthetic-events.md) - router-owned scheduler and notification triggers through the local control socket
 - [docs/hermes-gateway-tradeoffs.md](docs/hermes-gateway-tradeoffs.md) - what you give up (and gain) versus the built-in Hermes Signal gateway
 - [docs/profile-audit-checklist.md](docs/profile-audit-checklist.md) - pre-activation checklist template (use a copy in the private deployment repo)
