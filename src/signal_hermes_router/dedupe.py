@@ -292,7 +292,13 @@ class DedupeStore:
             if self._close_requested and not self._closed:
                 # Deferred finalizer: close() handed the connection close to
                 # this sweep worker instead of blocking the event loop.
-                self._db.close()
+                # Acquire the statement lock first so a straggler dedupe
+                # write abandoned past the shutdown drain deadline can never
+                # race the connection close; only this worker thread blocks.
+                # Lock order _state_lock -> _lock is safe: no path acquires
+                # _state_lock while holding _lock.
+                with self._lock:
+                    self._db.close()
                 self._closed = True
 
     def close(self) -> bool:
