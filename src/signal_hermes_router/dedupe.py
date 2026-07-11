@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from pathlib import Path
 
-from .private_fs import ensure_private_dir, ensure_private_file
+from .private_fs import PRIVATE_FILE_MODE, ensure_private_dir, ensure_private_file
+
+LOGGER = logging.getLogger(__name__)
 
 
 class DedupeStore:
@@ -13,11 +16,31 @@ class DedupeStore:
         if self.path != ":memory:":
             db_path = Path(self.path)
             ensure_private_dir(db_path.parent)
-            ensure_private_file(db_path)
+            if db_path.is_file():
+                # Never reopen an existing DB outside sqlite: closing any
+                # descriptor for the inode drops this process's POSIX record
+                # locks, including a live store's exclusive lock. chmod
+                # enforces the private mode without opening the file.
+                db_path.chmod(PRIVATE_FILE_MODE)
+            elif not db_path.exists():
+                ensure_private_file(db_path)
+            # A non-regular existing path (for example a directory) is left
+            # untouched; sqlite3.connect below fails loudly on it.
         self._lock = threading.Lock()
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._closed = False
-        self._ensure_schema()
+        try:
+            # Hold the sqlite file lock for the connection's lifetime. The
+            # reclaim below assumes this process owns the state DB
+            # exclusively, so an overlapping router over the same file must
+            # fail loudly at startup instead of erasing this process's
+            # in-flight claims.
+            self._db.execute("PRAGMA locking_mode=EXCLUSIVE")
+            self._ensure_schema()
+            self._reclaim_orphaned_claims()
+        except BaseException:
+            self.close()
+            raise
 
     def _ensure_schema(self) -> None:
         columns = {
@@ -41,6 +64,18 @@ class DedupeStore:
                 "SELECT '', source_uuid, timestamp, 'handled' FROM dedupe_events_legacy_v1"
             )
         self._db.commit()
+
+    def _reclaim_orphaned_claims(self) -> None:
+        # No turn is in flight when the store is constructed (construction
+        # fails on the exclusive lock above if another live store owns the
+        # DB), so any persisted 'processing' claim was orphaned by a dead
+        # process and would otherwise dedupe its retries forever. This write
+        # also escalates the exclusive lock, so it is held from startup even
+        # when nothing is reclaimed.
+        cursor = self._db.execute("DELETE FROM dedupe_events WHERE status = 'processing'")
+        self._db.commit()
+        if cursor.rowcount > 0:
+            LOGGER.info("reclaimed %d orphaned processing dedupe claims", cursor.rowcount)
 
     def _legacy_table_exists(self) -> bool:
         cursor = self._db.execute(

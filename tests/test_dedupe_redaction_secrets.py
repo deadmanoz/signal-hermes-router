@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,12 @@ from signal_hermes_router.dedupe import DedupeStore
 from signal_hermes_router.redaction import Redactor
 from signal_hermes_router.secrets import resolve_secret_refs, resolve_secret_uri
 from tests.support import file_mode
+
+_REAL_SQLITE_CONNECT = sqlite3.connect
+
+
+def _impatient_connect(path: str, **kwargs: object) -> sqlite3.Connection:
+    return _REAL_SQLITE_CONNECT(path, timeout=0.2, **kwargs)  # type: ignore[arg-type]
 
 
 class DedupeTests(unittest.TestCase):
@@ -66,6 +73,74 @@ class DedupeTests(unittest.TestCase):
                 store.close()
             self.assertEqual(file_mode(path.parent), 0o700)
             self.assertEqual(file_mode(path), 0o600)
+
+    def test_live_store_locks_out_overlapping_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "router.db"
+            with DedupeStore(path) as store:
+                self.assertTrue(store.claim("signal:route", "in-flight-uuid", 1))
+                store.mark_handled("signal:route", "handled-uuid", 2)
+
+                with patch("signal_hermes_router.dedupe.sqlite3.connect", _impatient_connect):
+                    with self.assertRaises(sqlite3.OperationalError):
+                        DedupeStore(path)
+
+                self.assertEqual(store.status("signal:route", "in-flight-uuid", 1), "processing")
+                # The failed same-process overlap must not have dropped the
+                # live store's file locks: a separate process stays excluded.
+                probe = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sqlite3, sys\n"
+                        "db = sqlite3.connect(sys.argv[1], timeout=0.2)\n"
+                        "try:\n"
+                        "    db.execute(\"DELETE FROM dedupe_events WHERE status = 'processing'\")\n"
+                        "    db.commit()\n"
+                        "except sqlite3.OperationalError:\n"
+                        "    sys.exit(3)\n"
+                        "sys.exit(0)\n",
+                        str(path),
+                    ],
+                    capture_output=True,
+                )
+                self.assertEqual(probe.returncode, 3)
+                self.assertEqual(store.status("signal:route", "in-flight-uuid", 1), "processing")
+
+            with DedupeStore(path) as reopened:
+                self.assertTrue(reopened.is_handled("signal:route", "handled-uuid", 2))
+
+    def test_directory_state_db_fails_without_touching_its_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state-dir"
+            path.mkdir()
+            os.chmod(path, 0o755)
+
+            with self.assertRaises(sqlite3.OperationalError):
+                DedupeStore(path)
+
+            self.assertEqual(file_mode(path), 0o755)
+
+    def test_fresh_live_store_holds_lock_before_any_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "router.db"
+            with DedupeStore(path):
+                with patch("signal_hermes_router.dedupe.sqlite3.connect", _impatient_connect):
+                    with self.assertRaises(sqlite3.OperationalError):
+                        DedupeStore(path)
+
+    def test_fresh_store_reclaims_orphaned_processing_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "router.db"
+            crashed = DedupeStore(path)
+            self.assertTrue(crashed.claim("signal:route", "orphaned-uuid", 1))
+            crashed.mark_handled("signal:route", "handled-uuid", 2)
+            crashed.close()
+
+            with DedupeStore(path) as store:
+                self.assertIsNone(store.status("signal:route", "orphaned-uuid", 1))
+                self.assertTrue(store.claim("signal:route", "orphaned-uuid", 1))
+                self.assertTrue(store.is_handled("signal:route", "handled-uuid", 2))
 
     def test_file_backed_store_uses_private_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
