@@ -26,6 +26,7 @@ from .private_fs import ensure_private_dir_tree
 LOGGER = logging.getLogger(__name__)
 DEFAULT_MAX_ACP_LINE_BYTES = 8 * 1024 * 1024
 DEFAULT_ACP_PROMPT_TIMEOUT_SECONDS = 300.0
+DEFAULT_ACP_INITIALIZE_TIMEOUT_SECONDS = 30.0
 DEFAULT_ACP_TOOL_SURFACE_TIMEOUT_SECONDS = 30.0
 
 
@@ -232,6 +233,7 @@ class ACPProfile:
     peer: JsonRpcStdioPeer | None = None
     max_line_bytes: int | None = DEFAULT_MAX_ACP_LINE_BYTES
     prompt_timeout_seconds: float = DEFAULT_ACP_PROMPT_TIMEOUT_SECONDS
+    initialize_timeout_seconds: float = DEFAULT_ACP_INITIALIZE_TIMEOUT_SECONDS
     agent_capabilities: dict[str, Any] = field(default_factory=dict)
     permission_policies: dict[str, StaticPermissionPolicy] = field(default_factory=dict)
     prompt_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
@@ -264,8 +266,9 @@ class ACPProfile:
                         "terminal": False,
                     },
                 },
+                timeout=self.initialize_timeout_seconds,
             )
-        except BaseException:
+        except BaseException as exc:
             # peer.start() already spawned the subprocess and the reader /
             # stderr-drain tasks. If initialize fails (timeout, JSON-RPC
             # error, cancellation), we own those resources and must close
@@ -275,6 +278,13 @@ class ACPProfile:
             with suppress(Exception):
                 await self.peer.close()
             self.peer = None
+            if isinstance(exc, TimeoutError):
+                # A bare wait_for timeout has an empty message; name the
+                # handshake and the configured bound so classified failure
+                # detail is actionable.
+                raise TimeoutError(
+                    f"ACP initialize timed out after {self.initialize_timeout_seconds:g}s"
+                ) from exc
             raise
         self.agent_capabilities = result.get("agentCapabilities") or {}
 

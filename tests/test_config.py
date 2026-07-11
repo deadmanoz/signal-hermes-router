@@ -123,6 +123,7 @@ router:
                 "busy_notice_after_seconds": "3.5",
                 "busy_notice": "busy",
                 "acp_prompt_timeout_seconds": "450",
+                "acp_initialize_timeout_seconds": "20",
                 "circuit_breaker": {
                     "failures": "7",
                     "window_seconds": "9.5",
@@ -139,6 +140,7 @@ router:
         self.assertEqual(router.max_reply_chars, 2048)
         self.assertEqual(router.max_signal_message_bytes, 1500)
         self.assertEqual(router.acp_prompt_timeout_seconds, 450.0)
+        self.assertEqual(router.acp_initialize_timeout_seconds, 20.0)
         self.assertEqual(router.circuit_breaker.failures, 7)
         self.assertEqual(router.circuit_breaker.window_seconds, 9.5)
         self.assertEqual(router.circuit_breaker.recovery_seconds, 12.5)
@@ -148,10 +150,22 @@ router:
     def test_parse_router_config_defaults_acp_prompt_timeout_and_recovery(self) -> None:
         router = parse_router_config({})
         self.assertEqual(router.acp_prompt_timeout_seconds, 300.0)
+        self.assertEqual(router.acp_initialize_timeout_seconds, 30.0)
         self.assertEqual(router.circuit_breaker.recovery_seconds, 300.0)
         self.assertEqual(router.max_signal_message_bytes, 1900)
         self.assertFalse(router.control.enabled)
         self.assertEqual(router.control_socket_path, Path("./private/work") / "control.sock")
+
+    def test_parse_router_config_rejects_non_positive_or_non_finite_initialize_timeout(
+        self,
+    ) -> None:
+        for value in ("0", "-5", "nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "router.acp_initialize_timeout_seconds must be a positive finite number",
+                ):
+                    parse_router_config({"acp_initialize_timeout_seconds": value})
 
     def test_parse_router_config_reads_control_socket_settings(self) -> None:
         router = parse_router_config(

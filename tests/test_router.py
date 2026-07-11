@@ -173,11 +173,14 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_default_runtime_dependencies_can_be_constructed_and_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            router = SignalHermesRouter(make_app(tmp, RouteState.ACTIVE))
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, acp_initialize_timeout_seconds=17.5)
+            )
             try:
                 self.assertIsNotNone(router.signal)
                 self.assertIsNotNone(router.supervisor)
                 self.assertIsNotNone(router.dedupe)
+                self.assertEqual(router.supervisor.initialize_timeout_seconds, 17.5)
             finally:
                 await router.close()
 

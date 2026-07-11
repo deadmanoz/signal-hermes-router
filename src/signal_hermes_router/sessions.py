@@ -8,7 +8,12 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from .acp import ACPProfile, DEFAULT_ACP_PROMPT_TIMEOUT_SECONDS, DEFAULT_MAX_ACP_LINE_BYTES
+from .acp import (
+    ACPProfile,
+    DEFAULT_ACP_INITIALIZE_TIMEOUT_SECONDS,
+    DEFAULT_ACP_PROMPT_TIMEOUT_SECONDS,
+    DEFAULT_MAX_ACP_LINE_BYTES,
+)
 from .config import Route
 from .models import ChatType, NormalizedEvent, SessionKeyInput, SessionPolicy, SessionStatus
 from .permissions import StaticPermissionPolicy
@@ -34,12 +39,14 @@ class ProfileSupervisor:
         *,
         max_acp_line_bytes: int | None = DEFAULT_MAX_ACP_LINE_BYTES,
         prompt_timeout_seconds: float = DEFAULT_ACP_PROMPT_TIMEOUT_SECONDS,
+        initialize_timeout_seconds: float = DEFAULT_ACP_INITIALIZE_TIMEOUT_SECONDS,
         restart_cooldown_seconds: float = DEFAULT_RESTART_COOLDOWN_SECONDS,
     ) -> None:
         self.work_root = work_root
         self.command_template = command_template
         self.max_acp_line_bytes = max_acp_line_bytes
         self.prompt_timeout_seconds = prompt_timeout_seconds
+        self.initialize_timeout_seconds = initialize_timeout_seconds
         self.restart_cooldown_seconds = restart_cooldown_seconds
         self._profiles: dict[str, ACPProfile] = {}
         self._last_restart: dict[str, float] = {}
@@ -66,6 +73,7 @@ class ProfileSupervisor:
             command=command,
             max_line_bytes=self.max_acp_line_bytes,
             prompt_timeout_seconds=self.prompt_timeout_seconds,
+            initialize_timeout_seconds=self.initialize_timeout_seconds,
         )
         try:
             await profile.start()

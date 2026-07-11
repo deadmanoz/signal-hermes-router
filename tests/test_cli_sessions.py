@@ -1065,12 +1065,14 @@ class FakeManagedProfile:
         command: list[str] | None = None,
         max_line_bytes: int | None = None,
         prompt_timeout_seconds: float = 300.0,
+        initialize_timeout_seconds: float = 30.0,
     ) -> None:
         self.profile = profile
         self.work_root = work_root
         self.command = command
         self.max_line_bytes = max_line_bytes
         self.prompt_timeout_seconds = prompt_timeout_seconds
+        self.initialize_timeout_seconds = initialize_timeout_seconds
         self.started = False
         self.closed = False
         self.instances.append(self)
@@ -1139,9 +1141,27 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(first.started)
             self.assertEqual(first.command, ["hermes", "-p", "profile-a", "acp"])
             self.assertEqual(first.max_line_bytes, 8 * 1024 * 1024)
+            self.assertEqual(first.initialize_timeout_seconds, 30.0)
             self.assertTrue(first.closed)
             self.assertIsNot(replacement, first)
             self.assertTrue(replacement.closed)
+
+    async def test_profile_supervisor_threads_initialize_timeout_into_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            FakeManagedProfile.instances.clear()
+            route = make_route(profile="profile-a")
+            supervisor = ProfileSupervisor(
+                Path(tmp),
+                command_template=["hermes", "-p", "{profile}", "acp"],
+                initialize_timeout_seconds=7.5,
+                restart_cooldown_seconds=0,
+            )
+
+            with patch.object(sessions_module, "ACPProfile", FakeManagedProfile):
+                profile = await supervisor.get_profile(route)
+                await supervisor.close()
+
+            self.assertEqual(profile.initialize_timeout_seconds, 7.5)
 
     async def test_profile_supervisor_restart_does_not_block_immediate_replacement(
         self,
