@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.16](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.15...v0.1.16) (2026-07-11)
+
+
+### Bug Fixes
+
+* **dedupe:** reclaim orphaned processing claims at startup ([#35](https://github.com/deadmanoz/signal-hermes-router/issues/35)) ([12068d5](https://github.com/deadmanoz/signal-hermes-router/commit/12068d57912d1f67406d04d567ede048f4a6941a))
+
 ## [0.1.15](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.14...v0.1.15) (2026-07-10)
 
 
