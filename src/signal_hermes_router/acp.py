@@ -92,21 +92,30 @@ class JsonRpcStdioPeer:
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def close(self) -> None:
-        if self._reader_task:
-            self._reader_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._reader_task
-        if self._stderr_task:
-            self._stderr_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._stderr_task
-        if self.process and self.process.returncode is None:
-            self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=5)
-            except TimeoutError:
-                self.process.kill()
-                await self.process.wait()
+        try:
+            if self._reader_task:
+                self._reader_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._reader_task
+            if self._stderr_task:
+                self._stderr_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._stderr_task
+            if self.process and self.process.returncode is None:
+                self.process.terminate()
+                try:
+                    await asyncio.wait_for(self.process.wait(), timeout=5)
+                except TimeoutError:
+                    self.process.kill()
+                    await self.process.wait()
+        finally:
+            # Cancellation-safe backstop: no exit path of close() may leave a
+            # running subprocess (e.g. cancellation during the terminate
+            # grace). The kill is synchronous; reaping falls to the event
+            # loop's child watcher.
+            if self.process and self.process.returncode is None:
+                with suppress(ProcessLookupError):
+                    self.process.kill()
 
     async def request(
         self, method: str, params: dict[str, Any] | None = None, *, timeout: float = 300.0

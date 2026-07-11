@@ -97,9 +97,24 @@ class ProfileSupervisor:
         # call that re-spawns a fresh subprocess.
 
     async def close(self) -> None:
-        for profile in list(self._profiles.values()):
-            await profile.close()
+        profiles = list(self._profiles.values())
         self._profiles.clear()
+        if not profiles:
+            return
+        # Close concurrently so one slow profile cannot serialize the rest,
+        # and isolate failures so every profile is attempted. Failures are
+        # re-raised as an aggregate afterwards so the router's shutdown path
+        # reports the close as incomplete instead of silently succeeding.
+        results = await asyncio.gather(
+            *(profile.close() for profile in profiles),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        for failure in failures:
+            LOGGER.warning("Hermes profile close failed: %s", failure.__class__.__name__)
+            LOGGER.debug("Hermes profile close failure details", exc_info=failure)
+        if failures:
+            raise RuntimeError(f"{len(failures)} Hermes profile close call(s) failed")
 
 
 class SessionRegistry:

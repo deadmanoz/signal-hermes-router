@@ -4,15 +4,18 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
 from collections.abc import Sequence
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from signal_hermes_router.acp import JsonRpcError
 from signal_hermes_router.config import (
@@ -42,6 +45,7 @@ from signal_hermes_router.permissions import StaticPermissionPolicy
 from signal_hermes_router.preflight import ToolSurface
 from signal_hermes_router.private_fs import ensure_private_dir_tree, write_private_bytes
 from signal_hermes_router.router import SignalHermesRouter
+from signal_hermes_router.sessions import ProfileSupervisor
 from signal_hermes_router.outbound_media import (
     OutboundAttachmentError,
     validate_outbound_attachments,
@@ -251,6 +255,10 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
             await router.run_forever()
 
+            # run_forever only requests sibling shutdown; settlement is owned
+            # by close(). Let the loop deliver the cancellation.
+            for _ in range(10):
+                await asyncio.sleep(0)
             self.assertTrue(control_cancelled)
 
     async def test_run_forever_with_control_cancels_children_when_parent_is_cancelled(self) -> None:
@@ -309,6 +317,10 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
+            # run_forever only requests child shutdown; settlement is owned
+            # by close(). Let the loop deliver the cancellations.
+            for _ in range(10):
+                await asyncio.sleep(0)
             self.assertTrue(signal_cancelled)
             self.assertTrue(control_cancelled)
 
@@ -5376,6 +5388,737 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 await router.handle_event(make_event())
             self.assertEqual(profile.resumes, 1)
             self.assertEqual(profile.new_sessions, 2)
+
+
+class ClosedAwareSignal(FakeSignal):
+    """Fake Signal client whose send path fails once the client is closed,
+    mirroring the real transport during shutdown."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+    async def send_group(
+        self,
+        group_id: str,
+        message: str,
+        *,
+        attachments: Sequence[str] = (),
+    ) -> dict[str, int]:
+        if self.closed:
+            raise RuntimeError("signal client closed")
+        return await super().send_group(group_id, message, attachments=attachments)
+
+
+class GatedProfile(FakeProfile):
+    def __init__(self, started: asyncio.Event, gate: asyncio.Event) -> None:
+        super().__init__()
+        self._started = started
+        self._gate = gate
+
+    async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
+        self._started.set()
+        await self._gate.wait()
+        return await super().prompt(session_id, blocks)
+
+
+class FirstGatedProfile(FakeProfile):
+    def __init__(self, started: asyncio.Event, gate: asyncio.Event) -> None:
+        super().__init__()
+        self._started = started
+        self._gate = gate
+        self._first = True
+
+    async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
+        if self._first:
+            self._first = False
+            self._started.set()
+            await self._gate.wait()
+        return await super().prompt(session_id, blocks)
+
+
+def _shutdown_route() -> Route:
+    return Route(
+        platform="signal",
+        name="agenda-route",
+        group_id="group",
+        profile="profile",
+        session_policy=SessionPolicy.PERSISTENT_ROUTE,
+        state=RouteState.ACTIVE,
+        route_context={"purpose": "synthetic", "route_alias": "agenda-route"},
+    )
+
+
+def _notification_app(tmp: str, **kwargs: Any) -> AppConfig:
+    return make_synthetic_app(
+        tmp,
+        _shutdown_route(),
+        notifications=(
+            SyntheticRouteNotification(
+                id="backup-report",
+                route_name="agenda-route",
+                prompt="Summarize the notification payload.",
+            ),
+        ),
+        **kwargs,
+    )
+
+
+class ShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def _settle(self, rounds: int = 10) -> None:
+        for _ in range(rounds):
+            await asyncio.sleep(0)
+
+    async def test_close_drains_in_flight_turn_before_closing_dependencies(self) -> None:
+        started = asyncio.Event()
+        gate = asyncio.Event()
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = ClosedAwareSignal()
+            router = SignalHermesRouter(
+                _notification_app(tmp),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(GatedProfile(started, gate)),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            payload = canonicalize_notification_payload({"status": "ok"}, max_bytes=1024)
+            turn = asyncio.create_task(
+                router.handle_notification("backup-report", payload, idempotency_key="k-1")
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+
+            close_task = asyncio.create_task(router.close())
+            await self._settle()
+            self.assertFalse(close_task.done())
+
+            gate.set()
+            outcome = await asyncio.wait_for(turn, timeout=5)
+            incomplete = await asyncio.wait_for(close_task, timeout=5)
+
+            self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(signal.sends, [("group", "reply")])
+            self.assertEqual(incomplete, ())
+            self.assertTrue(signal.closed)
+
+    async def test_signal_origin_turn_survives_cancellation_and_close_drains_it(self) -> None:
+        started = asyncio.Event()
+        gate = asyncio.Event()
+
+        class StreamingSignal(ClosedAwareSignal):
+            async def events(self):
+                yield make_group_raw(text="hello", timestamp=42)
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = StreamingSignal()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(GatedProfile(started, gate)),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            run_task = asyncio.create_task(router.run_forever())
+            await asyncio.wait_for(started.wait(), timeout=1)
+
+            run_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await run_task
+
+            close_task = asyncio.create_task(router.close())
+            await self._settle()
+            self.assertFalse(close_task.done())
+
+            gate.set()
+            incomplete = await asyncio.wait_for(close_task, timeout=5)
+
+            self.assertEqual(incomplete, ())
+            self.assertEqual(signal.sends, [("group", "reply")])
+
+    async def test_direct_close_fences_signal_intake_and_run_forever_declines(self) -> None:
+        started = asyncio.Event()
+        gate = asyncio.Event()
+
+        class StreamingSignal(ClosedAwareSignal):
+            async def events(self):
+                yield make_group_raw(text="hello", timestamp=42)
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = StreamingSignal()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(GatedProfile(started, gate)),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            run_task = asyncio.create_task(router.run_forever())
+            await asyncio.wait_for(started.wait(), timeout=1)
+
+            close_task = asyncio.create_task(router.close())
+            # Direct close (no external cancellation) fences intake itself:
+            # run_forever returns cleanly instead of raising.
+            await asyncio.wait_for(run_task, timeout=5)
+            gate.set()
+            incomplete = await asyncio.wait_for(close_task, timeout=5)
+
+            self.assertEqual(incomplete, ())
+            self.assertEqual(signal.sends, [("group", "reply")])
+            with self.assertRaisesRegex(RuntimeError, "shutting down"):
+                await router.run_forever()
+
+    async def test_queued_turns_admitted_before_shutdown_complete(self) -> None:
+        started = asyncio.Event()
+        gate = asyncio.Event()
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = ClosedAwareSignal()
+            router = SignalHermesRouter(
+                _notification_app(tmp),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FirstGatedProfile(started, gate)),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            payload = canonicalize_notification_payload({"status": "ok"}, max_bytes=1024)
+            first = asyncio.create_task(
+                router.handle_notification("backup-report", payload, idempotency_key="k-1")
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+
+            # Unchanged pre-shutdown semantics: a zero-timeout waiter is busy.
+            busy = await router.handle_notification(
+                "backup-report", payload, idempotency_key="k-busy", route_lock_timeout=0
+            )
+            self.assertEqual(busy.status, TurnOutcomeStatus.BUSY)
+
+            queued_control = asyncio.create_task(
+                router.handle_notification(
+                    "backup-report", payload, idempotency_key="k-2", route_lock_timeout=30
+                )
+            )
+            queued_signal = asyncio.create_task(router.handle_event(make_event(timestamp=77)))
+            await self._settle()
+
+            router.begin_shutdown()
+            close_task = asyncio.create_task(router.close())
+            await self._settle()
+            self.assertFalse(close_task.done())
+
+            gate.set()
+            first_outcome = await asyncio.wait_for(first, timeout=5)
+            control_outcome = await asyncio.wait_for(queued_control, timeout=5)
+            signal_result = await asyncio.wait_for(queued_signal, timeout=5)
+            incomplete = await asyncio.wait_for(close_task, timeout=5)
+
+            self.assertEqual(first_outcome.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(control_outcome.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(signal_result, TurnResult("reply"))
+            self.assertEqual(incomplete, ())
+            self.assertEqual(len(signal.sends), 3)
+
+    async def test_control_socket_gate_drain_and_refused_new_connections(self) -> None:
+        started = asyncio.Event()
+        gate = asyncio.Event()
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "work" / "control" / "router.sock"
+            router = SignalHermesRouter(
+                _notification_app(
+                    tmp,
+                    control=RouterControlConfig(enabled=True, socket_path=socket_path),
+                ),
+                signal_client=ClosedAwareSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(GatedProfile(started, gate)),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            server_task = asyncio.create_task(router._run_control_server())
+            for _ in range(50):
+                if socket_path.exists():
+                    break
+                await asyncio.sleep(0.01)
+
+            reader_a, writer_a = await asyncio.open_unix_connection(str(socket_path))
+            reader_b, writer_b = await asyncio.open_unix_connection(str(socket_path))
+            try:
+                writer_a.write(
+                    encode_control_message(
+                        {
+                            "command": "notify_route",
+                            "notification_id": "backup-report",
+                            "payload": {"status": "ok"},
+                        }
+                    )
+                )
+                await writer_a.drain()
+                await asyncio.wait_for(started.wait(), timeout=1)
+
+                close_task = asyncio.create_task(router.close())
+                await self._settle()
+                self.assertFalse(close_task.done())
+
+                # A preconnected client's new request is gated with busy.
+                writer_b.write(
+                    encode_control_message({"command": "trigger_job", "job_id": "daily-agenda"})
+                )
+                await writer_b.drain()
+                response_b = json.loads(
+                    (await asyncio.wait_for(reader_b.readline(), timeout=5)).decode("utf-8")
+                )
+                self.assertEqual(response_b["status"], "busy")
+                self.assertEqual(response_b["error"], "router_shutting_down")
+
+                # Brand-new connections are refused: the listener is closed
+                # and the socket file removed.
+                with self.assertRaises(OSError):
+                    await asyncio.open_unix_connection(str(socket_path))
+
+                gate.set()
+                response_a = json.loads(
+                    (await asyncio.wait_for(reader_a.readline(), timeout=5)).decode("utf-8")
+                )
+                self.assertEqual(response_a["status"], "delivered")
+
+                writer_a.close()
+                writer_b.close()
+                incomplete = await asyncio.wait_for(close_task, timeout=10)
+                self.assertEqual(incomplete, ())
+                await asyncio.wait_for(server_task, timeout=5)
+                self.assertFalse(socket_path.exists())
+            finally:
+                for writer in (writer_a, writer_b):
+                    writer.close()
+                    with suppress(Exception):
+                        await writer.wait_closed()
+                gate.set()
+                if not server_task.done():
+                    server_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await server_task
+
+    async def test_close_drain_deadline_cancels_straggling_control_turn(self) -> None:
+        started = asyncio.Event()
+        gate = asyncio.Event()
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "work" / "control" / "router.sock"
+            dedupe_path = Path(tmp) / "dedupe.db"
+            router = SignalHermesRouter(
+                _notification_app(
+                    tmp,
+                    control=RouterControlConfig(enabled=True, socket_path=socket_path),
+                ),
+                signal_client=ClosedAwareSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(GatedProfile(started, gate)),  # type: ignore[arg-type]
+                dedupe=DedupeStore(dedupe_path),
+            )
+            server_task = asyncio.create_task(router._run_control_server())
+            for _ in range(50):
+                if socket_path.exists():
+                    break
+                await asyncio.sleep(0.01)
+
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
+            try:
+                writer.write(
+                    encode_control_message(
+                        {
+                            "command": "notify_route",
+                            "notification_id": "backup-report",
+                            "payload": {"status": "ok"},
+                        }
+                    )
+                )
+                await writer.drain()
+                await asyncio.wait_for(started.wait(), timeout=1)
+
+                incomplete = await asyncio.wait_for(router.close(drain_timeout=0.05), timeout=10)
+                self.assertEqual(incomplete, ())
+                # The cancelled handler closed the connection without a reply.
+                self.assertEqual(await asyncio.wait_for(reader.readline(), timeout=5), b"")
+                await asyncio.wait_for(server_task, timeout=5)
+            finally:
+                writer.close()
+                with suppress(Exception):
+                    await writer.wait_closed()
+                gate.set()
+                if not server_task.done():
+                    server_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await server_task
+
+            inspect = sqlite3.connect(dedupe_path)
+            try:
+                rows = inspect.execute("SELECT COUNT(*) FROM dedupe_events").fetchone()[0]
+            finally:
+                inspect.close()
+            self.assertEqual(rows, 0)
+
+    async def test_close_abandons_unsettleable_turn_and_still_closes_dedupe(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class ResistantProfile(FakeProfile):
+            async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
+                started.set()
+                while True:
+                    try:
+                        await release.wait()
+                        return await super().prompt(session_id, blocks)
+                    except asyncio.CancelledError:
+                        continue
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dedupe_path = Path(tmp) / "dedupe.db"
+            router = SignalHermesRouter(
+                _notification_app(tmp),
+                signal_client=ClosedAwareSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(ResistantProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(dedupe_path),
+            )
+            payload = canonicalize_notification_payload({"status": "ok"}, max_bytes=1024)
+            turn = asyncio.create_task(
+                router.handle_notification("backup-report", payload, idempotency_key="k-1")
+            )
+            router._signal_turn_tasks.add(turn)
+            turn.add_done_callback(router._settle_tracked_task)
+            await asyncio.wait_for(started.wait(), timeout=1)
+
+            try:
+                with (
+                    patch("signal_hermes_router.router.SHUTDOWN_SETTLE_TIMEOUT_SECONDS", 0.1),
+                    patch("signal_hermes_router.router.SHUTDOWN_SUPERVISOR_FLOOR_SECONDS", 0.1),
+                ):
+                    close_started = time.monotonic()
+                    incomplete = await asyncio.wait_for(
+                        router.close(drain_timeout=0.05), timeout=10
+                    )
+                    elapsed = time.monotonic() - close_started
+
+                self.assertEqual(incomplete, (turn,))
+                self.assertFalse(turn.done())
+                self.assertLess(elapsed, 5.0)
+                # The exclusive state-DB lock is released underneath the
+                # abandoned turn: a replacement store can open the same DB.
+                replacement = DedupeStore(dedupe_path)
+                replacement.close()
+            finally:
+                release.set()
+                with suppress(Exception):
+                    await asyncio.wait_for(turn, timeout=5)
+
+    async def test_close_reports_resistant_supervisor_close_incomplete(self) -> None:
+        release = asyncio.Event()
+
+        class ResistantSupervisor(FakeSupervisor):
+            async def close(self) -> None:
+                while True:
+                    try:
+                        await release.wait()
+                        return
+                    except asyncio.CancelledError:
+                        continue
+
+        with tempfile.TemporaryDirectory() as tmp:
+            router = SignalHermesRouter(
+                _notification_app(tmp),
+                signal_client=ClosedAwareSignal(),  # type: ignore[arg-type]
+                supervisor=ResistantSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            try:
+                with (
+                    patch("signal_hermes_router.router.SHUTDOWN_SETTLE_TIMEOUT_SECONDS", 0.1),
+                    patch("signal_hermes_router.router.SHUTDOWN_SUPERVISOR_FLOOR_SECONDS", 0.1),
+                    patch(
+                        "signal_hermes_router.router.SHUTDOWN_CLEANUP_CANCEL_GRACE_SECONDS",
+                        0.1,
+                    ),
+                ):
+                    incomplete = await asyncio.wait_for(
+                        router.close(drain_timeout=0.05), timeout=10
+                    )
+                self.assertEqual(len(incomplete), 1)
+                self.assertFalse(incomplete[0].done())
+            finally:
+                release.set()
+                for task in incomplete:
+                    with suppress(Exception):
+                        await asyncio.wait_for(task, timeout=5)
+
+    async def test_close_reports_cancelled_supervisor_close_incomplete(self) -> None:
+        class BlockedSupervisor(FakeSupervisor):
+            async def close(self) -> None:
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            router = SignalHermesRouter(
+                _notification_app(tmp),
+                signal_client=ClosedAwareSignal(),  # type: ignore[arg-type]
+                supervisor=BlockedSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            with (
+                patch("signal_hermes_router.router.SHUTDOWN_SETTLE_TIMEOUT_SECONDS", 0.1),
+                patch("signal_hermes_router.router.SHUTDOWN_SUPERVISOR_FLOOR_SECONDS", 0.1),
+            ):
+                incomplete = await asyncio.wait_for(router.close(drain_timeout=0.05), timeout=10)
+            self.assertEqual(len(incomplete), 1)
+            self.assertTrue(incomplete[0].cancelled())
+
+    async def test_close_runs_all_phases_and_closes_dedupe_when_cleanup_fails(self) -> None:
+        class FailingWaitClosedServer:
+            def close(self) -> None:
+                return None
+
+            async def wait_closed(self) -> None:
+                raise RuntimeError("wait_closed failed")
+
+        class FailingSignal(ClosedAwareSignal):
+            async def close(self) -> None:
+                raise RuntimeError("signal close failed")
+
+        class RecordingSupervisor(FakeSupervisor):
+            def __init__(self, profile: FakeProfile) -> None:
+                super().__init__(profile)
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dedupe_path = Path(tmp) / "dedupe.db"
+            supervisor = RecordingSupervisor(FakeProfile())
+            router = SignalHermesRouter(
+                _notification_app(tmp),
+                signal_client=FailingSignal(),  # type: ignore[arg-type]
+                supervisor=supervisor,  # type: ignore[arg-type]
+                dedupe=DedupeStore(dedupe_path),
+            )
+            router._control_server = FailingWaitClosedServer()  # type: ignore[assignment]
+            with self.assertLogs("signal_hermes_router.router", level="ERROR") as logs:
+                incomplete = await asyncio.wait_for(router.close(), timeout=10)
+
+            self.assertEqual(len(incomplete), 2)
+            self.assertTrue(supervisor.closed)
+            output = "\n".join(logs.output)
+            self.assertIn("control server close failed", output)
+            self.assertIn("Signal client close failed", output)
+            replacement = DedupeStore(dedupe_path)
+            replacement.close()
+
+    async def test_close_reports_failed_supervisor_close_incomplete(self) -> None:
+        class FailingSupervisor(FakeSupervisor):
+            async def close(self) -> None:
+                raise RuntimeError("profile close failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            router = SignalHermesRouter(
+                _notification_app(tmp),
+                signal_client=ClosedAwareSignal(),  # type: ignore[arg-type]
+                supervisor=FailingSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                incomplete = await asyncio.wait_for(router.close(), timeout=10)
+            self.assertEqual(len(incomplete), 1)
+
+    async def test_close_bounds_resistant_server_and_signal_cleanup(self) -> None:
+        release = asyncio.Event()
+
+        class ResistantWaitClosedServer:
+            def close(self) -> None:
+                return None
+
+            async def wait_closed(self) -> None:
+                while True:
+                    try:
+                        await release.wait()
+                        return
+                    except asyncio.CancelledError:
+                        continue
+
+        class ResistantSignal(ClosedAwareSignal):
+            async def close(self) -> None:
+                while True:
+                    try:
+                        await release.wait()
+                        return
+                    except asyncio.CancelledError:
+                        continue
+
+        with tempfile.TemporaryDirectory() as tmp:
+            router = SignalHermesRouter(
+                _notification_app(tmp),
+                signal_client=ResistantSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            router._control_server = ResistantWaitClosedServer()  # type: ignore[assignment]
+            incomplete: tuple[asyncio.Task[Any], ...] = ()
+            try:
+                with (
+                    patch("signal_hermes_router.router.SHUTDOWN_SETTLE_TIMEOUT_SECONDS", 0.1),
+                    patch("signal_hermes_router.router.SHUTDOWN_SUPERVISOR_FLOOR_SECONDS", 0.1),
+                    patch(
+                        "signal_hermes_router.router.SHUTDOWN_CLEANUP_CANCEL_GRACE_SECONDS",
+                        0.1,
+                    ),
+                ):
+                    close_started = time.monotonic()
+                    incomplete = await asyncio.wait_for(
+                        router.close(drain_timeout=0.05), timeout=10
+                    )
+                    elapsed = time.monotonic() - close_started
+                self.assertEqual(len(incomplete), 2)
+                self.assertLess(elapsed, 5.0)
+            finally:
+                release.set()
+                for task in incomplete:
+                    with suppress(Exception):
+                        await asyncio.wait_for(task, timeout=5)
+
+    async def test_accept_callback_registers_handler_task_synchronously(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            router = SignalHermesRouter(
+                _notification_app(tmp),
+                signal_client=ClosedAwareSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            reader = asyncio.StreamReader()
+            writer = Mock()
+            writer.close = Mock()
+            writer.wait_closed = AsyncMock()
+
+            router._accept_control_client(reader, writer)
+
+            # Registered before any event-loop yield: entry-time registration
+            # would leave the set empty here.
+            self.assertEqual(len(router._control_client_tasks), 1)
+            task = next(iter(router._control_client_tasks))
+            reader.feed_eof()
+            await asyncio.wait_for(task, timeout=5)
+            self.assertEqual(len(router._control_client_tasks), 0)
+
+    async def test_control_server_startup_window_and_direct_close_unpark(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "work" / "control" / "router.sock"
+            router = SignalHermesRouter(
+                _notification_app(
+                    tmp,
+                    control=RouterControlConfig(enabled=True, socket_path=socket_path),
+                ),
+                signal_client=ClosedAwareSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            # Shutdown before startup: the server task must not serve and must
+            # clean up the socket it bound.
+            router.begin_shutdown()
+            await asyncio.wait_for(router._run_control_server(), timeout=5)
+            self.assertFalse(socket_path.exists())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "work" / "control" / "router.sock"
+            router = SignalHermesRouter(
+                _notification_app(
+                    tmp,
+                    control=RouterControlConfig(enabled=True, socket_path=socket_path),
+                ),
+                signal_client=ClosedAwareSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            server_task = asyncio.create_task(router._run_control_server())
+            for _ in range(50):
+                if socket_path.exists():
+                    break
+                await asyncio.sleep(0.01)
+
+            # A direct close() unparks the server task without cancellation.
+            incomplete = await asyncio.wait_for(router.close(), timeout=10)
+            self.assertEqual(incomplete, ())
+            await asyncio.wait_for(server_task, timeout=5)
+            self.assertFalse(server_task.cancelled())
+            self.assertFalse(socket_path.exists())
+
+    async def test_close_terminates_acp_child_gracefully(self) -> None:
+        script = Path(__file__).parent / "fixtures" / "fake_acp_agent_graceful_shutdown.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "marker.txt"
+            supervisor = ProfileSupervisor(
+                Path(tmp) / "work",
+                command_template=[sys.executable, str(script), str(marker)],
+            )
+            router = SignalHermesRouter(
+                _notification_app(tmp),
+                signal_client=ClosedAwareSignal(),  # type: ignore[arg-type]
+                supervisor=supervisor,
+                dedupe=DedupeStore(),
+            )
+            profile = await supervisor.get_profile(router.config.routes[0])
+            assert profile.peer is not None
+            process = profile.peer.process
+            assert process is not None
+            try:
+                incomplete = await asyncio.wait_for(router.close(), timeout=30)
+                self.assertEqual(incomplete, ())
+                # Graceful SIGTERM within the terminate grace, not SIGKILL:
+                # the fixture's handler ran, reaped its child, and exited 0.
+                self.assertEqual(process.returncode, 0)
+                self.assertEqual(
+                    marker.read_text(encoding="utf-8").strip(),
+                    "child_returncode=-15",
+                )
+            finally:
+                if process.returncode is None:
+                    with suppress(ProcessLookupError):
+                        process.kill()
+                childpid_path = marker.with_suffix(".childpid")
+                if childpid_path.exists():
+                    with suppress(ProcessLookupError, ValueError):
+                        os.kill(int(childpid_path.read_text(encoding="utf-8")), 9)
+
+    async def test_supervisor_close_is_concurrent_and_isolates_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            supervisor = ProfileSupervisor(Path(tmp))
+            second_started = asyncio.Event()
+
+            class WaitsForSibling:
+                async def close(self) -> None:
+                    # Serial closing (first-in-dict first) would deadlock here
+                    # and trip the timeout.
+                    await asyncio.wait_for(second_started.wait(), timeout=1)
+
+            class SignalsSibling:
+                async def close(self) -> None:
+                    second_started.set()
+
+            supervisor._profiles = {
+                "a": WaitsForSibling(),  # type: ignore[dict-item]
+                "b": SignalsSibling(),  # type: ignore[dict-item]
+            }
+            await asyncio.wait_for(supervisor.close(), timeout=5)
+            self.assertEqual(supervisor._profiles, {})
+
+            supervisor = ProfileSupervisor(Path(tmp))
+            closed: list[str] = []
+
+            class FailingClose:
+                async def close(self) -> None:
+                    raise RuntimeError("boom")
+
+            class RecordingClose:
+                async def close(self) -> None:
+                    closed.append("b")
+
+            supervisor._profiles = {
+                "a": FailingClose(),  # type: ignore[dict-item]
+                "b": RecordingClose(),  # type: ignore[dict-item]
+            }
+            with self.assertLogs("signal_hermes_router.sessions", level="WARNING"):
+                with self.assertRaisesRegex(RuntimeError, "1 Hermes profile close"):
+                    await asyncio.wait_for(supervisor.close(), timeout=5)
+            self.assertEqual(closed, ["b"])
+            self.assertEqual(supervisor._profiles, {})
 
 
 if __name__ == "__main__":

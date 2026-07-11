@@ -4,7 +4,13 @@ import asyncio
 import argparse
 import logging
 import json
+import os
+import signal
+import socket
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -1345,6 +1351,226 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(replacement.session_id, "session-1")
             self.assertNotIn(registry._session_key(route, event), registry._sessions)
             self.assertNotIn("private-profile", "\n".join(logs.output))
+
+
+class _FakeServeRouter:
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.started = asyncio.Event()
+        self.close_started = asyncio.Event()
+        self.close_release: asyncio.Event | None = None
+        self.close_result: tuple = ()
+        self.begin_shutdown_calls = 0
+        self.closed = False
+
+    def begin_shutdown(self) -> None:
+        self.begin_shutdown_calls += 1
+
+    async def run_forever(self) -> None:
+        self.started.set()
+        await asyncio.Event().wait()
+
+    async def close(self) -> tuple:
+        self.close_started.set()
+        if self.close_release is not None:
+            await self.close_release.wait()
+        self.closed = True
+        return self.close_result
+
+
+def _serve_app(tmp: str) -> AppConfig:
+    return AppConfig(
+        router=RouterConfig(
+            signal_base_url="http://signal.test",
+            work_root=Path(tmp) / "work",
+        ),
+        routes=(make_route(),),
+    )
+
+
+class ServeShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def _start_run(self, tmp: str) -> tuple[asyncio.Task, list[_FakeServeRouter]]:
+        instances: list[_FakeServeRouter] = []
+
+        def make_router(config: AppConfig) -> _FakeServeRouter:
+            router = _FakeServeRouter(config)
+            instances.append(router)
+            return router
+
+        patcher_config = patch.object(cli_module, "load_app_config", return_value=_serve_app(tmp))
+        patcher_router = patch.object(cli_module, "SignalHermesRouter", make_router)
+        patcher_config.start()
+        patcher_router.start()
+        self.addCleanup(patcher_config.stop)
+        self.addCleanup(patcher_router.stop)
+        task = asyncio.create_task(cli_module._run(Path("config.yaml"), Path("routes.yaml")))
+        for _ in range(100):
+            if instances:
+                break
+            await asyncio.sleep(0)
+        return task, instances
+
+    async def test_sigterm_triggers_graceful_shutdown_and_clean_return(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task, instances = await self._start_run(tmp)
+            await asyncio.wait_for(instances[0].started.wait(), timeout=2)
+
+            signal.raise_signal(signal.SIGTERM)
+
+            await asyncio.wait_for(task, timeout=5)
+            router = instances[0]
+            self.assertEqual(router.begin_shutdown_calls, 1)
+            self.assertTrue(router.closed)
+            # The handler was deregistered after close() completed.
+            loop = asyncio.get_running_loop()
+            self.assertFalse(loop.remove_signal_handler(signal.SIGTERM))
+
+    async def test_non_sigterm_cancellation_reraises_after_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task, instances = await self._start_run(tmp)
+            await asyncio.wait_for(instances[0].started.wait(), timeout=2)
+
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            router = instances[0]
+            self.assertTrue(router.closed)
+            self.assertEqual(router.begin_shutdown_calls, 0)
+            loop = asyncio.get_running_loop()
+            self.assertFalse(loop.remove_signal_handler(signal.SIGTERM))
+
+    async def test_second_sigterm_forces_immediate_exit_during_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(cli_module, "_force_immediate_exit") as force_exit:
+                task, instances = await self._start_run(tmp)
+                router_holder: list[_FakeServeRouter] = instances
+                await asyncio.wait_for(instances[0].started.wait(), timeout=2)
+                router = router_holder[0]
+                router.close_release = asyncio.Event()
+
+                signal.raise_signal(signal.SIGTERM)
+                await asyncio.wait_for(router.close_started.wait(), timeout=2)
+
+                signal.raise_signal(signal.SIGTERM)
+                for _ in range(100):
+                    if force_exit.called:
+                        break
+                    await asyncio.sleep(0.01)
+                force_exit.assert_called_once()
+
+                router.close_release.set()
+                await asyncio.wait_for(task, timeout=5)
+
+    async def test_hard_exit_when_shutdown_cleanup_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pending = asyncio.create_task(asyncio.Event().wait())
+            self.addCleanup(pending.cancel)
+            with patch.object(cli_module, "_hard_exit_after_incomplete_shutdown") as hard_exit:
+                task, instances = await self._start_run(tmp)
+                await asyncio.wait_for(instances[0].started.wait(), timeout=2)
+                instances[0].close_result = (pending,)
+
+                signal.raise_signal(signal.SIGTERM)
+                await asyncio.wait_for(task, timeout=5)
+                hard_exit.assert_called_once()
+
+
+class ServeSubprocessTests(unittest.TestCase):
+    def test_serve_subprocess_sigterm_exits_zero_within_bound(self) -> None:
+        src_root = Path(__file__).resolve().parent.parent / "src"
+        with tempfile.TemporaryDirectory() as tmp:
+            work_root = Path(tmp) / "work"
+            socket_path = work_root / "control.sock"
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "router:",
+                        "  signal:",
+                        # Unreachable local port: the SSE client keeps
+                        # reconnecting, so serve stays up without a daemon.
+                        '    base_url: "http://127.0.0.1:9"',
+                        f'  state_db: "{tmp}/state.db"',
+                        f'  media_root: "{tmp}/media"',
+                        f'  signal_attachment_root: "{tmp}/attachments"',
+                        f'  work_root: "{work_root}"',
+                        "  control:",
+                        "    enabled: true",
+                        f'    socket_path: "{socket_path}"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                "\n".join(
+                    [
+                        "routes:",
+                        '  - platform: "signal"',
+                        '    name: "r1"',
+                        '    group_id: "group"',
+                        '    profile: "profile"',
+                        '    session_policy: "persistent_route"',
+                        '    state: "shadow"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            env = dict(os.environ)
+            env["PYTHONPATH"] = str(src_root)
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "signal_hermes_router.cli",
+                    "--config",
+                    str(config_path),
+                    "--routes",
+                    str(routes_path),
+                    "serve",
+                ],
+                env=env,
+                cwd=tmp,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            try:
+                ready = False
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    if proc.poll() is not None:
+                        break
+                    if socket_path.exists():
+                        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                        try:
+                            probe.settimeout(0.2)
+                            probe.connect(str(socket_path))
+                            ready = True
+                            break
+                        except OSError:
+                            pass
+                        finally:
+                            probe.close()
+                    time.sleep(0.05)
+                if not ready:
+                    output = proc.stdout.read() if proc.stdout else ""
+                    self.fail(f"serve did not become ready: rc={proc.poll()} output={output!r}")
+
+                proc.send_signal(signal.SIGTERM)
+                # The documented service-level bound is ~30s worst case; an
+                # idle shutdown must come in far below it.
+                returncode = proc.wait(timeout=40)
+                self.assertEqual(returncode, 0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=10)
+                if proc.stdout is not None:
+                    proc.stdout.close()
 
 
 if __name__ == "__main__":
