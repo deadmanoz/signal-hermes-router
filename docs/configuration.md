@@ -149,6 +149,11 @@ Required keys are listed first; optional keys carry their defaults.
 - `maintenance_reply` (optional) - per-route override for
   `router.maintenance_reply` (see [Operational reply strings](#operational-reply-strings)).
 - `failure_reply` (optional) - per-route override for `router.failure_reply`.
+- `max_event_age_seconds` (optional, default off) - positive number of
+  seconds. See [Inbound burst policy](#inbound-burst-policy).
+- `inbound_rate_limit` (optional, default off) - mapping with exactly two
+  keys, `max_turns` (integer >= 1) and `window_seconds` (positive number).
+  See [Inbound burst policy](#inbound-burst-policy).
 
 For group routes, `(platform, group_id)` must be unique across the routes list.
 For direct routes, `(platform, sender_id)` must be unique, and any configured
@@ -448,6 +453,63 @@ may run before a one-shot busy notice is sent to the Signal target. To keep
 the notice meaningful, configure
 `busy_notice_after_seconds < acp_prompt_timeout_seconds`.
 
+`router.busy_notice_cooldown_seconds` (default `0`, disabled) rate-limits the
+busy notice itself: after a notice is sent for a route, further slow turns on
+that route stay quiet until the cooldown has elapsed. The default preserves
+the historical one-notice-per-slow-turn behaviour; in a busy group where
+several queued turns each run long, a cooldown keeps the router from
+repeating "Still working on this." every turn. The cooldown window starts
+only when a notice is actually delivered - a failed notice send is retried
+by the next slow turn as before.
+
+## Inbound burst policy
+
+Two per-route knobs in `routes.yaml` protect busy many-participant groups at
+the transport layer. Both are off by default; neither changes profile-side
+behaviour. They apply only to inbound Signal turns - synthetic turns
+(`trigger-job`, `notify-route`) keep their existing
+`route_lock_timeout_seconds`/busy admission control.
+
+```yaml
+routes:
+  - platform: "signal"
+    group_id: "SIGNAL_GROUP_ID_BASE64_EXAMPLE"
+    profile: "example-hermes-profile"
+    state: "active"
+    max_event_age_seconds: 900
+    inbound_rate_limit:
+      max_turns: 10
+      window_seconds: 60
+```
+
+- `max_event_age_seconds` - freshness gate. A routed Signal event whose
+  timestamp is older than this many seconds at the moment its turn would run
+  is dedupe-claimed, marked handled, and skipped without prompting, so a
+  backlog drain (for example signal-cli replaying queued messages after
+  downtime) does not answer hours-old messages. Staleness is evaluated after
+  the turn holds both its route and profile locks: an event that goes stale
+  while queued behind a slow turn (including another route's turn on a
+  shared profile) is also skipped. Because the skip marks the event handled
+  in the dedupe store, redelivery of a skipped event stays skipped. Events
+  without a usable timestamp (the normalizer emits `0`) bypass the age
+  check rather than being treated as infinitely old.
+- `inbound_rate_limit` - token-bucket cap on prompted inbound turns.
+  Sustained admission is `max_turns / window_seconds` turns per second with
+  bursts up to `max_turns`. Turns beyond the rate are dropped:
+  dedupe-claimed, marked handled, and logged as a content-free INFO line
+  carrying only the redacted route reference. The cap counts only turns
+  that would actually prompt Hermes: turns gated by route state
+  (`maintenance`, `disabled`, `shadow`) and deduplicated redeliveries do
+  not consume tokens, so a route that accumulates traffic while inactive
+  does not drop its first turns after (re)activation. `max_turns` must be
+  an integer >= 1 (booleans and fractional values are rejected);
+  `window_seconds` must be a positive finite number.
+
+Dropped and skipped events are permanent for that event identity: the router
+deliberately declines the turn and records it as handled. Operators who need
+delivery of every message under sustained overload should leave the rate cap
+off and scale the profile instead.
+
 ## Circuit breaker
 
 The per-route circuit breaker (`signal_hermes_router.circuit`) tracks Hermes
@@ -492,7 +554,10 @@ and `failure_reply` only); otherwise the router-level default applies.
   `failure_reply` override. If this is configured as an empty string, the
   router falls back to `router.failure_reply` instead of suppressing the reply.
 - `router.busy_notice` (default `"Still working on this."`) - the one-shot
-  notice fired at `busy_notice_after_seconds` if the turn has not completed.
+  notice fired at `busy_notice_after_seconds` if the turn has not completed,
+  subject to `busy_notice_cooldown_seconds` (see
+  [Hermes turn timeout and busy notice](#hermes-turn-timeout-and-busy-notice)
+  above).
 
 Route `failure_reply` values are explicit overrides when the key is present,
 including an empty string. A route configured with `failure_reply: ""`
@@ -535,6 +600,12 @@ envelopes at INFO, and receive exception envelopes at WARNING with
 `has_exception=true`. No sender identifier, group ID value, message text,
 attachment filename, exception message, or attachment payload appears in these
 summaries.
+
+Routed events skipped by transport policy - empty turns, stale turns under
+`max_event_age_seconds`, and turns dropped by `inbound_rate_limit` - are
+logged at INFO as `discarding <reason> Signal event for route <ref>` with a
+redacted route reference and no message content, and are marked handled in
+the dedupe store (see [Inbound burst policy](#inbound-burst-policy)).
 
 The router avoids retaining unrouteable payloads in router-owned objects, but
 Python cannot guarantee byte-level zeroisation of transient raw JSON/string

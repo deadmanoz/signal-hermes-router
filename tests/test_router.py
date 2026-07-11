@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -21,6 +22,7 @@ from signal_hermes_router.acp import JsonRpcError
 from signal_hermes_router.config import (
     AppConfig,
     CircuitBreakerConfig,
+    InboundRateLimitConfig,
     Route,
     RouterConfig,
     RouterControlConfig,
@@ -596,6 +598,266 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(dedupe.status(route.key, "+00000000000", 7))
             self.assertFalse(dedupe.claim(route.key, "sender-uuid", 7))
             self.assertTrue(dedupe.claim(route.key, "+00000000000", 7))
+
+    async def test_stale_group_event_is_skipped_and_marked_handled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            dedupe = DedupeStore()
+            now_ms = 1_000_000_000
+            route = make_route(max_event_age_seconds=60)
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, routes=(route,)),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+                clock_ms=lambda: now_ms,
+            )
+            stale_timestamp = now_ms - 60_001
+
+            with self.assertLogs("signal_hermes_router.router", level="INFO") as logs:
+                result = await router.handle_event(
+                    make_event(text="old message", timestamp=stale_timestamp)
+                )
+
+            self.assertIsNone(result)
+            self.assertEqual(profile.prompts, [])
+            self.assertEqual(signal.sends, [])
+            self.assertEqual(signal.typing, [])
+            self.assertEqual(dedupe.status(route.key, "sender", stale_timestamp), "handled")
+            self.assertTrue(any("discarding stale Signal event" in line for line in logs.output))
+
+            # Redelivery of the skipped event stays deduped.
+            redelivered = await router.handle_event(
+                make_event(text="old message", timestamp=stale_timestamp)
+            )
+            self.assertIsNone(redelivered)
+            self.assertEqual(profile.prompts, [])
+            self.assertFalse(dedupe.claim(route.key, "sender", stale_timestamp))
+
+    async def test_event_exactly_at_age_limit_still_prompts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            now_ms = 1_000_000_000
+            route = make_route(max_event_age_seconds=60)
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, routes=(route,)),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: now_ms,
+            )
+
+            result = await router.handle_event(make_event(timestamp=now_ms - 60_000))
+
+            self.assertEqual(result, TurnResult("reply"))
+            self.assertEqual(len(profile.prompts), 1)
+
+    async def test_route_without_age_limit_prompts_old_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            now_ms = 1_000_000_000
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: now_ms,
+            )
+
+            result = await router.handle_event(make_event(timestamp=1))
+
+            self.assertEqual(result, TurnResult("reply"))
+            self.assertEqual(len(profile.prompts), 1)
+
+    async def test_unknown_timestamp_bypasses_age_limit(self) -> None:
+        # The normalizer emits timestamp=0 when the envelope carries none; an
+        # unknown timestamp must not be treated as infinitely old.
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            now_ms = 1_000_000_000
+            route = make_route(max_event_age_seconds=60)
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, routes=(route,)),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: now_ms,
+            )
+
+            result = await router.handle_event(make_event(timestamp=0))
+
+            self.assertEqual(result, TurnResult("reply"))
+            self.assertEqual(len(profile.prompts), 1)
+
+    async def test_event_going_stale_behind_shared_profile_lock_is_skipped(self) -> None:
+        # Two routes share a profile. An event that was fresh when its route
+        # lock was acquired can outlive its age limit while waiting on the
+        # shared profile lock; staleness must be evaluated at that admission
+        # point, not at route-lock entry.
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            dedupe = DedupeStore()
+            clock = {"now": 1_000_000_000}
+            route_a = make_route(group_id="group-one")
+            route_b = make_route(group_id="group-two", max_event_age_seconds=60)
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, routes=(route_a, route_b)),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+                clock_ms=lambda: clock["now"],
+            )
+            fresh_timestamp = clock["now"]
+            profile_lock = router._profile_lock("profile")
+            await profile_lock.acquire()
+            task = asyncio.create_task(
+                router.handle_event(make_event(group_id="group-two", timestamp=fresh_timestamp))
+            )
+            await asyncio.sleep(0)
+            clock["now"] += 3_600_000
+            profile_lock.release()
+
+            result = await task
+
+            self.assertIsNone(result)
+            self.assertEqual(profile.prompts, [])
+            self.assertEqual(dedupe.status(route_b.key, "sender", fresh_timestamp), "handled")
+
+    async def test_inbound_rate_cap_drops_turns_beyond_bucket(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            dedupe = DedupeStore()
+            clock = {"now": 1_000_000_000}
+            route = make_route(
+                inbound_rate_limit=InboundRateLimitConfig(max_turns=2, window_seconds=60),
+            )
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, routes=(route,)),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+                clock_ms=lambda: clock["now"],
+            )
+
+            first = await router.handle_event(make_event(timestamp=1))
+            second = await router.handle_event(make_event(timestamp=2))
+            with self.assertLogs("signal_hermes_router.router", level="INFO") as logs:
+                third = await router.handle_event(make_event(timestamp=3))
+
+            self.assertEqual(first, TurnResult("reply"))
+            self.assertEqual(second, TurnResult("reply"))
+            self.assertIsNone(third)
+            self.assertEqual(len(profile.prompts), 2)
+            self.assertEqual(dedupe.status(route.key, "sender", 3), "handled")
+            self.assertTrue(
+                any("discarding rate_limited Signal event" in line for line in logs.output)
+            )
+
+            # Refill: 2 turns per 60s means one token back after 30s.
+            clock["now"] += 30_000
+            fourth = await router.handle_event(make_event(timestamp=4))
+            self.assertEqual(fourth, TurnResult("reply"))
+            self.assertEqual(len(profile.prompts), 3)
+
+    async def test_inbound_rate_cap_duplicate_does_not_burn_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            clock = {"now": 1_000_000_000}
+            route = make_route(
+                inbound_rate_limit=InboundRateLimitConfig(max_turns=2, window_seconds=60),
+            )
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, routes=(route,)),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: clock["now"],
+            )
+
+            first = await router.handle_event(make_event(timestamp=1))
+            duplicate = await router.handle_event(make_event(timestamp=1))
+            second = await router.handle_event(make_event(timestamp=2))
+            third = await router.handle_event(make_event(timestamp=3))
+
+            self.assertEqual(first, TurnResult("reply"))
+            self.assertIsNone(duplicate)
+            self.assertEqual(second, TurnResult("reply"))
+            self.assertIsNone(third)
+            self.assertEqual(len(profile.prompts), 2)
+
+    async def test_inbound_rate_cap_does_not_burn_tokens_for_non_active_states(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            clock = {"now": 1_000_000_000}
+            route = make_route(
+                inbound_rate_limit=InboundRateLimitConfig(max_turns=1, window_seconds=60),
+            )
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, routes=(route,)),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: clock["now"],
+            )
+            router.route_state_overrides[route.key] = RouteState.MAINTENANCE
+
+            await router.handle_event(make_event(timestamp=1))
+            await router.handle_event(make_event(timestamp=2))
+            router.route_state_overrides.pop(route.key)
+            active_result = await router.handle_event(make_event(timestamp=3))
+            capped_result = await router.handle_event(make_event(timestamp=4))
+
+            maintenance_replies = [body for _, body in signal.sends if "maintenance" in body]
+            self.assertEqual(len(maintenance_replies), 2)
+            self.assertEqual(active_result, TurnResult("reply"))
+            self.assertIsNone(capped_result)
+            self.assertEqual(len(profile.prompts), 1)
+
+    async def test_shadow_route_with_rate_limit_never_creates_bucket(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            route = make_route(
+                state=RouteState.SHADOW,
+                inbound_rate_limit=InboundRateLimitConfig(max_turns=1, window_seconds=60),
+            )
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.SHADOW, routes=(route,)),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            await router.handle_event(make_event(timestamp=1))
+            await router.handle_event(make_event(timestamp=2))
+
+            self.assertEqual(profile.prompts, [])
+            self.assertEqual(router._inbound_rate_buckets, {})
+
+    async def test_route_without_rate_limit_is_uncapped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            for timestamp in range(1, 6):
+                result = await router.handle_event(make_event(timestamp=timestamp))
+                self.assertEqual(result, TurnResult("reply"))
+
+            self.assertEqual(len(profile.prompts), 5)
 
     async def test_active_group_synthetic_job_calls_backend_and_replies(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4712,6 +4974,190 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             turn_done = asyncio.Event()
             turn_done.set()
             await router._long_running_notice(route, turn_done)
+
+    async def test_busy_notice_cooldown_suppresses_repeat_notices(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            clock = {"now": 1_000_000_000}
+            router = SignalHermesRouter(
+                make_app(
+                    tmp,
+                    RouteState.ACTIVE,
+                    busy_notice_after_seconds=0,
+                    busy_notice_cooldown_seconds=300,
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: clock["now"],
+            )
+            route = router.config.routes[0]
+            turn_done = asyncio.Event()
+
+            await router._long_running_notice(route, turn_done)
+            self.assertEqual(signal.sends, [("group", "Still working on this.")])
+
+            # A second slow turn within the cooldown window stays quiet.
+            clock["now"] += 100_000
+            await router._long_running_notice(route, turn_done)
+            self.assertEqual(len(signal.sends), 1)
+
+            # Once the cooldown elapses the notice fires again.
+            clock["now"] += 300_000
+            await router._long_running_notice(route, turn_done)
+            self.assertEqual(len(signal.sends), 2)
+
+    async def test_busy_notice_cooldown_is_tracked_per_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            clock = {"now": 1_000_000_000}
+            route_a = make_route(group_id="group-one")
+            route_b = make_route(group_id="group-two")
+            router = SignalHermesRouter(
+                make_app(
+                    tmp,
+                    RouteState.ACTIVE,
+                    routes=(route_a, route_b),
+                    busy_notice_after_seconds=0,
+                    busy_notice_cooldown_seconds=300,
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: clock["now"],
+            )
+            turn_done = asyncio.Event()
+
+            await router._long_running_notice(route_a, turn_done)
+            await router._long_running_notice(route_b, turn_done)
+
+            self.assertEqual(
+                signal.sends,
+                [
+                    ("group-one", "Still working on this."),
+                    ("group-two", "Still working on this."),
+                ],
+            )
+
+    async def test_busy_notice_failed_send_does_not_start_cooldown(self) -> None:
+        class FlakySignal(FakeSignal):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail = True
+
+            async def send_group(self, group_id: str, message: str) -> dict:
+                if self.fail:
+                    raise RuntimeError("send failed")
+                return await super().send_group(group_id, message)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FlakySignal()
+            clock = {"now": 1_000_000_000}
+            router = SignalHermesRouter(
+                make_app(
+                    tmp,
+                    RouteState.ACTIVE,
+                    busy_notice_after_seconds=0,
+                    busy_notice_cooldown_seconds=300,
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+                clock_ms=lambda: clock["now"],
+            )
+            route = router.config.routes[0]
+            turn_done = asyncio.Event()
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                await router._long_running_notice(route, turn_done)
+            self.assertEqual(signal.sends, [])
+
+            # The failed attempt did not start a cooldown window, so the next
+            # slow turn retries the notice immediately.
+            signal.fail = False
+            await router._long_running_notice(route, turn_done)
+            self.assertEqual(signal.sends, [("group", "Still working on this.")])
+
+    async def test_busy_notice_default_has_no_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, busy_notice_after_seconds=0),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            route = router.config.routes[0]
+            turn_done = asyncio.Event()
+
+            await router._long_running_notice(route, turn_done)
+            await router._long_running_notice(route, turn_done)
+
+            self.assertEqual(len(signal.sends), 2)
+
+    async def test_busy_notice_cooldown_applies_across_full_turns(self) -> None:
+        # End-to-end: with a cooldown configured, the second consecutive slow
+        # turn does not repeat the busy notice. The second turn's prompt waits
+        # until the notice task has observably run its suppression check.
+        suppressed = asyncio.Event()
+
+        class WaitForSuppressionHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                if "suppressing busy notice" in record.getMessage():
+                    suppressed.set()
+
+        notice_sent = asyncio.Event()
+
+        class SyncSignal(FakeSignal):
+            async def send_group(self, group_id: str, message: str) -> dict:
+                result = await super().send_group(group_id, message)
+                if message == "still working":
+                    notice_sent.set()
+                return result
+
+        class SyncProfile(FakeProfile):
+            def __init__(self) -> None:
+                super().__init__()
+                self.turn = 0
+
+            async def prompt(self, session_id: str, blocks: list[dict]) -> TurnResult:
+                self.prompt_session_ids.append(session_id)
+                self.prompts.append(blocks)
+                self.turn += 1
+                gate = notice_sent if self.turn == 1 else suppressed
+                await asyncio.wait_for(gate.wait(), timeout=5.0)
+                return TurnResult(self.reply_text)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = SyncSignal()
+            profile = SyncProfile()
+            router = SignalHermesRouter(
+                make_app(
+                    tmp,
+                    RouteState.ACTIVE,
+                    busy_notice_after_seconds=0,
+                    busy_notice_cooldown_seconds=300,
+                    busy_notice="still working",
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            handler = WaitForSuppressionHandler(level=logging.DEBUG)
+            logger = logging.getLogger("signal_hermes_router.router")
+            previous_level = logger.level
+            logger.addHandler(handler)
+            logger.setLevel(logging.DEBUG)
+            try:
+                await router.handle_event(make_event(timestamp=1))
+                await router.handle_event(make_event(timestamp=2))
+            finally:
+                logger.removeHandler(handler)
+                logger.setLevel(previous_level)
+
+            bodies = [body for _, body in signal.sends]
+            self.assertEqual(bodies.count("still working"), 1)
+            self.assertEqual(bodies.count("reply"), 2)
 
     async def test_turn_failure_restarts_profile_and_trips_circuit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

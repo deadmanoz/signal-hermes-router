@@ -10,6 +10,22 @@ routes:
     # and creates a fresh one instead of surfacing the resume failure.
     recreate_session_on_resume_failure: false
     state: "shadow"
+    # Opt-in inbound burst policy for busy many-participant groups. Both knobs
+    # are off by default.
+    #
+    # Skip (dedupe-claim + mark handled, never prompt) routed events whose
+    # Signal timestamp is older than this many seconds when the turn would
+    # run, so a backlog drain does not answer hours-old messages. Redelivery
+    # of a skipped event stays skipped.
+    # max_event_age_seconds: 900
+    #
+    # Token-bucket cap on prompted inbound turns: sustained rate of max_turns
+    # per window_seconds, with bursts up to max_turns. Turns beyond the rate
+    # are dropped (dedupe-claimed + marked handled) with a content-free log
+    # line.
+    # inbound_rate_limit:
+    #   max_turns: 10
+    #   window_seconds: 60
     route_context:
       purpose: "Synthetic public example route."
       route_alias: "example"

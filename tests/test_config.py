@@ -724,6 +724,107 @@ router:
         self.assertFalse(default_route.recreate_session_on_resume_failure)
         self.assertTrue(opt_in_route.recreate_session_on_resume_failure)
 
+    def test_parse_route_burst_policy_defaults_off(self) -> None:
+        route = parse_route({"platform": "signal", "group_id": "GROUP", "profile": "profile"})
+
+        self.assertIsNone(route.max_event_age_seconds)
+        self.assertIsNone(route.inbound_rate_limit)
+
+    def test_parse_route_reads_max_event_age_seconds(self) -> None:
+        route = parse_route(
+            {
+                "platform": "signal",
+                "group_id": "GROUP",
+                "profile": "profile",
+                "max_event_age_seconds": 900,
+            }
+        )
+
+        self.assertEqual(route.max_event_age_seconds, 900.0)
+
+    def test_parse_route_rejects_invalid_max_event_age_seconds(self) -> None:
+        for value in (0, -1, float("inf"), float("nan"), True, "soon", None):
+            raw = {
+                "platform": "signal",
+                "group_id": "GROUP",
+                "profile": "profile",
+                "max_event_age_seconds": value,
+            }
+            if value is None:
+                # Explicit null means off, same as an absent key.
+                self.assertIsNone(parse_route(raw).max_event_age_seconds)
+                continue
+            with self.assertRaises(ValueError, msg=repr(value)):
+                parse_route(raw)
+
+    def test_parse_route_reads_inbound_rate_limit(self) -> None:
+        route = parse_route(
+            {
+                "platform": "signal",
+                "group_id": "GROUP",
+                "profile": "profile",
+                "inbound_rate_limit": {"max_turns": 10, "window_seconds": 60},
+            }
+        )
+
+        assert route.inbound_rate_limit is not None
+        self.assertEqual(route.inbound_rate_limit.max_turns, 10)
+        self.assertEqual(route.inbound_rate_limit.window_seconds, 60.0)
+
+    def test_parse_route_inbound_rate_limit_accepts_decimal_string_max_turns(self) -> None:
+        # Secret-resolver values arrive as strings.
+        route = parse_route(
+            {
+                "platform": "signal",
+                "group_id": "GROUP",
+                "profile": "profile",
+                "inbound_rate_limit": {"max_turns": "3", "window_seconds": "60"},
+            }
+        )
+
+        assert route.inbound_rate_limit is not None
+        self.assertEqual(route.inbound_rate_limit.max_turns, 3)
+        self.assertEqual(route.inbound_rate_limit.window_seconds, 60.0)
+
+    def test_parse_route_rejects_invalid_inbound_rate_limit(self) -> None:
+        invalid_blocks = [
+            "fast",
+            ["max_turns"],
+            {"max_turns": 10},
+            {"window_seconds": 60},
+            {"max_turns": 10, "window_seconds": 60, "burst": 5},
+            {"max_turns": 0, "window_seconds": 60},
+            {"max_turns": True, "window_seconds": 60},
+            {"max_turns": 1.5, "window_seconds": 60},
+            {"max_turns": "1.5", "window_seconds": 60},
+            {"max_turns": 10, "window_seconds": 0},
+            {"max_turns": 10, "window_seconds": -5},
+            {"max_turns": 10, "window_seconds": float("inf")},
+            {"max_turns": 10, "window_seconds": True},
+        ]
+        for block in invalid_blocks:
+            with self.assertRaises(ValueError, msg=repr(block)):
+                parse_route(
+                    {
+                        "platform": "signal",
+                        "group_id": "GROUP",
+                        "profile": "profile",
+                        "inbound_rate_limit": block,
+                    }
+                )
+
+    def test_parse_router_config_reads_busy_notice_cooldown(self) -> None:
+        default = parse_router_config({})
+        self.assertEqual(default.busy_notice_cooldown_seconds, 0.0)
+
+        configured = parse_router_config({"busy_notice_cooldown_seconds": 300})
+        self.assertEqual(configured.busy_notice_cooldown_seconds, 300.0)
+
+    def test_parse_router_config_rejects_invalid_busy_notice_cooldown(self) -> None:
+        for value in (-1, float("inf"), float("nan"), True, "later"):
+            with self.assertRaises(ValueError, msg=repr(value)):
+                parse_router_config({"busy_notice_cooldown_seconds": value})
+
 
 if __name__ == "__main__":
     unittest.main()

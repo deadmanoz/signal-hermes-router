@@ -12,6 +12,7 @@ from signal_hermes_router.acp import ACPProfile
 from signal_hermes_router.config import (
     AppConfig,
     CircuitBreakerConfig,
+    InboundRateLimitConfig,
     Route,
     RouterConfig,
     SyntheticRouteNotification,
@@ -63,6 +64,8 @@ def make_route(
     maintenance_reply: str | None = None,
     failure_reply: str | None = None,
     recreate_session_on_resume_failure: bool = False,
+    max_event_age_seconds: float | None = None,
+    inbound_rate_limit: InboundRateLimitConfig | None = None,
 ) -> Route:
     return Route(
         platform=platform,
@@ -80,6 +83,8 @@ def make_route(
         maintenance_reply=maintenance_reply,
         failure_reply=failure_reply,
         recreate_session_on_resume_failure=recreate_session_on_resume_failure,
+        max_event_age_seconds=max_event_age_seconds,
+        inbound_rate_limit=inbound_rate_limit,
     )
 
 

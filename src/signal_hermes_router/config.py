@@ -33,6 +33,15 @@ class CircuitBreakerConfig:
 
 
 @dataclass(frozen=True)
+class InboundRateLimitConfig:
+    """Sustained cap of ``max_turns / window_seconds`` prompted inbound turns
+    per second, with bursts up to ``max_turns``."""
+
+    max_turns: int
+    window_seconds: float
+
+
+@dataclass(frozen=True)
 class RouterControlConfig:
     enabled: bool = False
     socket_path: Path | None = None
@@ -61,6 +70,7 @@ class RouterConfig:
     )
     busy_notice_after_seconds: float = 120.0
     busy_notice: str = "Still working on this."
+    busy_notice_cooldown_seconds: float = 0.0
     acp_prompt_timeout_seconds: float = 300.0
     acp_initialize_timeout_seconds: float = 30.0
     circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
@@ -92,6 +102,8 @@ class Route:
     maintenance_reply: str | None = None
     failure_reply: str | None = None
     recreate_session_on_resume_failure: bool = False
+    max_event_age_seconds: float | None = None
+    inbound_rate_limit: InboundRateLimitConfig | None = None
 
     @property
     def key(self) -> str:
@@ -291,6 +303,10 @@ def parse_router_config(raw: dict[str, Any]) -> RouterConfig:
     )
     if route_lock_timeout_seconds < 0:
         raise ValueError("router.control.route_lock_timeout_seconds must be non-negative")
+    busy_notice_cooldown_seconds = _as_non_negative_finite_float(
+        raw.get("busy_notice_cooldown_seconds", defaults.busy_notice_cooldown_seconds),
+        "router.busy_notice_cooldown_seconds",
+    )
     max_notification_payload_bytes = _as_positive_int(
         control.get(
             "max_notification_payload_bytes",
@@ -329,6 +345,7 @@ def parse_router_config(raw: dict[str, Any]) -> RouterConfig:
             raw.get("busy_notice_after_seconds", defaults.busy_notice_after_seconds)
         ),
         busy_notice=str(raw.get("busy_notice", defaults.busy_notice)),
+        busy_notice_cooldown_seconds=busy_notice_cooldown_seconds,
         acp_prompt_timeout_seconds=float(
             raw.get("acp_prompt_timeout_seconds", defaults.acp_prompt_timeout_seconds)
         ),
@@ -498,6 +515,11 @@ def parse_route(raw: dict[str, Any]) -> Route:
             if sender_number is not None
             else None
         )
+    max_event_age_seconds = None
+    if raw.get("max_event_age_seconds") is not None:
+        max_event_age_seconds = _as_positive_finite_float(
+            raw["max_event_age_seconds"], "route max_event_age_seconds"
+        )
     return Route(
         platform=platform,
         name=normalize_safe_token(route_name, "route name") if route_name is not None else None,
@@ -515,6 +537,26 @@ def parse_route(raw: dict[str, Any]) -> Route:
         failure_reply=raw.get("failure_reply"),
         recreate_session_on_resume_failure=_as_bool(
             raw.get("recreate_session_on_resume_failure", False)
+        ),
+        max_event_age_seconds=max_event_age_seconds,
+        inbound_rate_limit=_parse_inbound_rate_limit(raw.get("inbound_rate_limit")),
+    )
+
+
+def _parse_inbound_rate_limit(raw: Any) -> InboundRateLimitConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("route inbound_rate_limit must be a mapping")
+    unknown = set(raw) - {"max_turns", "window_seconds"}
+    if unknown:
+        raise ValueError("route inbound_rate_limit only accepts max_turns and window_seconds")
+    return InboundRateLimitConfig(
+        max_turns=_as_strict_positive_int(
+            raw.get("max_turns"), "route inbound_rate_limit.max_turns"
+        ),
+        window_seconds=_as_positive_finite_float(
+            raw.get("window_seconds"), "route inbound_rate_limit.window_seconds"
         ),
     )
 
@@ -591,4 +633,43 @@ def _as_positive_int(value: Any, name: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise ValueError(f"{name} must be positive")
+    return parsed
+
+
+def _as_strict_positive_int(value: Any, name: str) -> int:
+    # Unlike _as_positive_int, this rejects booleans (int(True) == 1) and
+    # fractional values (int(1.5) == 1) instead of silently coercing them.
+    # Decimal-digit strings stay accepted for secret-resolver compatibility.
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    if isinstance(value, str) and value.isdecimal():
+        value = int(value)
+    if not isinstance(value, int):
+        raise ValueError(f"{name} must be a positive integer")
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _as_positive_finite_float(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive finite number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive finite number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"{name} must be a positive finite number")
+    return parsed
+
+
+def _as_non_negative_finite_float(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a non-negative finite number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a non-negative finite number") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError(f"{name} must be a non-negative finite number")
     return parsed
