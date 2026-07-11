@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.24](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.23...v0.1.24) (2026-07-11)
+
+
+### Features
+
+* **outbound:** honor profile-emitted no-reply sentinel on transport out ([#52](https://github.com/deadmanoz/signal-hermes-router/issues/52)) ([aa110b3](https://github.com/deadmanoz/signal-hermes-router/commit/aa110b3fea51979a72a3ca78bd52e0d589e1a69a))
+
 ## [0.1.23](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.22...v0.1.23) (2026-07-11)
 
 
