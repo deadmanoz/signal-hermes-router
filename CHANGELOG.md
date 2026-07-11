@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.20](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.19...v0.1.20) (2026-07-11)
+
+
+### Features
+
+* **sessions:** log and proactively detect Hermes subprocess exits ([#43](https://github.com/deadmanoz/signal-hermes-router/issues/43))
+
 ## [0.1.19](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.18...v0.1.19) (2026-07-11)
 
 
