@@ -5,7 +5,7 @@
 
 ### Features
 
-* **router:** add retention sweeps for dedupe DB and media storage ([#50](https://github.com/deadmanoz/signal-hermes-router/issues/50)) ([810c9cc](https://github.com/deadmanoz/signal-hermes-router/commit/810c9cc58ed7af9466e3190110c5b63fa1aed3e3))
+* **router:** add retention sweeps for dedupe DB and media storage ([#50](https://github.com/deadmanoz/signal-hermes-router/issues/50))
 
 ## [0.1.22](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.21...v0.1.22) (2026-07-11)
 
