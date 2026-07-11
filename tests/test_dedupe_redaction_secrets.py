@@ -378,6 +378,42 @@ class DedupeRetentionTests(unittest.TestCase):
                 backup_db.close()
             self.assertNotIn("updated_at_ms", backup_columns)
 
+    def test_interrupted_backup_staging_is_replaced_by_valid_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "router.db"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "CREATE TABLE dedupe_events ("
+                "route_key TEXT NOT NULL, "
+                "source_uuid TEXT NOT NULL, "
+                "timestamp INTEGER NOT NULL, "
+                "status TEXT NOT NULL, "
+                "PRIMARY KEY (route_key, source_uuid, timestamp))"
+            )
+            connection.commit()
+            connection.close()
+            # A crash mid-backup leaves only a torn staging file behind; it
+            # must never be published or trusted as the snapshot.
+            staging = Path(str(path) + MIGRATION_BACKUP_SUFFIX + ".tmp")
+            staging.write_bytes(b"torn partial backup bytes")
+
+            with DedupeStore(path, clock_ms=lambda: 1_000):
+                pass
+
+            backup = Path(str(path) + MIGRATION_BACKUP_SUFFIX)
+            self.assertTrue(backup.is_file())
+            backup_db = sqlite3.connect(backup)
+            try:
+                backup_columns = {
+                    str(row[1])
+                    for row in backup_db.execute("PRAGMA table_info(dedupe_events)").fetchall()
+                }
+            finally:
+                backup_db.close()
+            self.assertIn("status", backup_columns)
+            self.assertNotIn("updated_at_ms", backup_columns)
+            self.assertFalse(staging.exists())
+
     def test_no_backup_written_when_schema_is_current(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "router.db"

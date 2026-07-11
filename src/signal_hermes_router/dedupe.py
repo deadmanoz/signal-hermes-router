@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -150,16 +151,26 @@ class DedupeStore:
         backup_path = Path(self.path + MIGRATION_BACKUP_SUFFIX)
         if backup_path.is_file() and backup_path.stat().st_size > 0:
             # A retried migration must not overwrite the original
-            # pre-migration snapshot with a partially migrated state.
+            # pre-migration snapshot with a partially migrated state. The
+            # atomic publish below means an existing non-empty backup is
+            # always a completed one, never a partial write.
             LOGGER.info("keeping existing dedupe state DB migration backup")
             return
-        ensure_private_file(backup_path)
-        target = sqlite3.connect(backup_path)
+        staging_path = Path(str(backup_path) + ".tmp")
+        # A staging file left by an interrupted earlier attempt is torn by
+        # definition; discard it rather than asking sqlite to write into it.
+        staging_path.unlink(missing_ok=True)
+        ensure_private_file(staging_path)
+        target = sqlite3.connect(staging_path)
         try:
             self._db.backup(target)
         finally:
             target.close()
-        backup_path.chmod(PRIVATE_FILE_MODE)
+        staging_path.chmod(PRIVATE_FILE_MODE)
+        # Atomic publish: an interrupted backup leaves only the staging
+        # file, so a later retry writes a fresh snapshot instead of
+        # trusting a torn one.
+        os.replace(staging_path, backup_path)
         LOGGER.info("wrote dedupe state DB backup before schema migration")
 
     def _reclaim_orphaned_claims(self) -> None:
