@@ -420,6 +420,70 @@ class SignalHttpTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "max_signal_event_bytes"):
             [event async for event in _iter_sse_json(response, max_event_bytes=10)]  # type: ignore[arg-type]
 
+    async def test_iter_sse_json_skips_malformed_frame_and_continues(self) -> None:
+        response = FakeSseResponse(
+            [
+                'data: {"message": "synthetic-not-json',
+                "",
+                'data: {"message": "valid"}',
+                "",
+            ]
+        )
+
+        with self.assertLogs("signal_hermes_router.signal", level="WARNING") as logs:
+            events = [event async for event in _iter_sse_json(response)]  # type: ignore[arg-type]
+
+        self.assertEqual(events, [{"message": "valid"}])
+        output = "\n".join(logs.output)
+        self.assertIn("Skipping malformed Signal SSE frame", output)
+        self.assertNotIn("synthetic-not-json", output)
+
+    async def test_iter_sse_json_skips_malformed_trailing_frame(self) -> None:
+        response = FakeSseResponse(['data: {"message": "valid"}', "", "data: synthetic-trailing"])
+
+        with self.assertLogs("signal_hermes_router.signal", level="WARNING") as logs:
+            events = [event async for event in _iter_sse_json(response)]  # type: ignore[arg-type]
+
+        self.assertEqual(events, [{"message": "valid"}])
+        output = "\n".join(logs.output)
+        self.assertIn("Skipping malformed Signal SSE frame", output)
+        self.assertNotIn("synthetic-trailing", output)
+
+    async def test_iter_sse_json_skips_undecodable_frame_variants(self) -> None:
+        # json.loads failures beyond JSONDecodeError: a plain ValueError for
+        # integers over the interpreter digit limit and RecursionError for
+        # deeply nested payloads. Raise each explicitly so the except clause
+        # is exercised regardless of interpreter limits. Both must skip the
+        # frame, not end the stream.
+        response = FakeSseResponse(
+            ["data: synthetic-a", "", "data: synthetic-b", "", "data: synthetic-valid", ""]
+        )
+
+        with (
+            patch.object(
+                signal_module.json,
+                "loads",
+                side_effect=[ValueError("synthetic"), RecursionError(), {"message": "valid"}],
+            ),
+            self.assertLogs("signal_hermes_router.signal", level="WARNING") as logs,
+        ):
+            events = [event async for event in _iter_sse_json(response)]  # type: ignore[arg-type]
+
+        self.assertEqual(events, [{"message": "valid"}])
+        self.assertEqual(
+            len([line for line in logs.output if "Skipping malformed Signal SSE frame" in line]),
+            2,
+        )
+
+    async def test_iter_sse_json_skips_non_dict_frame(self) -> None:
+        response = FakeSseResponse(["data: 5", "", 'data: {"message": "valid"}', ""])
+
+        with self.assertLogs("signal_hermes_router.signal", level="WARNING") as logs:
+            events = [event async for event in _iter_sse_json(response)]  # type: ignore[arg-type]
+
+        self.assertEqual(events, [{"message": "valid"}])
+        self.assertIn("Skipping malformed Signal SSE frame", "\n".join(logs.output))
+
     async def test_check_and_send_group_rpc_shape(self) -> None:
         requests: list[dict] = []
 
@@ -527,6 +591,39 @@ class SignalHttpTests(unittest.IsolatedAsyncioTestCase):
         stream = client.events(reconnect_delay=999)
         try:
             self.assertEqual(await anext(stream), {"message": "hello"})
+        finally:
+            await stream.aclose()
+            await client.close()
+
+    async def test_events_skips_malformed_frame_without_reconnect(self) -> None:
+        calls = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                200,
+                stream=FakeAsyncByteStream(
+                    [b"data: synthetic-not-json\n\n", b'data: {"message": "valid"}\n\n']
+                ),
+            )
+
+        async def fail_sleep(_delay: float) -> None:
+            raise AssertionError("unexpected reconnect")
+
+        client = SignalHttpClient("http://test", transport=httpx.MockTransport(handler))
+        stream = client.events(reconnect_delay=0.5)
+        try:
+            with (
+                patch.object(signal_module.asyncio, "sleep", fail_sleep),
+                self.assertLogs("signal_hermes_router.signal", level="WARNING") as logs,
+            ):
+                event = await asyncio.wait_for(anext(stream), 5)
+            self.assertEqual(event, {"message": "valid"})
+            self.assertEqual(calls, 1)
+            output = "\n".join(logs.output)
+            self.assertIn("Skipping malformed Signal SSE frame", output)
+            self.assertNotIn("reconnecting", output)
         finally:
             await stream.aclose()
             await client.close()

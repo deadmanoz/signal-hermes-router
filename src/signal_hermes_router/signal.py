@@ -167,16 +167,40 @@ async def _iter_sse_json(
         if line == "":
             if data_lines:
                 data = "\n".join(data_lines)
+                frame_bytes = event_bytes
                 data_lines.clear()
                 event_bytes = 0
-                yield json.loads(data)
+                event = _decode_sse_frame(data, frame_bytes)
+                if event is not None:
+                    yield event
             continue
         if line.startswith("data:"):
             data_line = line[5:].lstrip()
             event_bytes = _next_sse_event_size(event_bytes, data_line, max_event_bytes)
             data_lines.append(data_line)
     if data_lines:
-        yield json.loads("\n".join(data_lines))
+        event = _decode_sse_frame("\n".join(data_lines), event_bytes)
+        if event is not None:
+            yield event
+
+
+def _decode_sse_frame(data: str, size_bytes: int) -> dict[str, Any] | None:
+    # Mirror the ACP peer's log-and-continue handling of undecodable lines:
+    # one malformed frame must not tear down the SSE stream, because a
+    # reconnect can silently lose stream position (signal-cli has no replay).
+    # The warning stays content-free; Signal payloads carry group IDs, phone
+    # numbers, and message text. json.loads can fail with more than
+    # JSONDecodeError: a plain ValueError for integers over the interpreter
+    # digit limit and RecursionError for deeply nested payloads. All are
+    # decode-local failures of this one frame, so treat them alike.
+    try:
+        payload = json.loads(data)
+    except (ValueError, RecursionError):
+        payload = None
+    if not isinstance(payload, dict):
+        LOGGER.warning("Skipping malformed Signal SSE frame (%d bytes)", size_bytes)
+        return None
+    return payload
 
 
 def _next_sse_event_size(current: int, line: str, max_event_bytes: int | None) -> int:
