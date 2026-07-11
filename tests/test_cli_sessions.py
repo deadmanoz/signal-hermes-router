@@ -1089,6 +1089,9 @@ class FakeManagedProfile:
     async def close(self) -> None:
         self.closed = True
 
+    def exit_suspected(self) -> bool:
+        return False
+
 
 class RegistryProfile:
     def __init__(
@@ -1516,6 +1519,32 @@ class ProfileExitWatcherSupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(supervisor._profiles, {})
             # The exit did not stamp the failed-start cooldown: the next
             # acquisition spawns fresh instead of failing fast.
+            with patch.object(sessions_module, "ACPProfile", FakeManagedProfile):
+                replacement = await supervisor.get_profile(route)
+            self.assertTrue(replacement.started)
+
+    async def test_supervisor_rejects_profile_with_exit_evidence_after_start(self) -> None:
+        # A child can answer initialize and die before the exit watcher gets
+        # CPU: the identity check alone would pass, so get_profile must also
+        # consult the peer's synchronous exit evidence and refuse to hand out
+        # (or cache) the dead instance.
+        class ExitsAfterStartProfile(FakeManagedProfile):
+            def exit_suspected(self) -> bool:
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            FakeManagedProfile.instances.clear()
+            route = make_route(profile="profile-a")
+            supervisor = ProfileSupervisor(
+                Path(tmp),
+                command_template=["hermes", "-p", "{profile}", "acp"],
+                restart_cooldown_seconds=60,
+            )
+            with patch.object(sessions_module, "ACPProfile", ExitsAfterStartProfile):
+                with self.assertRaisesRegex(RuntimeError, "exited during startup"):
+                    await supervisor.get_profile(route)
+            self.assertEqual(supervisor._profiles, {})
+            self.assertEqual(supervisor._last_restart, {})
             with patch.object(sessions_module, "ACPProfile", FakeManagedProfile):
                 replacement = await supervisor.get_profile(route)
             self.assertTrue(replacement.started)

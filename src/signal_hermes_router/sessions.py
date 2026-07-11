@@ -104,9 +104,13 @@ class ProfileSupervisor:
                 # Cancellation is not a failed start and stamps no cooldown.
                 self._last_restart[route.profile] = time.monotonic()
             raise
-        if self._profiles.get(route.profile) is not profile:
-            # The exit watcher evicted this instance while start() was in
-            # flight; never hand out a known-dead profile.
+        if self._profiles.get(route.profile) is not profile or profile.exit_suspected():
+            # Either the exit watcher evicted this instance while start() was
+            # in flight, or the child is already demonstrably dead (a child
+            # can answer initialize and die before the watcher gets CPU);
+            # never hand out a known-dead profile.
+            if self._profiles.get(route.profile) is profile:
+                del self._profiles[route.profile]
             raise RuntimeError(f"Hermes profile {route.profile!r} exited during startup")
         return profile
 
@@ -131,10 +135,13 @@ class ProfileSupervisor:
             returncode,
         )
         if stderr_tail:
+            # Sanitize per line so a credential assignment masks the rest of
+            # its own stderr line, not everything joined after it.
+            sanitized_tail = " | ".join(sanitize_subprocess_output(line) for line in stderr_tail)
             LOGGER.error(
                 "Hermes profile %s stderr tail near exit: %s",
                 self._redact(profile_name),
-                self._redact(sanitize_subprocess_output(" | ".join(stderr_tail))),
+                self._redact(sanitized_tail),
             )
 
     async def restart_profile(self, profile_name: str) -> None:

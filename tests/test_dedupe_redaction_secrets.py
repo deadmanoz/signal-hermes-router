@@ -177,6 +177,10 @@ class RedactionTests(unittest.TestCase):
             "Authorization: Bearer abc.DEF-123_456~789\n"
             "api_key=sk-live-abcdefghijklmnop123456\n"
             "password: hunter2secret\n"
+            # ROUTER_TEST_SECRET marks this synthetic quoted passphrase for
+            # the repo's public-boundary check.
+            'password: "ROUTER_TEST_SECRET correct horse battery"\n'
+            "Cookie: sid=alpha-sid-value; csrf=beta-csrf-value\n"
             "digest 0123456789abcdef0123456789abcdef01234567\n"
             # The EXAMPLE marker keeps the repo's public-boundary check happy;
             # the sanitizer only cares about the base64-ish shape and length.
@@ -192,6 +196,11 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("abc.DEF-123_456~789", sanitized)
         self.assertNotIn("sk-live-abcdefghijklmnop123456", sanitized)
         self.assertNotIn("hunter2secret", sanitized)
+        # Quoted and header-style multi-token values are masked in full, not
+        # just their first whitespace-delimited token.
+        self.assertNotIn("correct horse battery", sanitized)
+        self.assertNotIn("sid=alpha-sid-value", sanitized)
+        self.assertNotIn("csrf=beta-csrf-value", sanitized)
         self.assertNotIn("0123456789abcdef0123456789abcdef01234567", sanitized)
         self.assertNotIn("EXAMPLEbase64", sanitized)
         # Ordinary traceback text stays readable for diagnosis.

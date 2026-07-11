@@ -120,7 +120,7 @@ class JsonRpcStdioPeer:
 
     async def close(self) -> None:
         watcher = self._exit_watcher_task
-        if watcher is not None and not watcher.done() and self._exit_evidence():
+        if watcher is not None and not watcher.done() and self.exit_evidence():
             # The child's exit (or its broken pipes) predates this close: let
             # the watcher report the unexpected exit before it is suppressed.
             # This is the lazy-discovery incident class, where recovery closes
@@ -211,7 +211,7 @@ class JsonRpcStdioPeer:
     def stderr_tail(self) -> tuple[str, ...]:
         return tuple(self._stderr_tail)
 
-    def _exit_evidence(self) -> bool:
+    def exit_evidence(self) -> bool:
         process = self.process
         return (
             (process is not None and process.returncode is not None)
@@ -421,6 +421,12 @@ class ACPProfile:
         callback = self.on_exit
         if callback is not None:
             callback(returncode, stderr_tail)
+
+    def exit_suspected(self) -> bool:
+        """Best-effort synchronous check that the supervised child already
+        died (reaped returncode, stdout EOF, or a failed stdin write) --
+        usable before the exit watcher has had a chance to run."""
+        return self.peer is not None and self.peer.exit_evidence()
 
     async def new_session(self, cwd: Path) -> str:
         assert self.peer

@@ -18,9 +18,14 @@ UUID_RE = re.compile(
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]")
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 BEARER_RE = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}")
+# A credential assignment masks the REST OF THE LINE, not just the first
+# whitespace-delimited token: a quoted multi-word passphrase and header-style
+# multi-part values ('Cookie: sid=...; csrf=...') must not leave residual
+# credential text behind. Callers sanitize per stderr line, so the blast
+# radius of the greedy match is one line of child output.
 CREDENTIAL_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(api[-_]?key|apikey|authorization|auth[-_]?token|access[-_]?token|"
-    r"refresh[-_]?token|token|secret|password|passwd|cookie)\b\s*[:=]\s*\S+"
+    r"refresh[-_]?token|token|secret|password|passwd|set[-_]?cookie|cookie)\b\s*[:=][^\n]*"
 )
 KEY_LITERAL_RE = re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}\b")
 LONG_HEX_RE = re.compile(r"\b[0-9a-fA-F]{32,}\b")

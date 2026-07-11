@@ -971,7 +971,7 @@ class PeerExitWatcherTests(unittest.IsolatedAsyncioTestCase):
         await peer._read_loop()
 
         self.assertTrue(peer._stdout_eof)
-        self.assertTrue(peer._exit_evidence())
+        self.assertTrue(peer.exit_evidence())
 
     async def test_write_frame_broken_pipe_sets_stdin_exit_evidence(self) -> None:
         class BrokenStdin:
@@ -988,7 +988,7 @@ class PeerExitWatcherTests(unittest.IsolatedAsyncioTestCase):
             await peer._write_frame({"jsonrpc": "2.0"})
 
         self.assertTrue(peer._stdin_write_failed)
-        self.assertTrue(peer._exit_evidence())
+        self.assertTrue(peer.exit_evidence())
 
     async def test_drain_stderr_bounds_tail_lines_and_line_length(self) -> None:
         lines = [f"line-{index}\n".encode() for index in range(STDERR_TAIL_MAX_LINES + 5)]

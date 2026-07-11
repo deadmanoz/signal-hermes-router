@@ -4968,6 +4968,9 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             def release_session(self, *_args, **_kwargs) -> None:
                 return None
 
+            def exit_suspected(self) -> bool:
+                return False
+
             async def prompt(self, session_id: str, blocks: list[dict]):
                 prompts.append(1)
                 raise RuntimeError("prompt boom")
@@ -5044,6 +5047,9 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
             def release_session(self, *_args, **_kwargs) -> None:
                 return None
+
+            def exit_suspected(self) -> bool:
+                return False
 
             async def prompt(self, session_id: str, blocks: list[dict]):
                 raise RuntimeError("prompt boom")
