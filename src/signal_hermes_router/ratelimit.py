@@ -28,6 +28,10 @@ class TokenBucket:
             return True
         return False
 
+    def refund(self) -> None:
+        """Return one token, e.g. when an admitted turn never ran."""
+        self._tokens = min(self._capacity, self._tokens + 1.0)
+
     def _refill(self, now_ms: int) -> None:
         if self._last_refill_ms is None:
             self._last_refill_ms = now_ms

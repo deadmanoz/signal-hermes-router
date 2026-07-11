@@ -486,27 +486,31 @@ routes:
   timestamp is older than this many seconds at the moment its turn would run
   is dedupe-claimed, marked handled, and skipped without prompting, so a
   backlog drain (for example signal-cli replaying queued messages after
-  downtime) does not answer hours-old messages. Staleness is evaluated after
-  the turn holds both its route and profile locks: an event that goes stale
-  while queued behind a slow turn (including another route's turn on a
-  shared profile) is also skipped. Because the skip marks the event handled
-  in the dedupe store, redelivery of a skipped event stays skipped. Events
-  without a usable timestamp (the normalizer emits `0`) bypass the age
-  check rather than being treated as infinitely old.
+  downtime) does not answer hours-old messages. Staleness is evaluated
+  twice: once under the route lock alone, so an already-stale backlog event
+  is discarded immediately instead of queueing behind another route's long
+  turn on a shared profile, and again once the turn holds the profile lock,
+  so an event that ages out while queued (including behind another route's
+  turn on a shared profile) is also skipped. Because the skip marks the
+  event handled in the dedupe store, redelivery of a skipped event stays
+  skipped. Events without a usable timestamp (the normalizer emits `0`)
+  bypass the age check rather than being treated as infinitely old.
 - `inbound_rate_limit` - token-bucket cap on prompted inbound turns.
   Sustained admission is `max_turns / window_seconds` turns per second with
   bursts up to `max_turns`. Turns beyond the rate are dropped:
   dedupe-claimed, marked handled, and logged as a content-free INFO line
-  carrying only the redacted route reference. The cap counts only turns
-  that actually reach the Hermes prompt: a token is consumed immediately
-  before the prompt call, after every other gate has passed, so turns
-  gated by route state (`maintenance`, `disabled`, `shadow`),
-  deduplicated redeliveries, and turns that fail earlier in the pipeline
-  (attachment storage, session acquisition) never consume tokens. A route
-  that accumulates traffic while inactive therefore does not drop its
-  first turns after (re)activation. `max_turns` must be an integer >= 1
-  (booleans and fractional values are rejected); `window_seconds` must be
-  a positive finite number.
+  carrying only the redacted route reference. A token is reserved after the
+  route-state gate but before attachment storage and ACP session
+  acquisition, so an over-limit burst sheds before consuming media I/O or
+  `session/new` work, and the token is refunded if an admitted turn fails
+  before the prompt (attachment storage or session acquisition failures).
+  The cap therefore counts only turns that actually reach the Hermes
+  prompt: turns gated by route state (`maintenance`, `disabled`, `shadow`)
+  and deduplicated redeliveries never consume tokens, and a route that
+  accumulates traffic while inactive does not drop its first turns after
+  (re)activation. `max_turns` must be an integer >= 1 (booleans and
+  fractional values are rejected); `window_seconds` must be a positive
+  finite number.
 
 Dropped and skipped events are permanent for that event identity: the router
 deliberately declines the turn and records it as handled. Operators who need

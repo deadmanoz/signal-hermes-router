@@ -40,6 +40,20 @@ class TokenBucketTests(unittest.TestCase):
         # Refill resumes from the last observed time, not the stepped-back one.
         self.assertTrue(bucket.try_acquire(11_000))
 
+    def test_refund_returns_a_token_capped_at_capacity(self) -> None:
+        bucket = TokenBucket(capacity=1, refill_per_second=0.001)
+        self.assertTrue(bucket.try_acquire(0))
+        self.assertFalse(bucket.try_acquire(0))
+
+        bucket.refund()
+        self.assertTrue(bucket.try_acquire(0))
+
+        # Refunding a full bucket does not mint an extra token.
+        bucket.refund()
+        bucket.refund()
+        self.assertTrue(bucket.try_acquire(0))
+        self.assertFalse(bucket.try_acquire(0))
+
     def test_constructor_rejects_invalid_parameters(self) -> None:
         with self.assertRaises(ValueError):
             TokenBucket(capacity=0, refill_per_second=1)

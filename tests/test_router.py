@@ -693,6 +693,39 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result, TurnResult("reply"))
             self.assertEqual(len(profile.prompts), 1)
 
+    async def test_already_stale_event_skips_without_waiting_for_profile_lock(self) -> None:
+        # An event that is already stale must be discarded under the route
+        # lock alone: the Signal consumer awaits each handler, so blocking on
+        # a busy shared profile just to throw the event away would stall
+        # every following event behind an unrelated long turn.
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            dedupe = DedupeStore()
+            now_ms = 1_000_000_000
+            route = make_route(max_event_age_seconds=60)
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, routes=(route,)),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=dedupe,
+                clock_ms=lambda: now_ms,
+            )
+            stale_timestamp = now_ms - 3_600_000
+            profile_lock = router._profile_lock("profile")
+            await profile_lock.acquire()
+            try:
+                result = await asyncio.wait_for(
+                    router.handle_event(make_event(timestamp=stale_timestamp)),
+                    timeout=1.0,
+                )
+            finally:
+                profile_lock.release()
+
+            self.assertIsNone(result)
+            self.assertEqual(profile.prompts, [])
+            self.assertEqual(dedupe.status(route.key, "sender", stale_timestamp), "handled")
+
     async def test_event_going_stale_behind_shared_profile_lock_is_skipped(self) -> None:
         # Two routes share a profile. An event that was fresh when its route
         # lock was acquired can outlive its age limit while waiting on the
@@ -820,6 +853,44 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(active_result, TurnResult("reply"))
             self.assertIsNone(capped_result)
             self.assertEqual(len(profile.prompts), 1)
+
+    async def test_inbound_rate_cap_sheds_before_media_and_session_work(self) -> None:
+        # An over-limit turn is dropped before attachment storage and before
+        # ACP session acquisition, so a burst does not consume media I/O or
+        # session/new calls on its way to being discarded.
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            route = make_route(
+                session_policy=SessionPolicy.EPHEMERAL,
+                inbound_rate_limit=InboundRateLimitConfig(max_turns=1, window_seconds=60),
+            )
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, routes=(route,)),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            first = await router.handle_event(make_event(timestamp=1))
+            dropped = await router.handle_event(
+                make_event(
+                    timestamp=2,
+                    attachments=(
+                        SignalAttachment(
+                            content_type="image/png",
+                            filename="photo.png",
+                            body=b"png-bytes",
+                        ),
+                    ),
+                )
+            )
+
+            self.assertEqual(first, TurnResult("reply"))
+            self.assertIsNone(dropped)
+            self.assertEqual(len(profile.prompts), 1)
+            self.assertEqual(profile.new_sessions, 1)
+            self.assertEqual(list((Path(tmp) / "media").rglob("*.png")), [])
 
     async def test_inbound_rate_cap_does_not_burn_tokens_on_session_failure(self) -> None:
         # A turn that fails before the prompt (here: session acquisition)

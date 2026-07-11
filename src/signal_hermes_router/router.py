@@ -433,12 +433,18 @@ class SignalHermesRouter:
             if self._is_empty_signal_event(event):
                 self._mark_signal_turn_skipped(turn, reason="empty")
                 return None
+            # Early freshness check: an event that is already stale is
+            # discarded without waiting on the shared profile lock, so a
+            # backlog drain does not queue behind another route's long turn
+            # just to be thrown away.
+            if self._is_stale_signal_event(route, event):
+                self._mark_signal_turn_skipped(turn, reason="stale")
+                return None
             profile_lock = self._profile_lock(route.profile)
             async with profile_lock:
-                # Freshness and rate admission are evaluated at the real
-                # admission point, under both locks: routes can share a
-                # profile, so an event fresh at route-lock acquisition can go
-                # stale waiting behind another route's turn on this profile.
+                # Re-check freshness at the real admission point: routes can
+                # share a profile, so an event fresh at route-lock acquisition
+                # can age out waiting behind another route's turn.
                 if self._is_stale_signal_event(route, event):
                     self._mark_signal_turn_skipped(turn, reason="stale")
                     return None
@@ -617,6 +623,8 @@ class SignalHermesRouter:
             claimed_dedupe.append((dedupe_sender_id, dedupe_timestamp))
 
         handled = False
+        rate_token_reserved = False
+        prompt_attempted = False
         try:
             self._maybe_clear_breaker_override(route)
             state = self.route_state_overrides.get(route.key, route.state)
@@ -649,6 +657,31 @@ class SignalHermesRouter:
                     route_state=state,
                     **self._synthetic_outcome_fields(turn),
                 )
+
+            # Rate admission for inbound Signal turns happens here: after the
+            # route-state gate (only active turns can prompt; shadow routes
+            # store media by design and stay uncapped) but before media
+            # storage and session acquisition, so over-limit turns shed
+            # before consuming attachment I/O or ACP session work. The token
+            # is refunded in the finally below if the turn fails before the
+            # prompt, keeping the cap a prompt cap.
+            if (
+                turn.origin == TurnOrigin.SIGNAL
+                and route.inbound_rate_limit is not None
+                and state == RouteState.ACTIVE
+            ):
+                if not self._reserve_inbound_rate_token(route):
+                    handled = True
+                    LOGGER.info(
+                        "discarding rate_limited Signal event for route %s",
+                        self.redactor.ref("route", route.key),
+                    )
+                    return TurnOutcome(
+                        TurnOutcomeStatus.SKIPPED,
+                        route_state=state,
+                        **self._synthetic_outcome_fields(turn),
+                    )
+                rate_token_reserved = True
 
             manifests: list[MediaManifest] = []
             if turn.signal_event is not None:
@@ -721,23 +754,11 @@ class SignalHermesRouter:
                     # retry the same logical job.
                     handled = turn.synthetic is None
                     return outcome
-                # Rate admission happens here, where the prompt is the only
-                # remaining step: turns that fail earlier (media storage,
-                # attachment freeze, session acquisition) never burn tokens,
-                # keeping the cap a prompt cap.
-                if not self._admit_inbound_turn(route, turn):
-                    handled = True
-                    if session.ephemeral:
-                        session.profile.release_session(session.session_id)
-                    return TurnOutcome(
-                        TurnOutcomeStatus.SKIPPED,
-                        route_state=state,
-                        **self._synthetic_outcome_fields(turn),
-                    )
                 await self._typing(route, True)
                 turn_done = asyncio.Event()
                 notice_task = asyncio.create_task(self._long_running_notice(route, turn_done))
                 try:
+                    prompt_attempted = True
                     result = await session.profile.prompt(session.session_id, blocks)
                     # Stop the busy-notice task immediately so it cannot fire
                     # while a long chunked reply is still being sent.
@@ -809,6 +830,11 @@ class SignalHermesRouter:
             finally:
                 self._cleanup_owned_outbound_attachments(frozen_attachments)
         finally:
+            if rate_token_reserved and not prompt_attempted:
+                # The turn was admitted but failed before the prompt (media
+                # storage, attachment freeze, or session acquisition), so it
+                # did not spend Hermes capacity; return the token.
+                self._refund_inbound_rate_token(route)
             if handled:
                 for dedupe_sender_id, dedupe_timestamp in claimed_dedupe:
                     self.dedupe.mark_handled(route.key, dedupe_sender_id, dedupe_timestamp)
@@ -962,29 +988,22 @@ class SignalHermesRouter:
             return False
         return self._clock_ms() - event.timestamp > route.max_event_age_seconds * 1000.0
 
-    def _admit_inbound_turn(self, route: Route, turn: RoutedTurnInput) -> bool:
-        # Called from _run_turn immediately before the prompt, so every
-        # upstream gate (dedupe claim, route state, media storage, session
-        # acquisition) has already passed: a token is consumed if and only if
-        # the turn is about to prompt Hermes. Synthetic turns keep their own
-        # busy admission control and are never rate-capped.
-        if turn.origin != TurnOrigin.SIGNAL or route.inbound_rate_limit is None:
-            return True
+    def _reserve_inbound_rate_token(self, route: Route) -> bool:
         bucket = self._inbound_rate_buckets.get(route.key)
         if bucket is None:
             limit = route.inbound_rate_limit
+            assert limit is not None
             bucket = TokenBucket(
                 capacity=float(limit.max_turns),
                 refill_per_second=limit.max_turns / limit.window_seconds,
             )
             self._inbound_rate_buckets[route.key] = bucket
-        if bucket.try_acquire(self._clock_ms()):
-            return True
-        LOGGER.info(
-            "discarding rate_limited Signal event for route %s",
-            self.redactor.ref("route", route.key),
-        )
-        return False
+        return bucket.try_acquire(self._clock_ms())
+
+    def _refund_inbound_rate_token(self, route: Route) -> None:
+        bucket = self._inbound_rate_buckets.get(route.key)
+        if bucket is not None:
+            bucket.refund()
 
     def _mark_signal_turn_skipped(self, turn: RoutedTurnInput, *, reason: str) -> None:
         route = turn.route
