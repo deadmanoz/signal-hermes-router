@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.19](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.18...v0.1.19) (2026-07-11)
+
+
+### Bug Fixes
+
+* **router:** gracefully stop supervised Hermes children on SIGTERM ([#41](https://github.com/deadmanoz/signal-hermes-router/issues/41)) ([fcb42cd](https://github.com/deadmanoz/signal-hermes-router/commit/fcb42cdd0cc1014b1861be7aadaffb2f89ae0bf5))
+
 ## [0.1.18](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.17...v0.1.18) (2026-07-11)
 
 
