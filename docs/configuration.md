@@ -536,6 +536,47 @@ deliberately declines the turn and records it as handled. Operators who need
 delivery of every message under sustained overload should leave the rate cap
 off and scale the profile instead.
 
+## Retention sweeps
+
+`router.retention` bounds the two router-owned stores that otherwise grow
+forever: the dedupe state DB and the archived-media tree. One sweep runs at
+router startup and then once per `sweep_interval_seconds` (default `21600`,
+6 hours). Sweep logging is counts-only (rows, files, bytes, directories);
+no filename, identifier, or path ever appears in a sweep log line.
+
+- `router.retention.dedupe_handled_seconds` (default `2592000`, 30 days) -
+  delete `handled` dedupe rows whose retention clock is older than this.
+  The clock is a router-owned wall-clock timestamp recorded when the row
+  was last written, not the sender-controlled Signal event timestamp, so
+  idempotency-key identities (whose event timestamp is a sentinel `0`) age
+  by when they were handled and forged event timestamps cannot evade or
+  outlive retention. `processing` claims are never pruned. `null` disables
+  dedupe pruning. Values below `86400` (1 day) are rejected at config load
+  so retention always comfortably exceeds the Signal redelivery and
+  synthetic retry window; consequently, an identity whose row has aged out
+  is re-handled if the upstream replays it after the window.
+- `router.retention.media_max_age_seconds` (default off) - delete archived
+  attachment/manifest pairs older than this. Deleting stored media is data
+  loss, so the age pass is opt-in; values below `86400` are rejected.
+- `router.retention.media_max_total_bytes` (default off) - size cap for
+  the archived-media subtree; when the archive exceeds it, the oldest
+  attachment groups are deleted first until at or under the cap.
+- `router.retention.sweep_interval_seconds` (default `21600`) - time
+  between periodic sweeps; must be a positive finite number.
+
+Media passes only ever consider the router-written archive layout
+(`<platform>/<YYYY>/<MM>/...` under `router.media_root`) plus stale
+`.outbound` crash orphans; see [media handling](media.md) for the sweep's
+media-side guarantees. Attachments and frozen outbound images referenced by
+an in-flight turn are tracked as live and are never deleted mid-turn.
+
+Dedupe pruning never freezes transport: on first startup after upgrade the
+state DB is migrated to incremental auto-vacuum (a backup copy is written
+next to the DB as `<state_db>.migration-backup` before any migration, and
+kept for the operator), after which prunes run as small chunked deletes and
+space is reclaimed with bounded `incremental_vacuum` chunks rather than a
+long full `VACUUM`.
+
 ## Circuit breaker
 
 The per-route circuit breaker (`signal_hermes_router.circuit`) tracks Hermes

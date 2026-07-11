@@ -23,6 +23,7 @@ from signal_hermes_router.config import (
     AppConfig,
     CircuitBreakerConfig,
     InboundRateLimitConfig,
+    RetentionConfig,
     Route,
     RouterConfig,
     RouterControlConfig,
@@ -60,6 +61,7 @@ from tests.support import (
     make_app,
     make_event,
     make_route,
+    make_router_harness,
 )
 
 
@@ -6988,6 +6990,231 @@ class UnexpectedChildExitRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(stable_ref("id", "private-profile"), output)
             finally:
                 await router.close()
+
+
+class RetentionSweepRouterTests(unittest.IsolatedAsyncioTestCase):
+    DAY_SECONDS = 86400.0
+
+    def _retention_config(self, **overrides: Any) -> RetentionConfig:
+        values: dict[str, Any] = {
+            "sweep_interval_seconds": 3600.0,
+            "dedupe_handled_seconds": 30 * self.DAY_SECONDS,
+            "media_max_age_seconds": 30 * self.DAY_SECONDS,
+        }
+        values.update(overrides)
+        return RetentionConfig(**values)
+
+    def _write_archive_file(self, tmp: str, relative: str, age_seconds: float) -> Path:
+        path = Path(tmp) / "media" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"synthetic media body")
+        moment = time.time() - age_seconds
+        os.utime(path, (moment, moment))
+        return path
+
+    async def test_startup_sweep_prunes_dedupe_and_media_with_count_only_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store_clock = {"now_ms": int((time.time() - 40 * self.DAY_SECONDS) * 1000)}
+            dedupe = DedupeStore(clock_ms=lambda: store_clock["now_ms"])
+            dedupe.mark_handled("signal:group", "old-uuid", 1)
+            store_clock["now_ms"] = int(time.time() * 1000)
+            dedupe.mark_handled("signal:group", "fresh-uuid", 2)
+            old_media = self._write_archive_file(
+                tmp, "signal/2024/01/abc123/old.pdf", 40 * self.DAY_SECONDS
+            )
+            fresh_media = self._write_archive_file(
+                tmp, "signal/2026/07/def456/fresh.pdf", 1 * self.DAY_SECONDS
+            )
+            harness = make_router_harness(
+                tmp,
+                dedupe=dedupe,
+                retention=self._retention_config(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="INFO") as logs:
+                await harness.router._run_retention_sweep_once()
+
+            self.assertFalse(harness.dedupe.is_handled("signal:group", "old-uuid", 1))
+            self.assertTrue(harness.dedupe.is_handled("signal:group", "fresh-uuid", 2))
+            self.assertFalse(old_media.exists())
+            self.assertTrue(fresh_media.exists())
+            retention_lines = [line for line in logs.output if "retention sweep" in line]
+            self.assertTrue(retention_lines)
+            for line in retention_lines:
+                self.assertNotIn(tmp, line)
+                self.assertNotIn("old.pdf", line)
+                self.assertNotIn("uuid", line)
+            self.assertTrue(any("pruned 1 handled dedupe rows" in line for line in retention_lines))
+            self.assertTrue(any("removed 1 media files" in line for line in retention_lines))
+            await harness.router.close(drain_timeout=0.0)
+
+    async def test_retention_loop_reschedules_periodic_sweeps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store_clock = {"now_ms": int((time.time() - 40 * self.DAY_SECONDS) * 1000)}
+            dedupe = DedupeStore(clock_ms=lambda: store_clock["now_ms"])
+            dedupe.mark_handled("signal:group", "startup-uuid", 1)
+            harness = make_router_harness(
+                tmp,
+                dedupe=dedupe,
+                retention=self._retention_config(sweep_interval_seconds=0.05),
+            )
+            router = harness.router
+            task = asyncio.create_task(router._run_retention_sweeps())
+            router._retention_task = task
+            try:
+                async with asyncio.timeout(5):
+                    while dedupe.is_handled("signal:group", "startup-uuid", 1):
+                        await asyncio.sleep(0.01)
+                # The startup sweep ran; a row backdated afterwards must be
+                # pruned by a later interval sweep, proving rescheduling.
+                dedupe.mark_handled("signal:group", "periodic-uuid", 2)
+                async with asyncio.timeout(5):
+                    while dedupe.is_handled("signal:group", "periodic-uuid", 2):
+                        await asyncio.sleep(0.01)
+            finally:
+                router.begin_shutdown()
+                with suppress(asyncio.CancelledError):
+                    async with asyncio.timeout(5):
+                        await task
+                await router.close(drain_timeout=0.0)
+
+    async def test_run_forever_spawns_no_retention_task_when_disabled(self) -> None:
+        class ParkedSignal(FakeSignal):
+            async def events(self):
+                await asyncio.Event().wait()
+                if False:
+                    yield {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = make_router_harness(
+                tmp,
+                signal=ParkedSignal(),
+                retention=RetentionConfig(dedupe_handled_seconds=None),
+            )
+            router = harness.router
+            run_task = asyncio.create_task(router.run_forever())
+            try:
+                await asyncio.sleep(0.05)
+                self.assertIsNone(router._retention_task)
+            finally:
+                router.begin_shutdown()
+                with suppress(asyncio.CancelledError):
+                    async with asyncio.timeout(5):
+                        await run_task
+                await router.close(drain_timeout=0.0)
+
+    async def test_close_reports_blocked_sweep_worker_without_wedging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            import threading
+
+            worker_started = threading.Event()
+            worker_release = threading.Event()
+
+            def blocked_plan(**_kwargs: Any) -> Any:
+                worker_started.set()
+                worker_release.wait(timeout=30)
+                from signal_hermes_router.media import MediaSweepPlan
+
+                return MediaSweepPlan(groups=(), candidate_dirs=())
+
+            harness = make_router_harness(
+                tmp,
+                retention=self._retention_config(dedupe_handled_seconds=None),
+            )
+            router = harness.router
+            with (
+                patch("signal_hermes_router.router.plan_media_sweep", blocked_plan),
+                patch("signal_hermes_router.router.SHUTDOWN_SETTLE_TIMEOUT_SECONDS", 0.2),
+            ):
+                task = asyncio.create_task(router._run_retention_sweeps())
+                router._retention_task = task
+                try:
+                    async with asyncio.timeout(5):
+                        while not worker_started.is_set():
+                            await asyncio.sleep(0.01)
+                    with self.assertLogs("signal_hermes_router.router", level="ERROR") as logs:
+                        started = time.monotonic()
+                        await router.close(drain_timeout=0.0)
+                        elapsed = time.monotonic() - started
+                    # Bounded: the blocked worker is reported, not awaited to
+                    # completion, and the dedupe store still closed cleanly.
+                    self.assertLess(elapsed, 5.0)
+                    self.assertTrue(any("retention sweep worker" in line for line in logs.output))
+                    self.assertTrue(router.dedupe.close())
+                finally:
+                    worker_release.set()
+                    task.cancel()
+                    with suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                        async with asyncio.timeout(5):
+                            await task
+
+    async def test_inbound_manifest_paths_live_during_prompt_and_released_after(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            live_seen: list[Path] = []
+
+            class SnapshotProfile(FakeProfile):
+                def __init__(self, router_ref: dict[str, Any]) -> None:
+                    super().__init__()
+                    self._router_ref = router_ref
+
+                async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
+                    live_seen.extend(self._router_ref["router"]._live_media.keys())
+                    return await super().prompt(session_id, blocks)
+
+            router_ref: dict[str, Any] = {}
+            profile = SnapshotProfile(router_ref)
+            harness = make_router_harness(
+                tmp,
+                profile=profile,
+                supervisor=FakeSupervisor(profile),
+                retention=self._retention_config(),
+            )
+            router_ref["router"] = harness.router
+            event = make_event(
+                timestamp=10,
+                text="file",
+                attachments=(
+                    SignalAttachment(
+                        content_type="application/pdf",
+                        filename="report.pdf",
+                        body=b"%PDF synthetic",
+                    ),
+                ),
+            )
+
+            result = await harness.router.handle_event(event)
+
+            self.assertIsNotNone(result)
+            self.assertEqual(len(live_seen), 1)
+            self.assertTrue(str(live_seen[0]).endswith("report.pdf"))
+            self.assertEqual(len(harness.router._live_media), 0)
+            await harness.router.close(drain_timeout=0.0)
+
+    async def test_outbound_freeze_counter_balances_across_nested_scopes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = make_router_harness(tmp, retention=self._retention_config())
+            router = harness.router
+            media_root = Path(tmp) / "media"
+            staged = media_root / "camera" / "person.png"
+            ensure_private_dir_tree(media_root, staged.parent)
+            write_private_bytes(staged, b"\x89PNG synthetic")
+
+            outer = router._freeze_outbound_attachments([str(staged)])
+            self.assertEqual(len(outer), 1)
+            frozen_path = outer[0].path
+            self.assertEqual(router._live_media[frozen_path], 1)
+
+            inner = router._freeze_outbound_attachments(outer)
+            self.assertEqual(router._live_media[frozen_path], 2)
+
+            router._cleanup_owned_outbound_attachments(inner)
+            self.assertEqual(router._live_media[frozen_path], 1)
+            # Still live after the inner scope: the sweep must not delete it.
+            self.assertTrue(router._is_live_media(frozen_path))
+
+            router._cleanup_owned_outbound_attachments(outer)
+            self.assertEqual(len(router._live_media), 0)
+            await router.close(drain_timeout=0.0)
 
 
 if __name__ == "__main__":

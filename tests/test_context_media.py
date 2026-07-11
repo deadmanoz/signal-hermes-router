@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -14,7 +16,16 @@ from signal_hermes_router.context import (
     render_route_context,
     render_scheduled_event,
 )
-from signal_hermes_router.media import safe_filename, write_attachment
+from signal_hermes_router.media import (
+    MEDIA_SWEEP_MIN_AGE_SECONDS,
+    OUTBOUND_ORPHAN_MAX_AGE_SECONDS,
+    MediaSweepResult,
+    execute_media_sweep_groups,
+    plan_media_sweep,
+    remove_empty_sweep_dirs,
+    safe_filename,
+    write_attachment,
+)
 from signal_hermes_router.models import MediaManifest, SignalAttachment
 from tests.support import file_mode
 
@@ -444,6 +455,286 @@ class MediaTests(unittest.TestCase):
             self.assertEqual(block["name"], "one.png")
             self.assertEqual(block["mimeType"], "image/png")
             self.assertTrue(block["uri"].startswith("file://"))
+
+
+DAY_SECONDS = 86400.0
+
+
+class MediaRetentionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.media_root = Path(self._tmp.name) / "media"
+        self.now_ms = int(time.time() * 1000)
+
+    def _write(self, relative: str, *, age_seconds: float, content: bytes = b"x" * 64) -> Path:
+        path = self.media_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        self._backdate(path, age_seconds)
+        return path
+
+    def _backdate(self, path: Path, age_seconds: float) -> None:
+        moment = self.now_ms / 1000.0 - age_seconds
+        os.utime(path, (moment, moment))
+
+    def _sweep(
+        self,
+        *,
+        max_age_seconds: float | None = None,
+        max_total_bytes: int | None = None,
+        live: frozenset[Path] = frozenset(),
+    ) -> MediaSweepResult:
+        plan = plan_media_sweep(
+            media_root=self.media_root,
+            now_ms=self.now_ms,
+            max_age_seconds=max_age_seconds,
+            max_total_bytes=max_total_bytes,
+        )
+        result = execute_media_sweep_groups(plan.groups, is_live=lambda path: path in live)
+        dirs_removed = remove_empty_sweep_dirs(plan.candidate_dirs, self.media_root)
+        return MediaSweepResult(
+            files_removed=result.files_removed,
+            bytes_removed=result.bytes_removed,
+            dirs_removed=dirs_removed,
+        )
+
+    def test_age_pass_deletes_expired_group_and_keeps_fresh(self) -> None:
+        old = self._write("signal/2024/01/abc123/file.pdf", age_seconds=40 * DAY_SECONDS)
+        old_sidecar = self._write(
+            "signal/2024/01/abc123/file.pdf.manifest.json", age_seconds=40 * DAY_SECONDS
+        )
+        fresh = self._write("signal/2026/07/def456/fresh.pdf", age_seconds=1 * DAY_SECONDS)
+
+        result = self._sweep(max_age_seconds=30 * DAY_SECONDS)
+
+        self.assertFalse(old.exists())
+        self.assertFalse(old_sidecar.exists())
+        self.assertTrue(fresh.exists())
+        self.assertEqual(result.files_removed, 2)
+        self.assertGreaterEqual(result.dirs_removed, 1)
+        self.assertFalse(old.parent.exists())
+        self.assertTrue(self.media_root.is_dir())
+
+    def test_orphan_sidecar_is_swept_by_its_own_age(self) -> None:
+        orphan = self._write(
+            "signal/2024/01/abc123/gone.pdf.manifest.json", age_seconds=40 * DAY_SECONDS
+        )
+
+        self._sweep(max_age_seconds=30 * DAY_SECONDS)
+
+        self.assertFalse(orphan.exists())
+
+    def test_group_age_is_anchored_on_newest_member(self) -> None:
+        principal = self._write("signal/2024/01/abc123/file.pdf", age_seconds=40 * DAY_SECONDS)
+        sidecar = self._write(
+            "signal/2024/01/abc123/file.pdf.manifest.json", age_seconds=2 * DAY_SECONDS
+        )
+
+        self._sweep(max_age_seconds=30 * DAY_SECONDS)
+
+        self.assertTrue(principal.exists())
+        self.assertTrue(sidecar.exists())
+
+    def test_principal_named_like_sidecar_deletes_as_one_group(self) -> None:
+        principal = self._write(
+            "signal/2024/01/abc123/report.manifest.json", age_seconds=45 * DAY_SECONDS
+        )
+        sidecar = self._write(
+            "signal/2024/01/abc123/report.manifest.json.manifest.json",
+            age_seconds=40 * DAY_SECONDS,
+        )
+
+        self._sweep(max_age_seconds=30 * DAY_SECONDS)
+
+        self.assertFalse(principal.exists())
+        self.assertFalse(sidecar.exists())
+
+    def test_ambiguous_chain_never_deletes_fresh_principal_as_sidecar(self) -> None:
+        old_plain = self._write("signal/2024/01/abc123/X", age_seconds=40 * DAY_SECONDS)
+        fresh_json_principal = self._write(
+            "signal/2024/01/abc123/X.manifest.json", age_seconds=1 * DAY_SECONDS
+        )
+        fresh_real_sidecar = self._write(
+            "signal/2024/01/abc123/X.manifest.json.manifest.json",
+            age_seconds=1 * DAY_SECONDS,
+        )
+
+        self._sweep(max_age_seconds=30 * DAY_SECONDS)
+
+        # X owns no sidecar here: X.manifest.json has its own sidecar and is
+        # therefore an independent principal, never deleted as X's sidecar.
+        self.assertFalse(old_plain.exists())
+        self.assertTrue(fresh_json_principal.exists())
+        self.assertTrue(fresh_real_sidecar.exists())
+
+    def test_size_pass_deletes_oldest_first_until_under_cap(self) -> None:
+        oldest = self._write(
+            "signal/2024/01/aaa111/oldest.pdf", age_seconds=20 * DAY_SECONDS, content=b"a" * 400
+        )
+        middle = self._write(
+            "signal/2024/02/bbb222/middle.pdf", age_seconds=10 * DAY_SECONDS, content=b"b" * 400
+        )
+        newest = self._write(
+            "signal/2024/03/ccc333/newest.pdf", age_seconds=5 * DAY_SECONDS, content=b"c" * 400
+        )
+
+        result = self._sweep(max_total_bytes=900)
+
+        self.assertFalse(oldest.exists())
+        self.assertTrue(middle.exists())
+        self.assertTrue(newest.exists())
+        self.assertEqual(result.files_removed, 1)
+
+    def test_operator_staged_files_survive_age_and_size_passes(self) -> None:
+        staged = self._write("camera/person.png", age_seconds=400 * DAY_SECONDS)
+        nested = self._write("staging/deep/archive.png", age_seconds=400 * DAY_SECONDS)
+
+        self._sweep(max_age_seconds=30 * DAY_SECONDS, max_total_bytes=1)
+
+        self.assertTrue(staged.exists())
+        self.assertTrue(nested.exists())
+        self.assertTrue(staged.parent.is_dir())
+
+    def test_outbound_orphans_swept_by_fixed_age_only(self) -> None:
+        stale = self._write(
+            ".outbound/1111aaaa/attachment.png",
+            age_seconds=OUTBOUND_ORPHAN_MAX_AGE_SECONDS * 2,
+        )
+        recent = self._write(".outbound/2222bbbb/attachment.png", age_seconds=3600.0)
+
+        result = self._sweep(max_age_seconds=30 * DAY_SECONDS, max_total_bytes=1)
+
+        self.assertFalse(stale.exists())
+        self.assertFalse(stale.parent.exists())
+        self.assertTrue(recent.exists())
+        self.assertEqual(result.files_removed, 1)
+
+    def test_live_paths_survive_every_pass(self) -> None:
+        live_archive = self._write("signal/2024/01/abc123/live.pdf", age_seconds=400 * DAY_SECONDS)
+        live_outbound = self._write(
+            ".outbound/3333cccc/attachment.png",
+            age_seconds=OUTBOUND_ORPHAN_MAX_AGE_SECONDS * 4,
+        )
+        # Production registrations use resolved canonical paths; resolve here
+        # so the live keys match the sweep's resolved-root entry paths.
+        live = frozenset({live_archive.resolve(), live_outbound.resolve()})
+
+        self._sweep(max_age_seconds=30 * DAY_SECONDS, max_total_bytes=1, live=live)
+
+        self.assertTrue(live_archive.exists())
+        self.assertTrue(live_outbound.exists())
+
+    def test_size_pass_never_deletes_files_younger_than_grace(self) -> None:
+        young = self._write(
+            "signal/2026/07/ddd444/young.pdf",
+            age_seconds=MEDIA_SWEEP_MIN_AGE_SECONDS / 2,
+            content=b"y" * 400,
+        )
+
+        self._sweep(max_total_bytes=1)
+
+        self.assertTrue(young.exists())
+
+    def test_plan_act_race_skips_re_stored_attachment(self) -> None:
+        attachment = SignalAttachment(
+            content_type="application/pdf",
+            filename="report.pdf",
+            body=b"%PDF synthetic",
+        )
+        manifest = write_attachment(
+            media_root=self.media_root,
+            platform="signal",
+            timestamp=self.now_ms,
+            attachment=attachment,
+            group_ref="group_ref",
+            sender_ref="sender_ref",
+        )
+        self._backdate(manifest.canonical_path, 40 * DAY_SECONDS)
+        sidecar = manifest.canonical_path.with_name(f"{manifest.canonical_path.name}.manifest.json")
+        self._backdate(sidecar, 40 * DAY_SECONDS)
+
+        plan = plan_media_sweep(
+            media_root=self.media_root,
+            now_ms=self.now_ms,
+            max_age_seconds=30 * DAY_SECONDS,
+            max_total_bytes=None,
+        )
+        self.assertEqual(len(plan.groups), 1)
+        # An identical re-store lands between plan and execute; the mtime
+        # recheck must skip the whole group.
+        write_attachment(
+            media_root=self.media_root,
+            platform="signal",
+            timestamp=self.now_ms,
+            attachment=attachment,
+            group_ref="group_ref",
+            sender_ref="sender_ref",
+        )
+        result = execute_media_sweep_groups(plan.groups, is_live=lambda _path: False)
+
+        self.assertEqual(result.files_removed, 0)
+        self.assertTrue(manifest.canonical_path.exists())
+        self.assertTrue(sidecar.exists())
+
+    def test_write_attachment_refreshes_mtime_on_identical_re_store(self) -> None:
+        attachment = SignalAttachment(
+            content_type="application/pdf",
+            filename="report.pdf",
+            body=b"%PDF synthetic",
+        )
+        manifest = write_attachment(
+            media_root=self.media_root,
+            platform="signal",
+            timestamp=self.now_ms,
+            attachment=attachment,
+            group_ref="group_ref",
+            sender_ref="sender_ref",
+        )
+        self._backdate(manifest.canonical_path, 40 * DAY_SECONDS)
+        backdated_ns = os.lstat(manifest.canonical_path).st_mtime_ns
+
+        write_attachment(
+            media_root=self.media_root,
+            platform="signal",
+            timestamp=self.now_ms,
+            attachment=attachment,
+            group_ref="group_ref",
+            sender_ref="sender_ref",
+        )
+
+        self.assertGreater(os.lstat(manifest.canonical_path).st_mtime_ns, backdated_ns)
+        self.assertEqual(file_mode(manifest.canonical_path), 0o600)
+
+    def test_symlink_is_unlinked_without_following(self) -> None:
+        external = Path(self._tmp.name) / "external.dat"
+        external.write_bytes(b"external target content")
+        link = self.media_root / "signal" / "2024" / "01" / "abc123" / "planted.pdf"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(external)
+        moment = self.now_ms / 1000.0 - 40 * DAY_SECONDS
+        os.utime(link, (moment, moment), follow_symlinks=False)
+
+        self._sweep(max_age_seconds=30 * DAY_SECONDS)
+
+        self.assertFalse(link.exists(follow_symlinks=False))
+        self.assertEqual(external.read_bytes(), b"external target content")
+
+    def test_survivor_modes_untouched_and_root_kept(self) -> None:
+        fresh = self._write("signal/2026/07/eee555/fresh.pdf", age_seconds=1 * DAY_SECONDS)
+        os.chmod(fresh, 0o600)
+        os.chmod(fresh.parent, 0o700)
+
+        self._sweep(max_age_seconds=30 * DAY_SECONDS, max_total_bytes=10**9)
+
+        self.assertTrue(fresh.exists())
+        self.assertEqual(file_mode(fresh), 0o600)
+        self.assertEqual(file_mode(fresh.parent), 0o700)
+        self.assertTrue(self.media_root.is_dir())
+
+    def test_missing_media_root_is_a_no_op(self) -> None:
+        result = self._sweep(max_age_seconds=30 * DAY_SECONDS)
+        self.assertEqual(result, MediaSweepResult(0, 0, 0))
 
 
 if __name__ == "__main__":

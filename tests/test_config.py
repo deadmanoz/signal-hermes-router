@@ -902,5 +902,71 @@ router:
                 parse_router_config({"busy_notice_cooldown_seconds": value})
 
 
+class RetentionConfigTests(unittest.TestCase):
+    def test_defaults_prune_dedupe_and_leave_media_off(self) -> None:
+        retention = parse_router_config({}).retention
+        self.assertEqual(retention.sweep_interval_seconds, 21600.0)
+        self.assertEqual(retention.dedupe_handled_seconds, 2592000.0)
+        self.assertIsNone(retention.media_max_age_seconds)
+        self.assertIsNone(retention.media_max_total_bytes)
+        self.assertTrue(retention.dedupe_enabled)
+        self.assertFalse(retention.media_enabled)
+        self.assertTrue(retention.enabled)
+
+    def test_parse_round_trip(self) -> None:
+        retention = parse_router_config(
+            {
+                "retention": {
+                    "sweep_interval_seconds": 3600,
+                    "dedupe_handled_seconds": 86400,
+                    "media_max_age_seconds": 7776000,
+                    "media_max_total_bytes": 1073741824,
+                }
+            }
+        ).retention
+        self.assertEqual(retention.sweep_interval_seconds, 3600.0)
+        self.assertEqual(retention.dedupe_handled_seconds, 86400.0)
+        self.assertEqual(retention.media_max_age_seconds, 7776000.0)
+        self.assertEqual(retention.media_max_total_bytes, 1073741824)
+        self.assertTrue(retention.media_enabled)
+
+    def test_null_windows_disable_each_store(self) -> None:
+        retention = parse_router_config({"retention": {"dedupe_handled_seconds": None}}).retention
+        self.assertFalse(retention.dedupe_enabled)
+        self.assertFalse(retention.enabled)
+
+        size_only = parse_router_config(
+            {
+                "retention": {
+                    "dedupe_handled_seconds": None,
+                    "media_max_total_bytes": 4096,
+                }
+            }
+        ).retention
+        self.assertTrue(size_only.media_enabled)
+        self.assertTrue(size_only.enabled)
+
+    def test_rejects_sub_day_retention_windows(self) -> None:
+        for key in ("dedupe_handled_seconds", "media_max_age_seconds"):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "86400"):
+                parse_router_config({"retention": {key: 3600}})
+
+    def test_rejects_invalid_values_and_unknown_keys(self) -> None:
+        cases = [
+            {"sweep_interval_seconds": 0},
+            {"sweep_interval_seconds": float("inf")},
+            {"dedupe_handled_seconds": True},
+            {"media_max_total_bytes": 0},
+            {"media_max_total_bytes": 1.5},
+            {"media_max_total_bytes": True},
+            {"unexpected_knob": 1},
+        ]
+        for raw in cases:
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                parse_router_config({"retention": raw})
+        with self.assertRaisesRegex(ValueError, "must be a mapping"):
+            parse_router_config({"retention": ["not", "a", "mapping"]})
+
+
 if __name__ == "__main__":
     unittest.main()
