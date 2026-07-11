@@ -1523,6 +1523,34 @@ class ProfileExitWatcherSupervisorTests(unittest.IsolatedAsyncioTestCase):
                 replacement = await supervisor.get_profile(route)
             self.assertTrue(replacement.started)
 
+    async def test_supervisor_evicts_cached_profile_with_exit_evidence(self) -> None:
+        # A turn can arrive after the child died but before the exit watcher
+        # finishes its settle window and evicts the cache entry. The cached
+        # branch must consult the synchronous exit evidence and spawn a fresh
+        # child instead of handing back the dead instance.
+        class TogglableProfile(FakeManagedProfile):
+            suspected = False
+
+            def exit_suspected(self) -> bool:
+                return self.suspected
+
+        with tempfile.TemporaryDirectory() as tmp:
+            FakeManagedProfile.instances.clear()
+            route = make_route(profile="profile-a")
+            supervisor = ProfileSupervisor(
+                Path(tmp),
+                command_template=["hermes", "-p", "{profile}", "acp"],
+                restart_cooldown_seconds=60,
+            )
+            with patch.object(sessions_module, "ACPProfile", TogglableProfile):
+                first = await supervisor.get_profile(route)
+                self.assertIs(await supervisor.get_profile(route), first)
+                first.suspected = True
+                replacement = await supervisor.get_profile(route)
+            self.assertIsNot(replacement, first)
+            self.assertTrue(replacement.started)
+            self.assertIs(supervisor._profiles["profile-a"], replacement)
+
     async def test_supervisor_rejects_profile_with_exit_evidence_after_start(self) -> None:
         # A child can answer initialize and die before the exit watcher gets
         # CPU: the identity check alone would pass, so get_profile must also

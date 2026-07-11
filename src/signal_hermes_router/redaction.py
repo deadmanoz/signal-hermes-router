@@ -16,7 +16,11 @@ UUID_RE = re.compile(
 # credentials and terminal control sequences. Ordinary traceback text (paths,
 # module names, exception messages) stays readable.
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]")
-CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Everything below 0x20 except tab and newline is normalized to a space --
+# including carriage returns, which would otherwise let child output like
+# "progress\r..." overwrite or forge the visible log line in terminal and
+# journal viewers.
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 BEARER_RE = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}")
 # A credential assignment masks the REST OF THE LINE, not just the first
 # whitespace-delimited token: a quoted multi-word passphrase and header-style

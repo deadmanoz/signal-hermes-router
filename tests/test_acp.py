@@ -947,6 +947,48 @@ class PeerExitWatcherTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await peer.close()
 
+    async def test_peer_close_cancelled_during_exit_handoff_still_kills_child(self) -> None:
+        # Cancellation while close() waits for the watcher handoff (live
+        # child with stdout-EOF evidence) must still reach the kill backstop:
+        # no exit path of close() may leave a running subprocess.
+        wait_gate = asyncio.Event()
+
+        class LiveProcess:
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+                self.killed = False
+
+            def terminate(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self) -> int | None:
+                await wait_gate.wait()
+                return self.returncode
+
+        peer = JsonRpcStdioPeer(["unused"])
+        process = LiveProcess()
+        peer.process = process  # type: ignore[assignment]
+        # Evidence without a reaped exit: the child closed its own stdout.
+        peer._stdout_eof = True
+        peer._exit_watcher_task = asyncio.create_task(peer._watch_exit())
+
+        close_task = asyncio.create_task(peer.close())
+        for _ in range(10):
+            await asyncio.sleep(0)
+        self.assertFalse(close_task.done(), "close() must be parked in the handoff wait")
+
+        close_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await close_task
+        self.assertTrue(process.killed, "kill backstop must run despite handoff cancellation")
+        wait_gate.set()
+        assert peer._exit_watcher_task is not None
+        await asyncio.wait_for(peer._exit_watcher_task, timeout=5)
+
     async def test_peer_exit_callback_failure_does_not_break_close(self) -> None:
         def bad_callback(_returncode: int | None, _tail: tuple[str, ...]) -> None:
             raise RuntimeError("callback boom")

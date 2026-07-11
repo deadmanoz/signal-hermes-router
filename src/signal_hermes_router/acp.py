@@ -120,18 +120,20 @@ class JsonRpcStdioPeer:
 
     async def close(self) -> None:
         watcher = self._exit_watcher_task
-        if watcher is not None and not watcher.done() and self.exit_evidence():
-            # The child's exit (or its broken pipes) predates this close: let
-            # the watcher report the unexpected exit before it is suppressed.
-            # This is the lazy-discovery incident class, where recovery closes
-            # the peer as soon as a request fails and would otherwise
-            # reclassify the crash as an intentional shutdown. The bound
-            # covers the one non-death way evidence can exist (a live child
-            # that closed its own stdout is never reaped); such a child is
-            # terminated below as a normal expected exit.
-            await asyncio.wait({watcher}, timeout=CLOSE_EXIT_REPORT_TIMEOUT_SECONDS)
-        self._expected_exit = True
         try:
+            if watcher is not None and not watcher.done() and self.exit_evidence():
+                # The child's exit (or its broken pipes) predates this close:
+                # let the watcher report the unexpected exit before it is
+                # suppressed. This is the lazy-discovery incident class, where
+                # recovery closes the peer as soon as a request fails and
+                # would otherwise reclassify the crash as an intentional
+                # shutdown. The bound covers the one non-death way evidence
+                # can exist (a live child that closed its own stdout is never
+                # reaped); such a child is terminated below as a normal
+                # expected exit. Inside the try block so cancellation during
+                # this wait still reaches the kill backstop.
+                await asyncio.wait({watcher}, timeout=CLOSE_EXIT_REPORT_TIMEOUT_SECONDS)
+            self._expected_exit = True
             if watcher is not None:
                 watcher.cancel()
                 with suppress(asyncio.CancelledError):

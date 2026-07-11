@@ -186,6 +186,7 @@ class RedactionTests(unittest.TestCase):
             # the sanitizer only cares about the base64-ish shape and length.
             "blob EXAMPLEbase64EXAMPLEbase64EXAMPLEbase64EXAMPLE==\n"
             "bell\x07 and null\x00 bytes\n"
+            "progress 42%\rprogress overwritten line\n"
         )
 
         sanitized = sanitize_subprocess_output(raw)
@@ -193,6 +194,8 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("\x1b", sanitized)
         self.assertNotIn("\x07", sanitized)
         self.assertNotIn("\x00", sanitized)
+        # Carriage returns could overwrite/forge visible log lines.
+        self.assertNotIn("\r", sanitized)
         self.assertNotIn("abc.DEF-123_456~789", sanitized)
         self.assertNotIn("sk-live-abcdefghijklmnop123456", sanitized)
         self.assertNotIn("hunter2secret", sanitized)

@@ -62,7 +62,14 @@ class ProfileSupervisor:
     async def get_profile(self, route: Route) -> ACPProfile:
         profile = self._profiles.get(route.profile)
         if profile is not None:
-            return profile
+            if not profile.exit_suspected():
+                return profile
+            # The child died but the exit watcher is still inside its settle
+            # window and has not evicted the entry yet. Evict now and fall
+            # through to spawn a fresh child so this turn recovers
+            # transparently; the watcher still logs the exit.
+            if self._profiles.get(route.profile) is profile:
+                del self._profiles[route.profile]
         last = self._last_restart.get(route.profile)
         if last is not None and self.restart_cooldown_seconds > 0:
             elapsed = time.monotonic() - last
