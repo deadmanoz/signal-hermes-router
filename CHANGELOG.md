@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.18](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.17...v0.1.18) (2026-07-11)
+
+
+### Bug Fixes
+
+* **acp:** add dedicated short timeout for ACP initialize ([#39](https://github.com/deadmanoz/signal-hermes-router/issues/39))
+
 ## [0.1.17](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.16...v0.1.17) (2026-07-11)
 
 
