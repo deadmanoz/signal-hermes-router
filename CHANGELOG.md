@@ -5,7 +5,7 @@
 
 ### Bug Fixes
 
-* **signal:** skip malformed SSE frames without stream teardown ([#37](https://github.com/deadmanoz/signal-hermes-router/issues/37)) ([f7ef2bc](https://github.com/deadmanoz/signal-hermes-router/commit/f7ef2bcfe56114a48e50644627c606f45fc2b035))
+* **signal:** skip malformed SSE frames without stream teardown ([#37](https://github.com/deadmanoz/signal-hermes-router/issues/37))
 
 ## [0.1.16](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.15...v0.1.16) (2026-07-11)
 
