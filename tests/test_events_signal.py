@@ -449,6 +449,30 @@ class SignalHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Skipping malformed Signal SSE frame", output)
         self.assertNotIn("synthetic-trailing", output)
 
+    async def test_iter_sse_json_skips_undecodable_frame_variants(self) -> None:
+        # json.loads failures beyond JSONDecodeError: a plain ValueError for
+        # integers over the interpreter digit limit and RecursionError for
+        # deeply nested payloads. Both must skip the frame, not end the stream.
+        response = FakeSseResponse(
+            [
+                "data: " + "1" * 5000,
+                "",
+                "data: " + "[" * 100000 + "]" * 100000,
+                "",
+                'data: {"message": "valid"}',
+                "",
+            ]
+        )
+
+        with self.assertLogs("signal_hermes_router.signal", level="WARNING") as logs:
+            events = [event async for event in _iter_sse_json(response)]  # type: ignore[arg-type]
+
+        self.assertEqual(events, [{"message": "valid"}])
+        self.assertEqual(
+            len([line for line in logs.output if "Skipping malformed Signal SSE frame" in line]),
+            2,
+        )
+
     async def test_iter_sse_json_skips_non_dict_frame(self) -> None:
         response = FakeSseResponse(["data: 5", "", 'data: {"message": "valid"}', ""])
 

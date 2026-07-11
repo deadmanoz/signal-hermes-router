@@ -188,10 +188,13 @@ def _decode_sse_frame(data: str) -> dict[str, Any] | None:
     # one malformed frame must not tear down the SSE stream, because a
     # reconnect can silently lose stream position (signal-cli has no replay).
     # The warning stays content-free; Signal payloads carry group IDs, phone
-    # numbers, and message text.
+    # numbers, and message text. json.loads can fail with more than
+    # JSONDecodeError: a plain ValueError for integers over the interpreter
+    # digit limit and RecursionError for deeply nested payloads. All are
+    # decode-local failures of this one frame, so treat them alike.
     try:
         payload = json.loads(data)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         payload = None
     if not isinstance(payload, dict):
         LOGGER.warning("Skipping malformed Signal SSE frame (%d bytes)", len(data.encode("utf-8")))
