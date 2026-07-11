@@ -5,7 +5,7 @@
 
 ### Features
 
-* **sessions:** log and proactively detect Hermes subprocess exits ([#43](https://github.com/deadmanoz/signal-hermes-router/issues/43)) ([47f9211](https://github.com/deadmanoz/signal-hermes-router/commit/47f9211cfab5921c0ce6a376fccfca6aa18ff418))
+* **sessions:** log and proactively detect Hermes subprocess exits ([#43](https://github.com/deadmanoz/signal-hermes-router/issues/43))
 
 ## [0.1.19](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.18...v0.1.19) (2026-07-11)
 
