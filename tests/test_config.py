@@ -813,6 +813,82 @@ router:
                     }
                 )
 
+    def test_parse_route_session_rotation_defaults_off(self) -> None:
+        route = parse_route({"platform": "signal", "group_id": "GROUP", "profile": "profile"})
+
+        self.assertIsNone(route.session_max_turns)
+        self.assertIsNone(route.session_max_age_seconds)
+
+    def test_parse_route_reads_session_rotation_knobs(self) -> None:
+        route = parse_route(
+            {
+                "platform": "signal",
+                "group_id": "GROUP",
+                "profile": "profile",
+                "session_policy": "persistent_sender",
+                "session_max_turns": 50,
+                "session_max_age_seconds": 86400,
+            }
+        )
+
+        self.assertEqual(route.session_max_turns, 50)
+        self.assertEqual(route.session_max_age_seconds, 86400.0)
+
+    def test_parse_route_session_rotation_accepts_decimal_string_max_turns(self) -> None:
+        # Secret-resolver values arrive as strings.
+        route = parse_route(
+            {
+                "platform": "signal",
+                "group_id": "GROUP",
+                "profile": "profile",
+                "session_max_turns": "50",
+            }
+        )
+
+        self.assertEqual(route.session_max_turns, 50)
+
+    def test_parse_route_rejects_invalid_session_max_turns(self) -> None:
+        for value in (0, -1, True, 1.5, "1.5", "many", None):
+            raw = {
+                "platform": "signal",
+                "group_id": "GROUP",
+                "profile": "profile",
+                "session_max_turns": value,
+            }
+            if value is None:
+                # Explicit null means off, same as an absent key.
+                self.assertIsNone(parse_route(raw).session_max_turns)
+                continue
+            with self.assertRaises(ValueError, msg=repr(value)):
+                parse_route(raw)
+
+    def test_parse_route_rejects_invalid_session_max_age_seconds(self) -> None:
+        for value in (0, -1, float("inf"), float("nan"), True, "soon", None):
+            raw = {
+                "platform": "signal",
+                "group_id": "GROUP",
+                "profile": "profile",
+                "session_max_age_seconds": value,
+            }
+            if value is None:
+                # Explicit null means off, same as an absent key.
+                self.assertIsNone(parse_route(raw).session_max_age_seconds)
+                continue
+            with self.assertRaises(ValueError, msg=repr(value)):
+                parse_route(raw)
+
+    def test_parse_route_rejects_session_rotation_on_ephemeral_routes(self) -> None:
+        for knob in ({"session_max_turns": 50}, {"session_max_age_seconds": 3600}):
+            raw = {
+                "platform": "signal",
+                "group_id": "GROUP",
+                "profile": "profile",
+                "session_policy": "ephemeral",
+                **knob,
+            }
+            with self.assertRaises(ValueError, msg=repr(knob)):
+                parse_route(raw)
+
     def test_parse_router_config_reads_busy_notice_cooldown(self) -> None:
         default = parse_router_config({})
         self.assertEqual(default.busy_notice_cooldown_seconds, 0.0)

@@ -7,7 +7,7 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .acp import (
@@ -19,7 +19,7 @@ from .acp import (
 from .config import Route
 from .models import ChatType, NormalizedEvent, SessionKeyInput, SessionPolicy, SessionStatus
 from .permissions import StaticPermissionPolicy
-from .redaction import sanitize_subprocess_output
+from .redaction import sanitize_subprocess_output, stable_ref
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +32,12 @@ class RoutedSession:
     session_id: str
     cwd: Path
     ephemeral: bool = False
+    # Rotation bookkeeping for cached persistent sessions: monotonic creation
+    # time of the underlying ACP session's context window and the number of
+    # turns it has served. Both survive a session/resume (context is
+    # preserved) and reset when a fresh session replaces the old one.
+    created_at: float = field(default_factory=time.monotonic)
+    turn_count: int = 0
 
 
 class ProfileSupervisor:
@@ -219,9 +225,16 @@ class ProfileSupervisor:
 
 
 class SessionRegistry:
-    def __init__(self, work_root: Path, supervisor: ProfileSupervisor) -> None:
+    def __init__(
+        self,
+        work_root: Path,
+        supervisor: ProfileSupervisor,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.work_root = work_root
         self.supervisor = supervisor
+        self._clock = clock
         self._sessions: dict[str, RoutedSession] = {}
         self._session_routes: dict[str, str] = {}
 
@@ -236,11 +249,14 @@ class SessionRegistry:
         session_key = self._session_key(route, session_ref)
         policy = permission_policy or route.permission_policy
         existing = self._sessions.get(session_key)
+        if existing is not None and self._rotate_expired(route, session_key, existing, profile):
+            existing = None
         if existing:
             if existing.profile is not profile:
                 existing = await self._resume_or_recreate(route, profile, existing, policy)
                 self._sessions[session_key] = existing
                 self._session_routes[session_key] = route.key
+            existing.turn_count += 1
             profile.set_permission_policy(existing.session_id, policy)
             return existing
         cwd = self._cwd(route.profile, session_key)
@@ -248,12 +264,54 @@ class SessionRegistry:
         profile.set_permission_policy(session_id, policy)
         ephemeral = route.session_policy == SessionPolicy.EPHEMERAL
         session = RoutedSession(
-            profile=profile, session_id=session_id, cwd=cwd, ephemeral=ephemeral
+            profile=profile,
+            session_id=session_id,
+            cwd=cwd,
+            ephemeral=ephemeral,
+            created_at=self._clock(),
+            turn_count=1,
         )
         if not ephemeral:
             self._sessions[session_key] = session
             self._session_routes[session_key] = route.key
         return session
+
+    def _rotate_expired(
+        self,
+        route: Route,
+        session_key: str,
+        session: RoutedSession,
+        profile: ACPProfile,
+    ) -> bool:
+        """Evict a cached persistent session whose rotation budget is spent so
+        the caller creates a fresh session (session/new) for this turn. Purely
+        transport session lifecycle: the Hermes subprocess keeps running."""
+        age = self._clock() - session.created_at
+        if route.session_max_turns is not None and session.turn_count >= route.session_max_turns:
+            reason = "max_turns"
+        elif route.session_max_age_seconds is not None and age >= route.session_max_age_seconds:
+            reason = "max_age"
+        else:
+            return False
+        self._sessions.pop(session_key, None)
+        self._session_routes.pop(session_key, None)
+        if session.profile is profile:
+            # Drop the rotated session's per-session state (permission policy,
+            # prompt lock, update subscription) on the live profile so long
+            # rotation histories do not accumulate entries. A session cached
+            # against an evicted profile instance has nothing to release here.
+            profile.release_session(session.session_id)
+        # Hashed route ref plus code-controlled reason and counters only:
+        # redaction-safe by construction.
+        LOGGER.info(
+            "rotating Hermes session for %s after %d turn(s) (age %.0fs): %s; "
+            "creating a fresh session",
+            stable_ref("route", route.key),
+            session.turn_count,
+            age,
+            reason,
+        )
+        return True
 
     async def replace_after_restart(
         self,
@@ -315,11 +373,17 @@ class SessionRegistry:
                 )
                 session_id = await profile.new_session(previous.cwd)
         profile.set_permission_policy(session_id, permission_policy)
+        # A resumed session keeps its accumulated context, so the rotation
+        # budget carries over; a fresh session starts a new budget. The caller
+        # (or the next turn's get) counts the turn, so no increment here.
+        resumed_previous = session_id == previous.session_id
         return RoutedSession(
             profile=profile,
             session_id=session_id,
             cwd=previous.cwd,
             ephemeral=previous.ephemeral,
+            created_at=previous.created_at if resumed_previous else self._clock(),
+            turn_count=previous.turn_count if resumed_previous else 0,
         )
 
     def _session_key(self, route: Route, session_ref: NormalizedEvent | SessionKeyInput) -> str:

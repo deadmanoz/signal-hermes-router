@@ -64,6 +64,8 @@ def make_route(
     maintenance_reply: str | None = None,
     failure_reply: str | None = None,
     recreate_session_on_resume_failure: bool = False,
+    session_max_turns: int | None = None,
+    session_max_age_seconds: float | None = None,
     max_event_age_seconds: float | None = None,
     inbound_rate_limit: InboundRateLimitConfig | None = None,
 ) -> Route:
@@ -83,6 +85,8 @@ def make_route(
         maintenance_reply=maintenance_reply,
         failure_reply=failure_reply,
         recreate_session_on_resume_failure=recreate_session_on_resume_failure,
+        session_max_turns=session_max_turns,
+        session_max_age_seconds=session_max_age_seconds,
         max_event_age_seconds=max_event_age_seconds,
         inbound_rate_limit=inbound_rate_limit,
     )

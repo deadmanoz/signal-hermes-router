@@ -9,6 +9,16 @@ routes:
     # error after a Hermes subprocess restart discards the stale cached session
     # and creates a fresh one instead of surfacing the resume failure.
     recreate_session_on_resume_failure: false
+    # Opt-in session rotation for persistent routes (rejected on ephemeral
+    # routes, where every turn already gets a fresh session). A cached session
+    # that has served session_max_turns turns, or is older than
+    # session_max_age_seconds, is dropped and the next turn starts a fresh
+    # session (session/new) on the same running Hermes subprocess, bounding
+    # accumulated conversation context on busy routes. Unset means never
+    # rotate. A resumed session keeps its rotation budget; a recreated one
+    # starts a new budget.
+    # session_max_turns: 50
+    # session_max_age_seconds: 86400
     state: "shadow"
     # Opt-in inbound burst policy for busy many-participant groups. Both knobs
     # are off by default.
