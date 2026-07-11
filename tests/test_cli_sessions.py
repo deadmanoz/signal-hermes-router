@@ -1353,6 +1353,196 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("private-profile", "\n".join(logs.output))
 
 
+_FAKE_ACP_AGENT = Path(__file__).parent / "fixtures" / "fake_acp_agent.py"
+
+
+class ProfileExitWatcherSupervisorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_supervisor_logs_unexpected_exit_and_respawns_on_next_acquisition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = make_route(profile="profile-a")
+            supervisor = ProfileSupervisor(
+                Path(tmp) / "work",
+                command_template=[sys.executable, str(_FAKE_ACP_AGENT)],
+            )
+            try:
+                first = await supervisor.get_profile(route)
+                assert first.peer is not None and first.peer.process is not None
+                process = first.peer.process
+                with self.assertLogs("signal_hermes_router.sessions", level="ERROR") as logs:
+                    process.kill()
+                    # Acceptance bound: the exit is noticed, logged, and the
+                    # profile marked dead within a second of the death.
+                    for _ in range(100):
+                        if "profile-a" not in supervisor._profiles:
+                            break
+                        await asyncio.sleep(0.01)
+                self.assertNotIn("profile-a", supervisor._profiles)
+                output = "\n".join(logs.output)
+                self.assertIn("profile-a", output)
+                self.assertIn("exited unexpectedly with returncode -9", output)
+                self.assertIn("will respawn on next acquisition", output)
+                # No cooldown was stamped: the next acquisition transparently
+                # spawns a fresh child.
+                replacement = await supervisor.get_profile(route)
+                self.assertIsNot(replacement, first)
+                assert replacement.peer is not None and replacement.peer.process is not None
+                self.assertNotEqual(replacement.peer.process.pid, process.pid)
+            finally:
+                await supervisor.close()
+
+    async def test_supervisor_restart_and_close_do_not_log_unexpected_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = make_route(profile="profile-a")
+            supervisor = ProfileSupervisor(
+                Path(tmp) / "work",
+                command_template=[sys.executable, str(_FAKE_ACP_AGENT)],
+            )
+            with self.assertNoLogs("signal_hermes_router.sessions", level="ERROR"):
+                await supervisor.get_profile(route)
+                await supervisor.restart_profile("profile-a")
+                await supervisor.get_profile(route)
+                await supervisor.close()
+                # Let any stray watcher callback land before the check ends.
+                await asyncio.sleep(0.05)
+
+    async def test_supervisor_logs_exit_when_recovery_closes_first(self) -> None:
+        # Lazy-discovery incident shape: the child dies mid-idle, the failure
+        # is only observed when the next request fails, and recovery calls
+        # restart_profile() immediately -- the exit must still be logged.
+        with tempfile.TemporaryDirectory() as tmp:
+            route = make_route(profile="profile-a")
+            supervisor = ProfileSupervisor(
+                Path(tmp) / "work",
+                command_template=[sys.executable, str(_FAKE_ACP_AGENT)],
+            )
+            try:
+                profile = await supervisor.get_profile(route)
+                assert profile.peer is not None and profile.peer.process is not None
+                profile.peer.process.kill()
+                with self.assertLogs("signal_hermes_router.sessions", level="ERROR") as logs:
+                    with self.assertRaises(Exception):
+                        await profile.peer.request("session/new", timeout=5)
+                    await supervisor.restart_profile("profile-a")
+                output = "\n".join(logs.output)
+                self.assertIn("exited unexpectedly with returncode -9", output)
+                replacement = await supervisor.get_profile(route)
+                self.assertIsNot(replacement, profile)
+            finally:
+                await supervisor.close()
+
+    async def test_supervisor_redacts_stderr_tail_and_profile_name_in_exit_log(self) -> None:
+        # A child that answers initialize, lingers briefly, then writes
+        # credential-bearing stderr and crashes. Both the profile name (via
+        # the redaction hook) and the stderr credentials (via the sanitizer)
+        # must be masked in the ERROR logs.
+        agent_code = (
+            "import json, sys, time\n"
+            "message = json.loads(sys.stdin.readline())\n"
+            "sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': message['id'],"
+            " 'result': {'agentCapabilities': {}}}) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(0.2)\n"
+            "sys.stderr.write('private-marker Authorization: Bearer super-secret-token-1234\\n')\n"
+            "sys.stderr.flush()\n"
+            "sys.exit(5)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            # The command template is str.format()-ed per part; a script file
+            # avoids brace escaping in the inline agent code.
+            agent_script = Path(tmp) / "crashing_agent.py"
+            agent_script.write_text(agent_code, encoding="utf-8")
+            route = make_route(profile="profile-a")
+            supervisor = ProfileSupervisor(
+                Path(tmp) / "work",
+                command_template=[sys.executable, str(agent_script)],
+            )
+            supervisor.set_redactor(
+                lambda text: text.replace("private-marker", "[marker]").replace(
+                    "profile-a", "[profile]"
+                )
+            )
+            try:
+                with self.assertLogs("signal_hermes_router.sessions", level="ERROR") as logs:
+                    await supervisor.get_profile(route)
+                    for _ in range(200):
+                        if "profile-a" not in supervisor._profiles:
+                            break
+                        await asyncio.sleep(0.01)
+                output = "\n".join(logs.output)
+                self.assertIn("returncode 5", output)
+                self.assertIn("[profile]", output)
+                self.assertNotIn("profile-a", output)
+                self.assertIn("[marker]", output)
+                self.assertNotIn("private-marker", output)
+                self.assertNotIn("super-secret-token-1234", output)
+            finally:
+                await supervisor.close()
+
+    async def test_supervisor_ignores_exit_of_replaced_profile_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            supervisor = ProfileSupervisor(Path(tmp))
+            stale = object()
+            replacement = object()
+            supervisor._profiles["profile-a"] = replacement  # type: ignore[assignment]
+
+            with self.assertLogs("signal_hermes_router.sessions", level="ERROR"):
+                supervisor._handle_profile_exit("profile-a", stale, 1, ())  # type: ignore[arg-type]
+
+            # A late callback for an already-replaced child still logs the
+            # exit but must not evict the replacement.
+            self.assertIs(supervisor._profiles["profile-a"], replacement)
+
+    async def test_supervisor_does_not_cache_profile_that_exits_during_start(self) -> None:
+        class DiesDuringStartProfile(FakeManagedProfile):
+            async def start(self) -> None:
+                self.started = True
+                # Simulate the exit watcher firing while start() is in flight
+                # (child answered initialize, then died immediately).
+                assert self.on_exit is not None
+                self.on_exit(-9, ())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            FakeManagedProfile.instances.clear()
+            route = make_route(profile="profile-a")
+            supervisor = ProfileSupervisor(
+                Path(tmp),
+                command_template=["hermes", "-p", "{profile}", "acp"],
+                restart_cooldown_seconds=60,
+            )
+            with patch.object(sessions_module, "ACPProfile", DiesDuringStartProfile):
+                with self.assertLogs("signal_hermes_router.sessions", level="ERROR"):
+                    with self.assertRaisesRegex(RuntimeError, "exited during startup"):
+                        await supervisor.get_profile(route)
+            self.assertEqual(supervisor._profiles, {})
+            # The exit did not stamp the failed-start cooldown: the next
+            # acquisition spawns fresh instead of failing fast.
+            with patch.object(sessions_module, "ACPProfile", FakeManagedProfile):
+                replacement = await supervisor.get_profile(route)
+            self.assertTrue(replacement.started)
+
+    async def test_supervisor_cancellation_during_start_leaves_no_cached_profile(self) -> None:
+        class CancelledStartProfile(FakeManagedProfile):
+            async def start(self) -> None:
+                raise asyncio.CancelledError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            FakeManagedProfile.instances.clear()
+            route = make_route(profile="profile-a")
+            supervisor = ProfileSupervisor(
+                Path(tmp),
+                command_template=["hermes", "-p", "{profile}", "acp"],
+                restart_cooldown_seconds=60,
+            )
+            with patch.object(sessions_module, "ACPProfile", CancelledStartProfile):
+                with self.assertRaises(asyncio.CancelledError):
+                    await supervisor.get_profile(route)
+            self.assertEqual(supervisor._profiles, {})
+            self.assertEqual(supervisor._last_restart, {})
+            with patch.object(sessions_module, "ACPProfile", FakeManagedProfile):
+                replacement = await supervisor.get_profile(route)
+            self.assertTrue(replacement.started)
+
+
 class _FakeServeRouter:
     def __init__(self, config: AppConfig) -> None:
         self.config = config

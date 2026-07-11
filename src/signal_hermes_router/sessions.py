@@ -5,6 +5,7 @@ import hashlib
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from .acp import (
 from .config import Route
 from .models import ChatType, NormalizedEvent, SessionKeyInput, SessionPolicy, SessionStatus
 from .permissions import StaticPermissionPolicy
+from .redaction import sanitize_subprocess_output
 
 LOGGER = logging.getLogger(__name__)
 
@@ -50,6 +52,12 @@ class ProfileSupervisor:
         self.restart_cooldown_seconds = restart_cooldown_seconds
         self._profiles: dict[str, ACPProfile] = {}
         self._last_restart: dict[str, float] = {}
+        self._redact: Callable[[str], str] = lambda text: text
+
+    def set_redactor(self, redact: Callable[[str], str]) -> None:
+        """Route the free-form exit-log content (profile name, stderr tail)
+        through the caller's redactor. Identity by default."""
+        self._redact = redact
 
     async def get_profile(self, route: Route) -> ACPProfile:
         profile = self._profiles.get(route.profile)
@@ -75,15 +83,59 @@ class ProfileSupervisor:
             prompt_timeout_seconds=self.prompt_timeout_seconds,
             initialize_timeout_seconds=self.initialize_timeout_seconds,
         )
+
+        def _on_exit(returncode: int | None, stderr_tail: tuple[str, ...]) -> None:
+            self._handle_profile_exit(route.profile, profile, returncode, stderr_tail)
+
+        profile.on_exit = _on_exit
+        # Provisional registration BEFORE start(): a child that answers
+        # initialize and dies immediately must be evictable by the exit
+        # watcher; a post-start cache write could store a corpse the watcher
+        # already reported.
+        self._profiles[route.profile] = profile
         try:
             await profile.start()
-        except Exception:
-            # Record so the next get_profile within the cooldown window
-            # refuses fast rather than spawning another doomed subprocess.
-            self._last_restart[route.profile] = time.monotonic()
+        except BaseException as exc:
+            if self._profiles.get(route.profile) is profile:
+                del self._profiles[route.profile]
+            if isinstance(exc, Exception):
+                # Record so the next get_profile within the cooldown window
+                # refuses fast rather than spawning another doomed subprocess.
+                # Cancellation is not a failed start and stamps no cooldown.
+                self._last_restart[route.profile] = time.monotonic()
             raise
-        self._profiles[route.profile] = profile
+        if self._profiles.get(route.profile) is not profile:
+            # The exit watcher evicted this instance while start() was in
+            # flight; never hand out a known-dead profile.
+            raise RuntimeError(f"Hermes profile {route.profile!r} exited during startup")
         return profile
+
+    def _handle_profile_exit(
+        self,
+        profile_name: str,
+        profile: ACPProfile,
+        returncode: int | None,
+        stderr_tail: tuple[str, ...],
+    ) -> None:
+        if self._profiles.get(profile_name) is profile:
+            # Mark dead: the next acquisition spawns a fresh subprocess. No
+            # eager respawn (a crash loop must not spin without traffic) and
+            # no failed-start cooldown stamp (the next turn must recover
+            # transparently; a genuinely broken binary still trips the
+            # cooldown on its next failed start).
+            del self._profiles[profile_name]
+        LOGGER.error(
+            "Hermes profile %s subprocess exited unexpectedly with returncode %s; "
+            "marked dead, will respawn on next acquisition",
+            self._redact(profile_name),
+            returncode,
+        )
+        if stderr_tail:
+            LOGGER.error(
+                "Hermes profile %s stderr tail near exit: %s",
+                self._redact(profile_name),
+                self._redact(sanitize_subprocess_output(" | ".join(stderr_tail))),
+            )
 
     async def restart_profile(self, profile_name: str) -> None:
         existing = self._profiles.pop(profile_name, None)

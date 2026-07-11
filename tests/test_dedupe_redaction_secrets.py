@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from signal_hermes_router.dedupe import DedupeStore
-from signal_hermes_router.redaction import Redactor
+from signal_hermes_router.redaction import Redactor, sanitize_subprocess_output
 from signal_hermes_router.secrets import resolve_secret_refs, resolve_secret_uri
 from tests.support import file_mode
 
@@ -169,6 +169,34 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("GROUP-ID", value)
         self.assertIn("[phone_redacted]", value)
         self.assertIn("[uuid_redacted]", value)
+
+    def test_sanitize_subprocess_output_masks_representative_secrets(self) -> None:
+        raw = (
+            "\x1b[31mTraceback (most recent call last):\x1b[0m\n"
+            '  File "/opt/hermes/agent.py", line 10, in run\n'
+            "Authorization: Bearer abc.DEF-123_456~789\n"
+            "api_key=sk-live-abcdefghijklmnop123456\n"
+            "password: hunter2secret\n"
+            "digest 0123456789abcdef0123456789abcdef01234567\n"
+            # The EXAMPLE marker keeps the repo's public-boundary check happy;
+            # the sanitizer only cares about the base64-ish shape and length.
+            "blob EXAMPLEbase64EXAMPLEbase64EXAMPLEbase64EXAMPLE==\n"
+            "bell\x07 and null\x00 bytes\n"
+        )
+
+        sanitized = sanitize_subprocess_output(raw)
+
+        self.assertNotIn("\x1b", sanitized)
+        self.assertNotIn("\x07", sanitized)
+        self.assertNotIn("\x00", sanitized)
+        self.assertNotIn("abc.DEF-123_456~789", sanitized)
+        self.assertNotIn("sk-live-abcdefghijklmnop123456", sanitized)
+        self.assertNotIn("hunter2secret", sanitized)
+        self.assertNotIn("0123456789abcdef0123456789abcdef01234567", sanitized)
+        self.assertNotIn("EXAMPLEbase64", sanitized)
+        # Ordinary traceback text stays readable for diagnosis.
+        self.assertIn("Traceback (most recent call last):", sanitized)
+        self.assertIn('File "/opt/hermes/agent.py", line 10, in run', sanitized)
 
 
 class SecretTests(unittest.TestCase):
