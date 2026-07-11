@@ -44,12 +44,12 @@ If you see a real-looking identifier in `config.example.yaml`, `routes.example.y
 ```
 signal-cli daemon → signal.py (HTTP/SSE client)
                   → events.py (normalise to NormalizedEvent)
-                  → dedupe.py (sqlite route-scoped event claims)
+                  → dedupe.py (sqlite route-scoped event claims; retention-pruned)
                   → router.py (route-state gate → media → prompt → reply)
 local automation → cli.py/control socket (trigger-job, notify-route, preflight-permissions)
                   → router.py (same route-state/session/reply path)
                        │
-                       ├─ media.py       attachment fetch + per-route storage (write_attachment, MediaManifest)
+                       ├─ media.py       attachment fetch + per-route storage + retention sweep (write_attachment, MediaManifest, plan_media_sweep)
                        ├─ outbound_media.py  validate notify-route outbound image attachments
                        ├─ context.py     build_prompt_blocks/build_synthetic_prompt_blocks (route-context preamble + escaped text + media/payload blocks)
                        ├─ sessions.py    ProfileSupervisor (one hermes subprocess per profile) + SessionRegistry (per session-policy)

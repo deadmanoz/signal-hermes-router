@@ -24,6 +24,22 @@ router:
     failures: 3
     window_seconds: 300
     recovery_seconds: 300
+  retention:
+    # One sweep at startup, then one per interval.
+    sweep_interval_seconds: 21600
+    # Prune 'handled' dedupe rows whose last update is older than this.
+    # Must be >= 86400 (windows below one day are rejected) so retention
+    # comfortably exceeds the Signal redelivery / synthetic retry window.
+    # null disables dedupe pruning. Default: 2592000 (30 days).
+    dedupe_handled_seconds: 2592000
+    # Age bound for router-archived attachments (deleting stored media is
+    # data loss, so this is opt-in). Must be >= 86400 when set; null (the
+    # default) disables the media age pass.
+    media_max_age_seconds: null
+    # Optional size cap for the archived-media subtree; oldest attachment
+    # groups are removed first until at or under the cap. null (the
+    # default) disables the size pass.
+    media_max_total_bytes: null
   control:
     enabled: false
     # Defaults to ./private/work/control.sock when enabled.

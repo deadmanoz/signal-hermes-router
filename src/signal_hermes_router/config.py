@@ -49,6 +49,36 @@ class RouterControlConfig:
     max_notification_payload_bytes: int = DEFAULT_MAX_NOTIFICATION_PAYLOAD_BYTES
 
 
+MIN_RETENTION_SECONDS = 86400.0
+
+
+@dataclass(frozen=True)
+class RetentionConfig:
+    """Retention sweep knobs for the router-owned stores.
+
+    ``dedupe_handled_seconds`` and ``media_max_age_seconds`` must comfortably
+    exceed the Signal redelivery / synthetic retry window; sub-day windows
+    are rejected at parse time so a typo cannot break redelivery dedupe.
+    """
+
+    sweep_interval_seconds: float = 21600.0
+    dedupe_handled_seconds: float | None = 2592000.0
+    media_max_age_seconds: float | None = None
+    media_max_total_bytes: int | None = None
+
+    @property
+    def dedupe_enabled(self) -> bool:
+        return self.dedupe_handled_seconds is not None
+
+    @property
+    def media_enabled(self) -> bool:
+        return self.media_max_age_seconds is not None or self.media_max_total_bytes is not None
+
+    @property
+    def enabled(self) -> bool:
+        return self.dedupe_enabled or self.media_enabled
+
+
 @dataclass(frozen=True)
 class RouterConfig:
     signal_base_url: str = "http://127.0.0.1:8080"
@@ -75,6 +105,7 @@ class RouterConfig:
     acp_initialize_timeout_seconds: float = 30.0
     circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
     control: RouterControlConfig = field(default_factory=RouterControlConfig)
+    retention: RetentionConfig = field(default_factory=RetentionConfig)
 
     @property
     def control_socket_path(self) -> Path:
@@ -258,6 +289,7 @@ def parse_router_config(raw: dict[str, Any]) -> RouterConfig:
     signal = raw.get("signal") or {}
     circuit = raw.get("circuit_breaker") or {}
     control = raw.get("control") or {}
+    retention = _parse_retention_config(raw.get("retention"))
     signal_base_url = str(
         signal.get("base_url", raw.get("signal_base_url", defaults.signal_base_url))
     )
@@ -365,7 +397,61 @@ def parse_router_config(raw: dict[str, Any]) -> RouterConfig:
             route_lock_timeout_seconds=route_lock_timeout_seconds,
             max_notification_payload_bytes=max_notification_payload_bytes,
         ),
+        retention=retention,
     )
+
+
+def _parse_retention_config(raw: Any) -> RetentionConfig:
+    defaults = RetentionConfig()
+    if raw is None:
+        return defaults
+    if not isinstance(raw, dict):
+        raise ValueError("router.retention must be a mapping")
+    unknown = set(raw) - {
+        "sweep_interval_seconds",
+        "dedupe_handled_seconds",
+        "media_max_age_seconds",
+        "media_max_total_bytes",
+    }
+    if unknown:
+        raise ValueError(
+            "router.retention only accepts sweep_interval_seconds, "
+            "dedupe_handled_seconds, media_max_age_seconds, and media_max_total_bytes"
+        )
+    return RetentionConfig(
+        sweep_interval_seconds=_as_positive_finite_float(
+            raw.get("sweep_interval_seconds", defaults.sweep_interval_seconds),
+            "router.retention.sweep_interval_seconds",
+        ),
+        dedupe_handled_seconds=_as_retention_window(
+            raw.get("dedupe_handled_seconds", defaults.dedupe_handled_seconds),
+            "router.retention.dedupe_handled_seconds",
+        ),
+        media_max_age_seconds=_as_retention_window(
+            raw.get("media_max_age_seconds", defaults.media_max_age_seconds),
+            "router.retention.media_max_age_seconds",
+        ),
+        media_max_total_bytes=(
+            None
+            if raw.get("media_max_total_bytes", defaults.media_max_total_bytes) is None
+            else _as_strict_positive_int(
+                raw["media_max_total_bytes"],
+                "router.retention.media_max_total_bytes",
+            )
+        ),
+    )
+
+
+def _as_retention_window(value: Any, name: str) -> float | None:
+    if value is None:
+        return None
+    parsed = _as_positive_finite_float(value, name)
+    if parsed < MIN_RETENTION_SECONDS:
+        raise ValueError(
+            f"{name} must be at least {int(MIN_RETENTION_SECONDS)} seconds so retention "
+            "comfortably exceeds the Signal redelivery / synthetic retry window"
+        )
+    return parsed
 
 
 def parse_routes(raw: dict[str, Any]) -> list[Route]:

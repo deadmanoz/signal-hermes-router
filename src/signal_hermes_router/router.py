@@ -9,12 +9,12 @@ import socket
 import stat
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 from .circuit import CircuitBreaker
 from .config import AppConfig, Route, SyntheticRouteDefinition
@@ -29,7 +29,14 @@ from .failures import (
     is_model_provider_failure,
     preflight_failure_from_report,
 )
-from .media import write_attachment
+from .media import (
+    MediaSweepPlan,
+    MediaSweepResult,
+    execute_media_sweep_groups,
+    plan_media_sweep,
+    remove_empty_sweep_dirs,
+    write_attachment,
+)
 from .models import (
     ChatType,
     CircuitStatus,
@@ -91,7 +98,13 @@ SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 15.0
 SHUTDOWN_SETTLE_TIMEOUT_SECONDS = 5.0
 SHUTDOWN_SUPERVISOR_FLOOR_SECONDS = 10.0
 SHUTDOWN_CLEANUP_CANCEL_GRACE_SECONDS = 1.0
+# Retention sweep deletions run on the event loop (so the pre-unlink mtime
+# recheck cannot interleave with media writes) in bounded batches with a
+# yield in between; this bounds each uninterrupted loop slice. A code
+# constant by design, not configuration.
+RETENTION_EXECUTE_BATCH_ITEMS = 200
 _MISSING = object()
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -177,6 +190,15 @@ class SignalHermesRouter:
         self._control_client_tasks: set[asyncio.Task[None]] = set()
         self._signal_events_task: asyncio.Task[None] | None = None
         self._control_server_task: asyncio.Task[None] | None = None
+        self._retention_task: asyncio.Task[None] | None = None
+        # Un-cancelled handle for the current retention worker; cancelling
+        # the retention task never cancels this (the awaits are shielded),
+        # so close() can observe real worker completion.
+        self._retention_inflight: asyncio.Future[Any] | None = None
+        # Reference counts of media paths in use by in-flight turns (stored
+        # inbound manifests and frozen outbound artifacts). Event-loop-only
+        # mutation; the sweep's execute phase consults it at deletion time.
+        self._live_media: Counter[Path] = Counter()
 
     async def run_forever(self) -> None:
         if self._closing:
@@ -188,6 +210,10 @@ class SignalHermesRouter:
             control_server_task = asyncio.create_task(self._run_control_server())
             self._control_server_task = control_server_task
             tasks.add(control_server_task)
+        if self.config.router.retention.enabled:
+            retention_task = asyncio.create_task(self._run_retention_sweeps())
+            self._retention_task = retention_task
+            tasks.add(retention_task)
         try:
             done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
@@ -228,6 +254,11 @@ class SignalHermesRouter:
         events_task = self._signal_events_task
         if events_task is not None and not events_task.done():
             events_task.cancel()
+        retention_task = self._retention_task
+        if retention_task is not None and not retention_task.done():
+            # Stops future sweep dispatches; an already-running worker is
+            # observed (not cancelled) by close() via _retention_inflight.
+            retention_task.cancel()
         self._close_control_listener()
 
     async def close(
@@ -255,11 +286,27 @@ class SignalHermesRouter:
             stragglers |= await self._drain_tasks(
                 set(self._control_client_tasks), drain_deadline, "control client"
             )
-            for task in (self._signal_events_task, self._control_server_task):
+            for task in (
+                self._signal_events_task,
+                self._control_server_task,
+                self._retention_task,
+            ):
                 if task is not None and not task.done():
                     task.cancel()
                     stragglers.add(task)
             incomplete += await self._settle_cancelled(stragglers, settle_deadline)
+            retention_worker = self._retention_inflight
+            if retention_worker is not None and not retention_worker.done():
+                # Task settlement is not worker completion: a cancelled
+                # retention task leaves its executor thread running. Observe
+                # the real worker handle (shielded, so the deadline path
+                # records it incomplete instead of cancelling it) before the
+                # dedupe store is finalized.
+                incomplete += await self._observe_cleanup(
+                    self._wait_retention_worker(retention_worker),
+                    settle_deadline,
+                    "retention sweep worker",
+                )
             incomplete += await self._observe_cleanup(
                 self._wait_control_server_closed(),
                 settle_deadline,
@@ -279,8 +326,14 @@ class SignalHermesRouter:
             # Always release the exclusive state-DB lock, even if a cleanup
             # step raised unexpectedly; abandoned tasks cannot write to a
             # closed store, and the replacement router's startup reclaim
-            # recovers any orphaned processing claim.
-            self.dedupe.close()
+            # recovers any orphaned processing claim. The close never blocks
+            # the event loop on a sweep statement: a mid-chunk retention
+            # worker receives the deferred finalizer instead.
+            if not self.dedupe.close():
+                LOGGER.error(
+                    "dedupe store close deferred to an in-flight retention worker; "
+                    "cleanup is incomplete"
+                )
         return tuple(incomplete)
 
     async def _drain_tasks(
@@ -391,6 +444,125 @@ class SignalHermesRouter:
                 )
                 continue
             lock.release()
+
+    async def _run_retention_sweeps(self) -> None:
+        # Startup sweep first, then one sweep per interval. Parks on the
+        # shutdown event between sweeps (the control-server pattern), so
+        # teardown is immediate. A failed sweep is logged and the loop
+        # continues: retention must never take down transport.
+        interval = self.config.router.retention.sweep_interval_seconds
+        while not self._closing:
+            try:
+                await self._run_retention_sweep_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOGGER.error(
+                    "retention sweep failed: %s",
+                    self.redactor.redact(exc.__class__.__name__),
+                )
+                LOGGER.debug("retention sweep failure details", exc_info=True)
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval)
+                return
+            except TimeoutError:
+                continue
+
+    async def _run_retention_sweep_once(self) -> None:
+        retention = self.config.router.retention
+        now_ms = self._clock_ms()
+        if retention.dedupe_enabled:
+            dedupe_window_seconds = retention.dedupe_handled_seconds
+            assert dedupe_window_seconds is not None
+            cutoff_ms = now_ms - int(dedupe_window_seconds * 1000)
+            pruned = await self._run_retention_worker(lambda: self._prune_dedupe(cutoff_ms))
+            LOGGER.log(
+                logging.INFO if pruned else logging.DEBUG,
+                "retention sweep pruned %d handled dedupe rows",
+                pruned,
+            )
+        if retention.media_enabled:
+            plan = await self._run_retention_worker(
+                lambda: plan_media_sweep(
+                    media_root=Path(self.config.router.media_root),
+                    now_ms=now_ms,
+                    max_age_seconds=retention.media_max_age_seconds,
+                    max_total_bytes=retention.media_max_total_bytes,
+                )
+            )
+            result = await self._execute_media_sweep_plan(plan)
+            LOGGER.log(
+                logging.INFO if result.files_removed or result.dirs_removed else logging.DEBUG,
+                "retention sweep removed %d media files (%d bytes, %d dirs)",
+                result.files_removed,
+                result.bytes_removed,
+                result.dirs_removed,
+            )
+
+    def _prune_dedupe(self, cutoff_ms: int) -> int:
+        pruned = self.dedupe.prune_handled_before(cutoff_ms)
+        if pruned > 0:
+            self.dedupe.incremental_vacuum()
+        return pruned
+
+    async def _run_retention_worker(self, work: Callable[[], _T]) -> _T:
+        # The worker future is retained un-cancelled: shielding the await
+        # means cancelling the retention task raises here without cancelling
+        # the executor work, so close() can still observe real completion.
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, work)
+        self._retention_inflight = future
+        return await asyncio.shield(future)
+
+    @staticmethod
+    async def _wait_retention_worker(worker: asyncio.Future[Any]) -> None:
+        with suppress(Exception):
+            await asyncio.shield(worker)
+
+    async def _execute_media_sweep_plan(self, plan: MediaSweepPlan) -> MediaSweepResult:
+        # Deletions run on the event loop so the pre-unlink mtime recheck
+        # and live-path check cannot interleave with media writes; bounded
+        # batches with a yield keep the loop responsive.
+        files_removed = 0
+        bytes_removed = 0
+        dirs_removed = 0
+        for start in range(0, len(plan.groups), RETENTION_EXECUTE_BATCH_ITEMS):
+            if self._closing:
+                break
+            partial = execute_media_sweep_groups(
+                plan.groups[start : start + RETENTION_EXECUTE_BATCH_ITEMS],
+                is_live=self._is_live_media,
+            )
+            files_removed += partial.files_removed
+            bytes_removed += partial.bytes_removed
+            await asyncio.sleep(0)
+        media_root = Path(self.config.router.media_root)
+        for start in range(0, len(plan.candidate_dirs), RETENTION_EXECUTE_BATCH_ITEMS):
+            if self._closing:
+                break
+            dirs_removed += remove_empty_sweep_dirs(
+                plan.candidate_dirs[start : start + RETENTION_EXECUTE_BATCH_ITEMS],
+                media_root,
+            )
+            await asyncio.sleep(0)
+        return MediaSweepResult(
+            files_removed=files_removed,
+            bytes_removed=bytes_removed,
+            dirs_removed=dirs_removed,
+        )
+
+    def _register_live_media(self, path: Path) -> None:
+        self._live_media[path] += 1
+
+    def _release_live_media(self, path: Path) -> None:
+        count = self._live_media.get(path, 0)
+        if count <= 1:
+            self._live_media.pop(path, None)
+        else:
+            self._live_media[path] = count - 1
+
+    def _is_live_media(self, path: Path) -> bool:
+        return path in self._live_media
 
     async def handle_raw_event(self, raw: dict) -> TurnResult | None:
         probe = probe_signal_route(raw)
@@ -625,6 +797,7 @@ class SignalHermesRouter:
         handled = False
         rate_token_reserved = False
         prompt_attempted = False
+        live_manifest_paths: list[Path] = []
         try:
             self._maybe_clear_breaker_override(route)
             state = self.route_state_overrides.get(route.key, route.state)
@@ -686,6 +859,12 @@ class SignalHermesRouter:
             manifests: list[MediaManifest] = []
             if turn.signal_event is not None:
                 manifests = self._store_media(route, turn.signal_event)
+                for manifest in manifests:
+                    # Keep stored attachments exempt from retention deletion
+                    # for the duration of this turn, however long it waits
+                    # on locks or the prompt.
+                    self._register_live_media(manifest.canonical_path)
+                    live_manifest_paths.append(manifest.canonical_path)
             if state == RouteState.SHADOW:
                 handled = True
                 return TurnOutcome(
@@ -830,6 +1009,8 @@ class SignalHermesRouter:
             finally:
                 self._cleanup_owned_outbound_attachments(frozen_attachments)
         finally:
+            for manifest_path in live_manifest_paths:
+                self._release_live_media(manifest_path)
             if rate_token_reserved and not prompt_attempted:
                 # The turn was admitted but failed before the prompt (media
                 # storage, attachment freeze, or session acquisition), so it
@@ -877,7 +1058,14 @@ class SignalHermesRouter:
         try:
             for attachment in attachment_requests:
                 if attachment.owned_by_router:
+                    # Pass-through of an already-owned artifact (the nested
+                    # notification flow). Ownership rule: every freeze
+                    # invocation acquires one live-media reference per owned
+                    # attachment it returns, and every cleanup invocation
+                    # releases one, so nested freeze/cleanup pairs balance
+                    # and the artifact stays live until the outer cleanup.
                     frozen.append(attachment)
+                    self._register_live_media(attachment.path)
                     continue
                 validated = validate_outbound_attachments(
                     [str(attachment.path)],
@@ -923,11 +1111,17 @@ class SignalHermesRouter:
                         owned_by_router=True,
                     )
                 )
+                self._register_live_media(frozen[-1].path)
                 frozen_validated = validate_outbound_attachments(
                     [str(destination)],
                     media_root=media_root,
                     max_bytes=self.config.router.max_attachment_bytes,
                 )[0]
+                if frozen_validated.path != frozen[-1].path:
+                    # Keep the live-media key aligned with the attachment
+                    # object cleanup will eventually release.
+                    self._release_live_media(frozen[-1].path)
+                    self._register_live_media(frozen_validated.path)
                 frozen[-1] = OutboundAttachment(
                     path=frozen_validated.path,
                     content_type=frozen_validated.content_type,
@@ -953,6 +1147,9 @@ class SignalHermesRouter:
         for attachment in attachments:
             if not attachment.owned_by_router:
                 continue
+            # Matches the acquisition in _freeze_outbound_attachments: one
+            # release per cleanup invocation per owned attachment.
+            self._release_live_media(attachment.path)
             with suppress(FileNotFoundError):
                 attachment.path.unlink()
             with suppress(OSError):

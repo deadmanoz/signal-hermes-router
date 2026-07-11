@@ -81,6 +81,31 @@ Later chunks remain text-only. If Hermes returns empty text for an
 attachment-bearing notification, the router sends the fallback text
 `Image attached.` with the image.
 
+## Retention sweep
+
+The optional retention sweep (`router.retention`, see
+[configuration](configuration.md#retention-sweeps)) deletes old archived
+attachments by age and/or total size. Its media-side guarantees:
+
+- Only the router-written archive layout
+  (`${MEDIA_ROOT}/<platform>/<YYYY>/<MM>/...`) is swept. Operator staging
+  paths under `media_root` (for example `notify-route --attachment` source
+  images like `camera/person.png`) are never deleted; do not stage files
+  inside archive-shaped subtrees.
+- Attachments and their sidecar manifests are deleted together, anchored on
+  the newest member's modification time; re-storing identical content (for
+  example a redelivered event) refreshes that retention clock.
+- Files referenced by an in-flight turn - stored inbound attachments and
+  frozen `.outbound` images - are tracked as live and are never deleted
+  mid-turn, regardless of how long the turn waits on locks or the prompt.
+  Stale `.outbound` artifacts from a crashed process are removed once they
+  are older than one day (a code constant), and no pass ever deletes a file
+  younger than one hour.
+- The sweep only deletes files, symlink entries (never their targets), and
+  emptied archive directories; it never creates or chmods anything, so the
+  `0700`/`0600` model on the surviving tree is untouched. Sweep logs carry
+  counts only, never filenames.
+
 ## Attachment-by-ID resolution
 
 When signal-cli events reference an attachment by ID instead of carrying inline bytes, the router resolves the ID under `signal_attachment_root`, defaulting to `~/.local/share/signal-cli/attachments`.
