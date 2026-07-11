@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from ipaddress import ip_address
@@ -61,6 +62,7 @@ class RouterConfig:
     busy_notice_after_seconds: float = 120.0
     busy_notice: str = "Still working on this."
     acp_prompt_timeout_seconds: float = 300.0
+    acp_initialize_timeout_seconds: float = 30.0
     circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
     control: RouterControlConfig = field(default_factory=RouterControlConfig)
 
@@ -276,6 +278,11 @@ def parse_router_config(raw: dict[str, Any]) -> RouterConfig:
             SIGNAL_MESSAGE_WARNING_BYTES,
         )
     work_root = Path(raw.get("work_root", defaults.work_root))
+    acp_initialize_timeout_seconds = float(
+        raw.get("acp_initialize_timeout_seconds", defaults.acp_initialize_timeout_seconds)
+    )
+    if not math.isfinite(acp_initialize_timeout_seconds) or acp_initialize_timeout_seconds <= 0:
+        raise ValueError("router.acp_initialize_timeout_seconds must be a positive finite number")
     route_lock_timeout_seconds = float(
         control.get(
             "route_lock_timeout_seconds",
@@ -325,6 +332,7 @@ def parse_router_config(raw: dict[str, Any]) -> RouterConfig:
         acp_prompt_timeout_seconds=float(
             raw.get("acp_prompt_timeout_seconds", defaults.acp_prompt_timeout_seconds)
         ),
+        acp_initialize_timeout_seconds=acp_initialize_timeout_seconds,
         circuit_breaker=CircuitBreakerConfig(
             failures=int(circuit.get("failures", circuit_defaults.failures)),
             window_seconds=float(circuit.get("window_seconds", circuit_defaults.window_seconds)),

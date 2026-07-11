@@ -186,6 +186,51 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client_info, {"name": "signal-hermes-router", "version": __version__})
         self.assertTrue(instances[0].closed)
 
+    async def test_acp_profile_initialize_uses_configured_timeout(self) -> None:
+        instances: list[TimeoutCapturingInitPeer] = []
+
+        class TimeoutCapturingInitPeer:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.initialize_timeout: float | None = None
+                instances.append(self)
+
+            async def start(self) -> None:
+                return None
+
+            async def request(self, method: str, _params: dict[str, object], **kwargs):
+                if method != "initialize":
+                    raise AssertionError(f"unexpected method {method}")
+                self.initialize_timeout = kwargs.get("timeout")
+                return {"agentCapabilities": {}}
+
+            async def close(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = ACPProfile(
+                profile="synthetic", work_root=Path(tmp), initialize_timeout_seconds=12.5
+            )
+            with patch.object(acp_module, "JsonRpcStdioPeer", TimeoutCapturingInitPeer):
+                await profile.start()
+                await profile.close()
+
+        self.assertEqual(instances[0].initialize_timeout, 12.5)
+
+    async def test_acp_profile_start_times_out_when_initialize_hangs(self) -> None:
+        # A subprocess that spawns but never answers `initialize` must fail
+        # profile startup within the configured initialize timeout (not the
+        # 300s JSON-RPC request default) and leave no orphaned peer behind.
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = ACPProfile(
+                profile="synthetic",
+                work_root=Path(tmp),
+                command=[sys.executable, "-c", "import time; time.sleep(10)"],
+                initialize_timeout_seconds=0.05,
+            )
+            with self.assertRaisesRegex(TimeoutError, "ACP initialize timed out after 0.05s"):
+                await profile.start()
+            self.assertIsNone(profile.peer, "peer reference cleared on initialize timeout")
+
     async def test_acp_profile_tool_surface_reads_agent_capabilities_meta(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             profile = ACPProfile(profile="synthetic", work_root=Path(tmp))

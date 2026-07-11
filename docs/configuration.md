@@ -421,9 +421,22 @@ Production defaults have ample marker headroom.
 `router.acp_prompt_timeout_seconds` bounds each `session/prompt` JSON-RPC
 request to the Hermes subprocess. The default is `300` seconds (5 minutes).
 When the timeout is exceeded the router restarts the Hermes profile and
-records a circuit-breaker failure for the route. Other ACP requests
-(`initialize`, `session/new`, `session/resume`) use a fixed 5-minute timeout
-and are not affected by this key.
+records a circuit-breaker failure for the route. The other session-management
+requests (`session/new`, `session/resume`) use a fixed 5-minute timeout and
+are not affected by this key.
+
+`router.acp_initialize_timeout_seconds` bounds the `initialize` handshake
+request issued when a Hermes profile subprocess is started. The default is
+`30` seconds; the value must be a positive finite number. Profile startup
+runs while the route and profile locks are held, so a hung Hermes startup
+would otherwise block the route for the full 5-minute request default. When
+the timeout is exceeded the turn fails with `acp_session_failed` (the failure
+detail names the ACP initialize timeout), a circuit-breaker failure is
+recorded, and the supervisor's restart cooldown makes immediately-following
+turns refuse fast instead of re-spawning a doomed subprocess. The setting
+bounds the request wait itself; the failure propagates after subprocess
+cleanup, which can add up to a few more seconds of SIGTERM grace before the
+process is killed.
 
 Failure metadata distinguishes router-owned ACP prompt timeouts from
 provider-facing model timeouts. A bare router-side wait timeout is reported as

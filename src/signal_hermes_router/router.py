@@ -122,6 +122,7 @@ class SignalHermesRouter:
             config.router.work_root,
             max_acp_line_bytes=config.router.max_acp_line_bytes,
             prompt_timeout_seconds=config.router.acp_prompt_timeout_seconds,
+            initialize_timeout_seconds=config.router.acp_initialize_timeout_seconds,
         )
         self.sessions = SessionRegistry(config.router.work_root, self.supervisor)
         self.dedupe = dedupe or DedupeStore(config.router.state_db)

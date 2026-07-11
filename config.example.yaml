@@ -16,6 +16,7 @@ router:
   busy_notice_after_seconds: 120
   busy_notice: "Still working on this."
   acp_prompt_timeout_seconds: 300
+  acp_initialize_timeout_seconds: 30
   circuit_breaker:
     failures: 3
     window_seconds: 300
