@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.22](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.21...v0.1.22) (2026-07-11)
+
+
+### Features
+
+* **sessions:** rotate persistent-route sessions by age and turn count ([#48](https://github.com/deadmanoz/signal-hermes-router/issues/48))
+
 ## [0.1.21](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.20...v0.1.21) (2026-07-11)
 
 
