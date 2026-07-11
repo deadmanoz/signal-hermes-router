@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "signal-hermes-router"
-version = "0.1.20"
+version = "0.1.21"
 description = "Transport router from one Signal account to isolated Hermes profiles over ACP"
 readme = "README.md"
 requires-python = ">=3.12"

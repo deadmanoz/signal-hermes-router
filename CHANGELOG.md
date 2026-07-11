@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.21](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.20...v0.1.21) (2026-07-11)
+
+
+### Features
+
+* **router:** add inbound burst policy for busy groups ([#45](https://github.com/deadmanoz/signal-hermes-router/issues/45)) ([35ff59b](https://github.com/deadmanoz/signal-hermes-router/commit/35ff59b4acb272e22b24fbcc0f3f50f6c045e98c))
+
 ## [0.1.20](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.19...v0.1.20) (2026-07-11)
 
 
