@@ -5,6 +5,7 @@ import hashlib
 import logging
 import time
 import uuid
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,7 @@ class ProfileSupervisor:
         self.restart_cooldown_seconds = restart_cooldown_seconds
         self._profiles: dict[str, ACPProfile] = {}
         self._last_restart: dict[str, float] = {}
+        self._acquire_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._redact: Callable[[str], str] = lambda text: text
 
     def set_redactor(self, redact: Callable[[str], str]) -> None:
@@ -60,6 +62,12 @@ class ProfileSupervisor:
         self._redact = redact
 
     async def get_profile(self, route: Route) -> ACPProfile:
+        # Serialized per profile name so a concurrent acquisition can never
+        # observe the provisional (still-starting) cache entry below.
+        async with self._acquire_locks[route.profile]:
+            return await self._acquire_profile(route)
+
+    async def _acquire_profile(self, route: Route) -> ACPProfile:
         profile = self._profiles.get(route.profile)
         if profile is not None:
             if not profile.exit_suspected():
@@ -70,6 +78,7 @@ class ProfileSupervisor:
             # transparently; the watcher still logs the exit.
             if self._profiles.get(route.profile) is profile:
                 del self._profiles[route.profile]
+            await self._close_evicted_profile(profile)
         last = self._last_restart.get(route.profile)
         if last is not None and self.restart_cooldown_seconds > 0:
             elapsed = time.monotonic() - last
@@ -118,8 +127,23 @@ class ProfileSupervisor:
             # never hand out a known-dead profile.
             if self._profiles.get(route.profile) is profile:
                 del self._profiles[route.profile]
+            await self._close_evicted_profile(profile)
             raise RuntimeError(f"Hermes profile {route.profile!r} exited during startup")
         return profile
+
+    async def _close_evicted_profile(self, profile: ACPProfile) -> None:
+        # Exit evidence can come from broken pipes on a child that has not
+        # fully exited (for example one that closed its stdout while wedged).
+        # Close the evicted profile so eviction never orphans a subprocess
+        # that _profiles no longer owns; close() is safe on an already-dead
+        # peer and still lets the watcher report the exit first.
+        try:
+            await profile.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.warning("evicted Hermes profile close failed")
+            LOGGER.debug("evicted Hermes profile close failure details", exc_info=True)
 
     def _handle_profile_exit(
         self,

@@ -1550,6 +1550,9 @@ class ProfileExitWatcherSupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNot(replacement, first)
             self.assertTrue(replacement.started)
             self.assertIs(supervisor._profiles["profile-a"], replacement)
+            # Eviction must close the old profile: broken-pipe evidence can
+            # come from a child that has not fully exited.
+            self.assertTrue(first.closed)
 
     async def test_supervisor_rejects_profile_with_exit_evidence_after_start(self) -> None:
         # A child can answer initialize and die before the exit watcher gets
@@ -1573,9 +1576,74 @@ class ProfileExitWatcherSupervisorTests(unittest.IsolatedAsyncioTestCase):
                     await supervisor.get_profile(route)
             self.assertEqual(supervisor._profiles, {})
             self.assertEqual(supervisor._last_restart, {})
+            self.assertTrue(
+                FakeManagedProfile.instances[-1].closed,
+                "the rejected instance must be closed, not orphaned",
+            )
             with patch.object(sessions_module, "ACPProfile", FakeManagedProfile):
                 replacement = await supervisor.get_profile(route)
             self.assertTrue(replacement.started)
+
+    async def test_supervisor_eviction_survives_failing_close(self) -> None:
+        # A failing close on the evicted dead profile is contained: the
+        # acquisition still spawns the replacement.
+        class FailingCloseProfile(FakeManagedProfile):
+            suspected = False
+
+            def exit_suspected(self) -> bool:
+                return self.suspected
+
+            async def close(self) -> None:
+                self.closed = True
+                raise RuntimeError("close boom")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            FakeManagedProfile.instances.clear()
+            route = make_route(profile="profile-a")
+            supervisor = ProfileSupervisor(
+                Path(tmp),
+                command_template=["hermes", "-p", "{profile}", "acp"],
+                restart_cooldown_seconds=0,
+            )
+            with patch.object(sessions_module, "ACPProfile", FailingCloseProfile):
+                first = await supervisor.get_profile(route)
+                first.suspected = True
+                with self.assertLogs("signal_hermes_router.sessions", level="WARNING") as logs:
+                    replacement = await supervisor.get_profile(route)
+            self.assertIsNot(replacement, first)
+            self.assertTrue(first.closed)
+            self.assertIn("evicted Hermes profile close failed", "\n".join(logs.output))
+
+    async def test_supervisor_serializes_concurrent_acquisitions(self) -> None:
+        # The provisional cache entry exists while start() is still awaiting;
+        # a concurrent get_profile for the same profile must wait for startup
+        # rather than returning the half-started instance.
+        class SlowStartProfile(FakeManagedProfile):
+            async def start(self) -> None:
+                await asyncio.sleep(0.05)
+                self.started = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            FakeManagedProfile.instances.clear()
+            route = make_route(profile="profile-a")
+            supervisor = ProfileSupervisor(
+                Path(tmp),
+                command_template=["hermes", "-p", "{profile}", "acp"],
+                restart_cooldown_seconds=0,
+            )
+
+            async def acquire() -> tuple[FakeManagedProfile, bool]:
+                profile = await supervisor.get_profile(route)
+                return profile, profile.started
+
+            with patch.object(sessions_module, "ACPProfile", SlowStartProfile):
+                (first, first_started), (second, second_started) = await asyncio.gather(
+                    acquire(), acquire()
+                )
+            self.assertIs(first, second)
+            self.assertTrue(first_started)
+            self.assertTrue(second_started, "no caller may observe a half-started profile")
+            self.assertEqual(len(FakeManagedProfile.instances), 1)
 
     async def test_supervisor_cancellation_during_start_leaves_no_cached_profile(self) -> None:
         class CancelledStartProfile(FakeManagedProfile):
