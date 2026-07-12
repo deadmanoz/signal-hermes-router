@@ -104,6 +104,7 @@ class RouterConfig:
     busy_notice_cooldown_seconds: float = 0.0
     acp_prompt_timeout_seconds: float = 300.0
     acp_initialize_timeout_seconds: float = 30.0
+    max_concurrent_turns: int = 8
     circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
     control: RouterControlConfig = field(default_factory=RouterControlConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
@@ -481,6 +482,10 @@ def parse_router_config(raw: dict[str, Any]) -> RouterConfig:
             raw.get("acp_prompt_timeout_seconds", defaults.acp_prompt_timeout_seconds)
         ),
         acp_initialize_timeout_seconds=acp_initialize_timeout_seconds,
+        max_concurrent_turns=_as_positive_int(
+            raw.get("max_concurrent_turns", defaults.max_concurrent_turns),
+            "router.max_concurrent_turns",
+        ),
         circuit_breaker=CircuitBreakerConfig(
             failures=int(circuit.get("failures", circuit_defaults.failures)),
             window_seconds=float(circuit.get("window_seconds", circuit_defaults.window_seconds)),

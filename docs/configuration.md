@@ -697,6 +697,31 @@ deliberately declines the turn and records it as handled. Operators who need
 delivery of every message under sustained overload should leave the rate cap
 off and scale the profile instead.
 
+## Concurrent inbound dispatch
+
+`router.max_concurrent_turns` (default `8`, integer >= 1) bounds how many inbound
+Signal turns may execute at once. Inbound events are dispatched as independent
+tasks rather than processed strictly one at a time, so a single slow turn (up to
+`acp_prompt_timeout_seconds`) on one route no longer stalls delivery to every other
+route. Same-route events are still serialized and delivered in arrival order by the
+route lock, and same-profile turns are still serialized by the profile lock, so a
+route consumes at most one of these slots at a time. Raise the value for
+deployments with many distinct active profiles that should progress in parallel;
+lower it to cap concurrent load on the host or on shared model capacity.
+
+The bound applies to turn execution: the permit is held only while a turn actually
+runs, so a same-route event queued behind a slow turn holds no slot and cannot
+starve other routes. Separately, an internal in-flight buffer bounds the number of
+dispatched-but-not-yet-finished turn tasks so a burst cannot grow an unbounded task
+set; when that buffer fills (a sustained flood from one route while its turn is
+slow), the router applies backpressure to the Signal read until capacity frees.
+This buffer is global rather than per-route, so a single route flooding faster than
+it can be processed can delay other routes once the buffer is full; that is strictly
+better than the pre-dispatch behaviour (where any slow turn stalled every route) but
+is not full per-route flood fairness. The bound applies only to inbound Signal
+turns; synthetic turns (`trigger-job`, `notify-route`) keep their own
+`route_lock_timeout_seconds` admission control.
+
 ## Retention sweeps
 
 `router.retention` bounds the two router-owned stores that otherwise grow

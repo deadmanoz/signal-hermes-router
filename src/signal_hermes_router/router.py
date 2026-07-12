@@ -182,6 +182,16 @@ def _is_non_turn_control_command(line: bytes) -> bool:
 # yield in between; this bounds each uninterrupted loop slice. A code
 # constant by design, not configuration.
 RETENTION_EXECUTE_BATCH_ITEMS = 200
+# Floor for the in-flight inbound-dispatch buffer: the consumer holds one of these
+# permits per dispatched Signal turn task so a burst cannot grow an unbounded task
+# set. It is deliberately much larger than the execution bound (max_concurrent_turns)
+# so that a same-route backlog queued on one route lock (each task holds a buffer
+# permit but no execution permit) cannot exhaust the pool and stall other routes for
+# ordinary bursts. The effective bound is max(floor, max_concurrent_turns * 2), so it
+# is never <= the execution bound. A code constant by design, not configuration.
+# Note: this buffer is global; a sustained single-route flood that fills it applies
+# global backpressure. Full per-route flood fairness is tracked separately.
+MAX_INFLIGHT_SIGNAL_DISPATCH_FLOOR = 256
 _MISSING = object()
 _T = TypeVar("_T")
 
@@ -407,6 +417,19 @@ class SignalHermesRouter:
         self._control_socket_path: Path | None = None
         self._closing = False
         self._shutdown_event = asyncio.Event()
+        # Global execution bound (the max_concurrent_turns knob): acquired inside a
+        # turn AFTER both the route and profile locks, wrapping only _run_turn, so a
+        # same-route turn queued on its route lock holds no execution permit and
+        # cannot starve other routes' execution capacity. The route lock already
+        # caps a route at one running turn, so a route holds at most one permit.
+        self._turn_execution_semaphore = asyncio.Semaphore(config.router.max_concurrent_turns)
+        # In-flight dispatch buffer: the consumer holds one permit per dispatched
+        # Signal turn task so a burst cannot grow an unbounded task set. Sized well
+        # above the execution bound so a same-route backlog cannot exhaust it for
+        # ordinary bursts (see MAX_INFLIGHT_SIGNAL_DISPATCH_FLOOR).
+        self._inflight_dispatch_semaphore = asyncio.Semaphore(
+            max(MAX_INFLIGHT_SIGNAL_DISPATCH_FLOOR, config.router.max_concurrent_turns * 2)
+        )
         self._signal_turn_tasks: set[asyncio.Task[Any]] = set()
         self._control_client_tasks: set[asyncio.Task[None]] = set()
         # Per-request control tasks, tracked separately from the connection
@@ -511,33 +534,75 @@ class SignalHermesRouter:
                     task.cancel()
 
     async def _run_signal_events(self) -> None:
+        # Each event is dispatched as an independent tracked task rather than
+        # awaited inline, so a slow turn on one route/profile no longer stalls
+        # delivery to every other route. Same-route ordering is preserved by the
+        # route lock: create_task schedules first-step callbacks FIFO, the path
+        # from _dispatch_signal_turn entry to the route-lock acquire is await-free
+        # (handle_raw_event/handle_event do only synchronous routing before
+        # `async with route_lock`), and asyncio.Lock serves waiters FIFO, so the
+        # first-created same-route task acquires or FIFO-enqueues on the route lock
+        # before the next same-route task runs its first step. The in-flight
+        # dispatch buffer is acquired here in the (serial, arrival-ordered) consumer
+        # and bounds the tracked task set so a burst cannot grow it without bound;
+        # when saturated the consumer parks on acquire(), applying backpressure to
+        # the SSE read. Cancelling this consumer (SIGTERM/SIGINT teardown or
+        # begin_shutdown) does not abort accepted turns, which close() then drains
+        # to normal delivery; create_task and the set.add below are synchronous, so
+        # a task is never missing from _signal_turn_tasks when close() snapshots it.
         async for raw in self.signal.events():
-            # Each accepted event runs as a tracked task awaited through
-            # shield: cancelling this consumer (SIGTERM/SIGINT teardown or
-            # begin_shutdown) does not abort the accepted turn, which close()
-            # then drains to normal delivery. The config is pinned at
-            # acceptance: the task may not run until after a reload swapped
-            # self.config, and an admitted event must still resolve its route
-            # against the config it was admitted under. The breaker override
-            # map and config generation are pinned for the same reason: a
-            # reload can clear a MAINTENANCE override before the task runs,
-            # and a turn accepted under an open breaker must keep its
-            # admission-time maintenance gate.
-            task = asyncio.create_task(
-                self.handle_raw_event(
-                    raw,
-                    config=self.config,
-                    admission_overrides=dict(self.route_state_overrides),
-                    admission_generation=self._config_generation,
-                )
-            )
-            self._signal_turn_tasks.add(task)
-            task.add_done_callback(self._settle_tracked_task)
+            await self._inflight_dispatch_semaphore.acquire()
             try:
-                await asyncio.shield(task)
-            except Exception as exc:
-                LOGGER.error("event handler crashed; continuing: %s", exc.__class__.__name__)
-                LOGGER.debug("event handler crash details", exc_info=True)
+                # The config is pinned at acceptance: the task may not run
+                # until after a reload swapped self.config, and an admitted
+                # event must still resolve its route against the config it was
+                # admitted under. The breaker override map and config
+                # generation are pinned for the same reason: a reload can
+                # clear a MAINTENANCE override before the task runs, and a
+                # turn accepted under an open breaker must keep its
+                # admission-time maintenance gate.
+                task = asyncio.create_task(
+                    self._dispatch_signal_turn(
+                        raw,
+                        config=self.config,
+                        admission_overrides=dict(self.route_state_overrides),
+                        admission_generation=self._config_generation,
+                    )
+                )
+            except BaseException:
+                # No task will run its done callback, so release the buffer permit
+                # here to keep acquire/release balanced.
+                self._inflight_dispatch_semaphore.release()
+                raise
+            self._signal_turn_tasks.add(task)
+            task.add_done_callback(self._settle_signal_turn_task)
+
+    async def _dispatch_signal_turn(
+        self,
+        raw: dict,
+        *,
+        config: AppConfig,
+        admission_overrides: dict[str, RouteState],
+        admission_generation: int,
+    ) -> None:
+        # The per-event dispatched turn. Ordinary handler exceptions are isolated
+        # here (logged redaction-safe) so a crashing turn cannot kill the consumer;
+        # CancelledError propagates so the shutdown drain can cancel in-flight turns.
+        # The in-flight buffer permit is released by _settle_signal_turn_task (the
+        # done callback), not here, so the release happens only after the task has
+        # left _signal_turn_tasks.
+        try:
+            await self.handle_raw_event(
+                raw,
+                config=config,
+                admission_overrides=admission_overrides,
+                admission_generation=admission_generation,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOGGER.error("event handler crashed; continuing: %s", exc.__class__.__name__)
+            LOGGER.debug("event handler crash details", exc_info=True)
 
     def begin_shutdown(self) -> None:
         """Synchronously fence new work: gate control lines, stop the control
@@ -754,6 +819,32 @@ class SignalHermesRouter:
             self.redactor.redact(exc.__class__.__name__),
         )
         LOGGER.debug("tracked task failure details", exc_info=exc)
+
+    def _settle_signal_turn_task(self, task: asyncio.Task[Any]) -> None:
+        # Done callback for dispatched Signal turns. It discards the task from the
+        # tracking set FIRST and releases the in-flight dispatch buffer permit LAST.
+        # Releasing here (not in the turn's finally, which runs before the task is
+        # done and before it leaves the set) is what makes the buffer a hard bound:
+        # semaphore.release() only schedules the parked consumer, so the discard is
+        # always complete before the consumer wakes and adds a replacement task,
+        # keeping len(_signal_turn_tasks) <= the buffer size. A dedicated Signal-turn
+        # callback is used because _settle_tracked_task also settles control-client
+        # tasks, which must not touch the dispatch buffer.
+        self._signal_turn_tasks.discard(task)
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                # _dispatch_signal_turn swallows ordinary handler exceptions, so this
+                # only fires for unexpected escapes; retrieving it silences the
+                # unretrieved-exception warning for an abandoned straggler.
+                level = logging.WARNING if self._closing else logging.DEBUG
+                LOGGER.log(
+                    level,
+                    "signal turn task failed while unobserved: %s",
+                    self.redactor.redact(exc.__class__.__name__),
+                )
+                LOGGER.debug("signal turn task failure details", exc_info=exc)
+        self._inflight_dispatch_semaphore.release()
 
     async def _drain_route_locks(self, deadline: float) -> None:
         for key, lock in list(self._route_locks.items()):
@@ -1146,11 +1237,25 @@ class SignalHermesRouter:
             async with profile_lock:
                 # Re-check freshness at the real admission point: routes can
                 # share a profile, so an event fresh at route-lock acquisition
-                # can age out waiting behind another route's turn.
+                # can age out waiting behind another route's turn. Discarding an
+                # already-stale event here means it never waits on the execution
+                # permit below.
                 if self._is_stale_signal_event(route, event):
                     await self._mark_signal_turn_skipped(turn, reason="stale")
                     return None
-                outcome = await self._run_turn(turn)
+                # The execution permit is acquired here, after both locks, so it
+                # bounds only turns that actually run and a same-route turn queued
+                # on the route lock holds no permit.
+                async with self._turn_execution_semaphore:
+                    # Re-check freshness after the execution-permit wait: an event
+                    # fresh at this profile-lock admission point can age past
+                    # max_event_age_seconds while parked on the permit, and the
+                    # contract is that a stale event is skipped at the moment its
+                    # turn would actually run.
+                    if self._is_stale_signal_event(route, event):
+                        await self._mark_signal_turn_skipped(turn, reason="stale")
+                        return None
+                    outcome = await self._run_turn(turn)
         return outcome.result if outcome.status == TurnOutcomeStatus.DELIVERED else None
 
     async def handle_synthetic_job(
