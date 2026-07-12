@@ -259,6 +259,110 @@ class RouterConcurrencyTests(RouterTestCase):
             gate_2.set()
             await self._shutdown(router, run_task)
 
+    async def test_execution_wait_does_not_hold_profile_lock(self) -> None:
+        # GitHub-round regression: a turn waiting for global execution capacity
+        # must NOT hold its profile lock. If it did, a synthetic notify-route for
+        # another route sharing that profile would observe profile_lock.locked()
+        # and return a spurious BUSY even though no turn is running on the profile.
+        started_a = asyncio.Event()
+        gate_a = asyncio.Event()
+        started_b = asyncio.Event()
+        gate_b = asyncio.Event()
+        profile_a = FakeProfile(gate_started=started_a, gate_wait=gate_a)
+        profile_b = FakeProfile(gate_started=started_b, gate_wait=gate_b)
+
+        class TwoProfileSignal(ClosedAwareSignal):
+            async def events(self):
+                yield make_group_raw(group_id="group-a", timestamp=1)
+                yield make_group_raw(group_id="group-b", timestamp=2)
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = TwoProfileSignal()
+            router = SignalHermesRouter(
+                _concurrent_app(
+                    tmp,
+                    (
+                        _concurrent_route("route-a", "group-a", "profile-a"),
+                        _concurrent_route("route-b", "group-b", "profile-b"),
+                    ),
+                    max_concurrent_turns=1,
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=MultiProfileSupervisor(  # type: ignore[arg-type]
+                    {"profile-a": profile_a, "profile-b": profile_b}
+                ),
+                dedupe=DedupeStore(),
+            )
+            run_task = asyncio.create_task(router.run_forever())
+            # A holds the single execution permit; B is dispatched and parks on the
+            # execution semaphore before touching its profile lock.
+            await asyncio.wait_for(started_a.wait(), timeout=1)
+            await self._settle()
+            self.assertFalse(started_b.is_set())
+            # profile-b's lock must be free (unheld/uncreated) while B waits for
+            # global capacity: the execution permit is acquired before the profile
+            # lock. Inspect without creating a lock via the defaultdict.
+            profile_b_lock = router._profile_locks.get("profile-b")
+            self.assertFalse(profile_b_lock is not None and profile_b_lock.locked())
+
+            # Freeing A's permit lets B acquire capacity and only then its profile
+            # lock, so it runs normally.
+            gate_a.set()
+            await asyncio.wait_for(started_b.wait(), timeout=1)
+            self.assertTrue(router._profile_locks["profile-b"].locked())
+            gate_b.set()
+            await self._shutdown(router, run_task)
+
+    async def test_inflight_byte_budget_backpressures_the_read(self) -> None:
+        # GitHub-round regression: the count bound alone lets large events retain
+        # unbounded bytes in queued task frames. The byte budget must park the
+        # consumer before reading the next frame once in-flight bytes are exhausted,
+        # so a distinct route's event is not even read until capacity frees.
+        started_a = asyncio.Event()
+        gate_a = asyncio.Event()
+        profile_a = FakeProfile(gate_started=started_a, gate_wait=gate_a)
+        profile_b = FakeProfile()
+
+        class TwoRouteSignal(ClosedAwareSignal):
+            async def events(self):
+                yield make_group_raw(group_id="group-a", timestamp=1)
+                yield make_group_raw(group_id="group-b", timestamp=2)
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = TwoRouteSignal()
+            router = SignalHermesRouter(
+                _concurrent_app(
+                    tmp,
+                    (
+                        _concurrent_route("route-a", "group-a", "profile-a"),
+                        _concurrent_route("route-b", "group-b", "profile-b"),
+                    ),
+                    max_concurrent_turns=4,
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=MultiProfileSupervisor(  # type: ignore[arg-type]
+                    {"profile-a": profile_a, "profile-b": profile_b}
+                ),
+                dedupe=DedupeStore(),
+            )
+            # A tiny byte limit means the first dispatched event exhausts the budget,
+            # so the consumer parks before reading route B's event even though the
+            # count bound and execution permits are plentiful.
+            router._inflight_dispatch_bytes_limit = 1
+            run_task = asyncio.create_task(router.run_forever())
+            await asyncio.wait_for(started_a.wait(), timeout=1)
+            await self._settle()
+            # Route B's event has not been read while A's payload holds the budget.
+            self.assertEqual(profile_b.prompts, [])
+
+            # Completing A frees its bytes and lifts the backpressure, so B is read
+            # and processed.
+            gate_a.set()
+            await self._await_condition(lambda: ("group-b", "reply") in signal.sends)
+            await self._shutdown(router, run_task)
+
     async def test_stale_event_skipped_after_execution_permit_wait(self) -> None:
         # Round-2 blocker fix: an event fresh at profile-lock admission that ages
         # past max_event_age_seconds while parked on the execution permit must be
