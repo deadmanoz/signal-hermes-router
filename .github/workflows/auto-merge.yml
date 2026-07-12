@@ -2,7 +2,7 @@ name: Auto Merge
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, labeled, ready_for_review]
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: write
@@ -10,17 +10,12 @@ permissions:
 
 jobs:
   auto-merge:
-    if: >-
-      ${{
-        github.event.pull_request.user.login == 'dependabot[bot]' ||
-        contains(github.event.pull_request.labels.*.name, 'autorelease: pending')
-      }}
+    if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     steps:
       # This workflow intentionally does not check out or execute PR branch code.
       - name: Fetch Dependabot metadata
         id: dependabot
-        if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -28,20 +23,14 @@ jobs:
       - name: Determine eligibility
         id: eligibility
         env:
-          IS_RELEASE_PR: "${{ contains(github.event.pull_request.labels.*.name, 'autorelease: pending') }}"
-          IS_DEPENDABOT_PR: "${{ github.event.pull_request.user.login == 'dependabot[bot]' }}"
           UPDATE_TYPE: "${{ steps.dependabot.outputs.update-type }}"
         run: |
           eligible=false
-          if [ "$IS_RELEASE_PR" = "true" ]; then
-            eligible=true
-          elif [ "$IS_DEPENDABOT_PR" = "true" ]; then
-            case "$UPDATE_TYPE" in
-              version-update:semver-patch|version-update:semver-minor)
-                eligible=true
-                ;;
-            esac
-          fi
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor)
+              eligible=true
+              ;;
+          esac
           echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
 
       - name: Resolve merge state
@@ -84,7 +73,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-        run: gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body "Automated approval for eligible release/dependency PR."
+        run: gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body "Automated approval for eligible dependency PR."
 
       - name: Enable squash auto-merge
         if: >-

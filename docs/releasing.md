@@ -24,7 +24,7 @@ Patch bumps cover bug fixes, log/metric changes, internal refactors with no publ
 
 1. Merge PRs with Conventional Commit squash titles.
 2. Release Please opens or updates a release PR after releasable commits land on `main`.
-3. The release workflow refreshes `uv.lock` on the release PR branch so `uv sync --locked` stays green.
+3. The same release workflow normalizes the release PR branch (strips changelog commit links and refreshes `uv.lock` so `uv sync --locked` stays green), then approves and arms squash auto-merge on that normalized head, so the PR can only ever merge after normalization has landed.
 4. When the release PR auto-merges, Release Please creates the `vX.Y.Z` tag and GitHub Release.
 
 Do not hand-edit [CHANGELOG.md](../CHANGELOG.md) or add `[Unreleased]` entries. Release Please generates changelog entries from merged commit titles.

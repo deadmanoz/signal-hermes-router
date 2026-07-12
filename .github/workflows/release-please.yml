@@ -44,10 +44,69 @@ jobs:
           uv lock
           if git diff --quiet -- CHANGELOG.md uv.lock; then
             echo "changelog and uv.lock already match release metadata"
-            exit 0
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add CHANGELOG.md uv.lock
+            git commit -m "chore(release): normalize changelog and uv.lock"
+            git push
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add CHANGELOG.md uv.lock
-          git commit -m "chore(release): normalize changelog and uv.lock"
-          git push
+
+      # Arm auto-merge on the release PR from within this job, AFTER the normalize
+      # commit has been pushed, so the PR can never be squash-merged on a
+      # pre-normalize head. This owns the release-PR path that the Auto Merge
+      # workflow used to handle; Auto Merge now covers Dependabot only.
+      - name: Resolve release PR merge state
+        id: merge_state
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          PR_NUMBER: ${{ fromJSON(steps.release.outputs.prs)[0].number }}
+          REPO: ${{ github.repository }}
+        run: |
+          state=""
+          for attempt in 1 2 3 4 5; do
+            state="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeStateStatus --jq .mergeStateStatus)"
+            if [ "$state" != "UNKNOWN" ]; then
+              break
+            fi
+            echo "mergeStateStatus is UNKNOWN on attempt $attempt; retrying"
+            sleep 5
+          done
+          echo "merge_state=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Update stale release branch
+        id: update_branch
+        if: ${{ steps.release.outputs.prs_created == 'true' && steps.merge_state.outputs.merge_state == 'BEHIND' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          PR_NUMBER: ${{ fromJSON(steps.release.outputs.prs)[0].number }}
+          REPO: ${{ github.repository }}
+        run: gh pr update-branch "$PR_NUMBER" --repo "$REPO"
+
+      - name: Approve release PR
+        if: >-
+          ${{
+            steps.release.outputs.prs_created == 'true' &&
+            steps.merge_state.outputs.merge_state != 'DIRTY' &&
+            steps.update_branch.outcome != 'failure'
+          }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ fromJSON(steps.release.outputs.prs)[0].number }}
+          REPO: ${{ github.repository }}
+        run: gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body "Automated approval for normalized release PR."
+
+      - name: Enable squash auto-merge
+        if: >-
+          ${{
+            steps.release.outputs.prs_created == 'true' &&
+            steps.merge_state.outputs.merge_state != 'DIRTY' &&
+            steps.update_branch.outcome != 'failure'
+          }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          PR_NUMBER: ${{ fromJSON(steps.release.outputs.prs)[0].number }}
+          REPO: ${{ github.repository }}
+        run: gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --squash --delete-branch
