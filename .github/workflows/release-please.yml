@@ -56,12 +56,30 @@ jobs:
       # commit has been pushed, so the PR can never be squash-merged on a
       # pre-normalize head. This owns the release-PR path that the Auto Merge
       # workflow used to handle; Auto Merge now covers Dependabot only.
+      #
+      # Resolve the PR number once via jq on the raw `prs` string rather than
+      # `fromJSON(...)` in a step `env:`. A step `env:` expression is evaluated
+      # even when the step is skipped by `if:`, so `fromJSON` of the empty `prs`
+      # output (every push that creates no release PR) would fail the whole job.
+      - name: Resolve release PR number
+        id: release_pr
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        env:
+          PRS_JSON: ${{ steps.release.outputs.prs }}
+        run: |
+          number="$(printf '%s' "$PRS_JSON" | jq -r '.[0].number')"
+          if [ -z "$number" ] || [ "$number" = "null" ]; then
+            echo "could not resolve release PR number from release output" >&2
+            exit 1
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
       - name: Resolve release PR merge state
         id: merge_state
         if: ${{ steps.release.outputs.prs_created == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-          PR_NUMBER: ${{ fromJSON(steps.release.outputs.prs)[0].number }}
+          PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
         run: |
           state=""
@@ -81,7 +99,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-          PR_NUMBER: ${{ fromJSON(steps.release.outputs.prs)[0].number }}
+          PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
         run: gh pr update-branch "$PR_NUMBER" --repo "$REPO"
 
@@ -94,7 +112,7 @@ jobs:
           }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ fromJSON(steps.release.outputs.prs)[0].number }}
+          PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
         run: gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body "Automated approval for normalized release PR."
 
@@ -107,6 +125,6 @@ jobs:
           }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-          PR_NUMBER: ${{ fromJSON(steps.release.outputs.prs)[0].number }}
+          PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
         run: gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --squash --delete-branch
