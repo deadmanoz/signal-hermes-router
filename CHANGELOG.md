@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.25](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.24...v0.1.25) (2026-07-12)
+
+
+### Bug Fixes
+
+* **release:** resolve release PR number without fromJSON in step env ([#57](https://github.com/deadmanoz/signal-hermes-router/issues/57)) ([baeeb50](https://github.com/deadmanoz/signal-hermes-router/commit/baeeb50aeb786b3cbc12fdee642e4627b558e879))
+
 ## [0.1.24](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.23...v0.1.24) (2026-07-11)
 
 
