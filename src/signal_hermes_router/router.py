@@ -576,6 +576,22 @@ class SignalHermesRouter:
                 raise
             self._signal_turn_tasks.add(task)
             task.add_done_callback(self._settle_signal_turn_task)
+        # The event source ended on its own (a finite or disconnecting stream,
+        # not a shutdown cancellation): let already-dispatched turns finish before
+        # returning, so run_forever() does not resolve with turns still in flight
+        # for a caller that does not immediately call close(). A shutdown cancels
+        # this consumer while it is parked in the async-for above, so this drain
+        # is skipped on that path and close() owns the drain instead.
+        await self._await_outstanding_signal_turns()
+
+    async def _await_outstanding_signal_turns(self) -> None:
+        pending = {task for task in self._signal_turn_tasks if not task.done()}
+        if pending:
+            # asyncio.wait (unlike gather) does not cancel the awaited tasks if
+            # this await is itself cancelled, so a shutdown arriving mid-drain
+            # leaves the in-flight turns for close() to drain rather than
+            # cancelling them early.
+            await asyncio.wait(pending)
 
     async def _dispatch_signal_turn(
         self,

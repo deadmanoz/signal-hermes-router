@@ -357,6 +357,30 @@ class RouterConcurrencyTests(RouterTestCase):
             gate.set()
             await self._shutdown(router, run_task)
 
+    async def test_run_forever_awaits_dispatched_turns_when_stream_ends(self) -> None:
+        # When the event source ends on its own (finite/disconnecting stream), the
+        # dispatched turns must complete before run_forever() returns, so a caller
+        # that treats its return as "done" is not left with in-flight turns.
+        profile = FakeProfile()
+        profile.prompt_delay = 0.05
+
+        class FiniteSignal(ClosedAwareSignal):
+            async def events(self):
+                yield make_group_raw(group_id="group-a", timestamp=1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FiniteSignal()
+            router = SignalHermesRouter(
+                _concurrent_app(tmp, (_concurrent_route("route-a", "group-a", "profile-a"),)),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            await asyncio.wait_for(router.run_forever(), timeout=5)
+            # The delayed turn finished before run_forever() resolved.
+            self.assertEqual(signal.sends, [("group-a", "reply")])
+            await asyncio.wait_for(router.close(), timeout=5)
+
     async def test_close_drains_concurrent_in_flight_turns(self) -> None:
         started_a = asyncio.Event()
         gate_a = asyncio.Event()
