@@ -482,7 +482,7 @@ def parse_router_config(raw: dict[str, Any]) -> RouterConfig:
             raw.get("acp_prompt_timeout_seconds", defaults.acp_prompt_timeout_seconds)
         ),
         acp_initialize_timeout_seconds=acp_initialize_timeout_seconds,
-        max_concurrent_turns=_as_positive_int(
+        max_concurrent_turns=_as_strict_positive_int(
             raw.get("max_concurrent_turns", defaults.max_concurrent_turns),
             "router.max_concurrent_turns",
         ),
