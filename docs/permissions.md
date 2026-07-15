@@ -60,19 +60,29 @@ signal-hermes-router \
   --json
 ```
 
-The probe contract is private deployment evidence. The router accepts either of
-these equivalent JSON shapes:
+The probe contract is private deployment evidence. Version 1 requires one
+document-wide `full_callable` scope that applies to every profile entry:
 
 ```json
 {
+  "schema_version": 1,
+  "scope": "full_callable",
   "profiles": {
     "example-profile": {
       "tools": ["read_file", "web_search"]
     },
-    "another-profile": ["read_file"]
+    "another-profile": {
+      "tools": ["read_file"]
+    }
   }
 }
 ```
+
+`full_callable` means every tool the profile can dispatch by name, including
+tools deferred behind Tool Search or another progressive-disclosure mechanism.
+A compressed or model-facing list containing bridge tools is not a callable
+catalog and must use a different scope. Permission preflight rejects that scope
+instead of reporting its omitted tools as missing.
 
 Live checks can use profiles managed by the running router's ACP supervisor:
 
@@ -85,19 +95,60 @@ signal-hermes-router \
   --json
 ```
 
-The running-router probe is intentionally structured. It reads
-`agentCapabilities._meta` fields such as `toolSurface`, `tool_surface`, `tools`,
-or `tool_names`, including the same fields nested under `signalHermesRouter`,
-`signal-hermes-router`, or `signal_hermes_router`. If no metadata surface is
-present, the router tries an optional JSON-RPC extension method named
-`_tool_surface/list`.
+The running-router probe is intentionally structured. It reads a tool-surface
+candidate from `agentCapabilities._meta`, including candidates nested under
+`signalHermesRouter`, `signal-hermes-router`, or `signal_hermes_router`. If no
+metadata surface is present, the router tries an optional JSON-RPC extension
+method named `_tool_surface/list`. Either source must return this envelope:
+
+```json
+{
+  "schema_version": 1,
+  "scope": "full_callable",
+  "tools": ["read_file", "web_search"]
+}
+```
+
+The producer must assemble `tools` before Tool Search compression. The router
+does not import Hermes or inspect its private implementation; it validates only
+this producer contract.
 Agents that do not expose either source report `probe_unsupported`; that means
 the agent needs a structured tool-surface integration before live preflight can
 validate it.
 
-An explicit empty surface such as `_meta: {"tools": []}` is treated as
-authoritative. Any configured allowlist tools for that profile are reported as
-missing rather than falling back to `_tool_surface/list`.
+An explicit v1 empty surface with `"tools": []` is authoritative. Any
+configured allowlist tools for that profile are reported as missing rather than
+falling back to `_tool_surface/list`.
+
+Missing versions, unsupported versions, missing scopes, model-facing scopes,
+ambiguous metadata candidates, and malformed contracts produce specific
+`probe_contract_*` errors. They never produce missing-tool findings. Present but
+invalid capability metadata also does not fall through to `_tool_surface/list`.
+Redundant aliases count as ambiguous, including a v1 `toolSurface` alongside a
+legacy or model-facing `tools` field; producers must publish exactly one
+candidate.
+
+### Version 1 transition checklist
+
+1. Generate a private recorded contract from a catalog independently verified
+   to contain every callable tool, then add `schema_version: 1` and
+   `scope: full_callable`.
+2. Run offline permission preflight with that file during the rollout.
+3. Update the Hermes ACP producer to wrap its pre-Tool-Search full catalog in
+   the v1 envelope shown above.
+4. Deploy the producer update, then resume live control-socket preflight.
+
+Keep using the verified offline v1 contract until every live producer is
+updated; mixed deployments with unversioned producers intentionally fail live
+preflight rather than guessing at catalog completeness.
+Regenerate and verify the recorded contract whenever a profile's callable tool
+catalog changes during that transition.
+
+Unversioned recorded files are rejected before preflight with a validation
+message that names the required `schema_version=1` field. Unversioned live
+Hermes responses fail with `probe_contract_version_missing`. The router does
+not grandfather either shape because an unversioned list cannot prove whether
+it is complete or compressed.
 
 Because the live path uses the router's normal `ProfileSupervisor`, probing an
 idle profile can start that profile's ACP subprocess. Supervisor cooldowns and

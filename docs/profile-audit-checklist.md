@@ -18,6 +18,7 @@ Checks:
 - [ ] Pinned `hermes-agent` version recorded.
 - [ ] `hermes-acp` toolset contents inspected and attached or summarized.
 - [ ] Route permission allowlist reviewed against expected tools and arguments.
+- [ ] Version 1 `full_callable` tool-surface contract recorded.
 - [ ] `signal-hermes-router preflight-permissions` report attached or summarized.
 - [ ] Denial canary run for an unlisted tool call.
 - [ ] Allow canary run for each intended allowed tool shape.

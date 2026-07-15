@@ -128,6 +128,10 @@ signal-hermes-router --config /path/to/private/config.yaml --routes /path/to/pri
 signal-hermes-router --config /path/to/private/config.yaml preflight-permissions --active-only --control-socket /path/to/private/control.sock --json
 ```
 
+Both probe sources must provide a version 1 `full_callable` catalog. See
+[docs/permissions.md](docs/permissions.md#permission-preflight) for the contract
+and transition checklist.
+
 The control-socket form uses the running router's normal ACP supervisor. Probing
 an idle profile can start that profile's ACP subprocess, and supervisor
 cooldowns or startup failures are reported as probe errors. If a profile is

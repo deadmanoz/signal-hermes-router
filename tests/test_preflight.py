@@ -9,6 +9,10 @@ from signal_hermes_router.config import AppConfig, SyntheticRouteJob, SyntheticR
 from signal_hermes_router.models import RouteState
 from signal_hermes_router.permissions import StaticPermissionPolicy
 from signal_hermes_router.preflight import (
+    FULL_CALLABLE_TOOL_SURFACE_SCOPE,
+    SUPPORTED_TOOL_SURFACE_SCHEMA_VERSION,
+    PreflightProbeError,
+    PreflightProbeUnavailable,
     PreflightScope,
     ToolSurface,
     collect_expected_permission_tools,
@@ -25,6 +29,21 @@ from tests.support import make_route, router_config_for_tmp
 
 def policy(*tools: str) -> StaticPermissionPolicy:
     return StaticPermissionPolicy.from_config([{"tool": tool} for tool in tools])
+
+
+def callable_surface(
+    profile: str,
+    tools: list[str] | tuple[str, ...],
+    *,
+    source: str = "injected",
+) -> ToolSurface:
+    return ToolSurface.from_names(
+        profile,
+        tools,
+        schema_version=SUPPORTED_TOOL_SURFACE_SCHEMA_VERSION,
+        scope=FULL_CALLABLE_TOOL_SURFACE_SCOPE,
+        source=source,
+    )
 
 
 def preflight_app(tmp: str | Path) -> AppConfig:
@@ -87,7 +106,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                     "calendar": ["read_file", "todo_create"],
                     "ops": ["read_file"],
                 }[profile]
-                return ToolSurface.from_names(profile, tools)
+                return callable_surface(profile, tools)
 
             report = await run_permission_preflight(app, probe)
 
@@ -153,6 +172,8 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             contract.write_text(
                 json.dumps(
                     {
+                        "schema_version": 1,
+                        "scope": "full_callable",
                         "profiles": {
                             "calendar": {
                                 "tools": [
@@ -162,8 +183,8 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                                     "web_search",
                                 ]
                             },
-                            "ops": ["read_file"],
-                        }
+                            "ops": {"tools": ["read_file"]},
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -183,7 +204,13 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             contract = Path(tmp) / "probe-contract.json"
             contract.write_text(
-                json.dumps({"profiles": {"ops": ["read_file"]}}),
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "scope": "full_callable",
+                        "profiles": {"ops": {"tools": ["read_file"]}},
+                    }
+                ),
                 encoding="utf-8",
             )
             report = await run_permission_preflight(
@@ -203,15 +230,84 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ValueError, "JSON object"):
                 load_probe_contract(contract)
 
-            contract.write_text(json.dumps({"profiles": []}), encoding="utf-8")
+            contract.write_text(
+                json.dumps({"profiles": {"calendar": {"tools": ["read_file"]}}}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "declare schema_version=1"):
+                load_probe_contract(contract)
+
+            contract.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "scope": "full_callable",
+                        "profiles": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "expected integer 1"):
+                load_probe_contract(contract)
+
+            contract.write_text(
+                json.dumps(
+                    {
+                        "schema_version": None,
+                        "scope": "full_callable",
+                        "profiles": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "expected integer 1"):
+                load_probe_contract(contract)
+
+            contract.write_text(
+                json.dumps(
+                    {
+                        "schema_version": True,
+                        "scope": "full_callable",
+                        "profiles": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "expected integer 1"):
+                load_probe_contract(contract)
+
+            contract.write_text(
+                json.dumps({"schema_version": 1, "profiles": {}}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "declare scope=full_callable"):
+                load_probe_contract(contract)
+
+            contract.write_text(
+                json.dumps({"schema_version": 1, "scope": "model_facing", "profiles": {}}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "must be full_callable"):
+                load_probe_contract(contract)
+
+            contract.write_text(
+                json.dumps({"schema_version": 1, "scope": "full_callable", "profiles": []}),
+                encoding="utf-8",
+            )
             with self.assertRaisesRegex(ValueError, "profiles must be a mapping"):
                 load_probe_contract(contract)
 
             contract.write_text(
-                json.dumps({"profiles": {"calendar": {"tools": ["read_file", 7]}}}),
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "scope": "full_callable",
+                        "profiles": {"calendar": {"tools": ["read_file", 7]}},
+                    }
+                ),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ValueError, "string list"):
+            with self.assertRaisesRegex(ValueError, "list of non-empty strings"):
                 load_probe_contract(contract)
 
     async def test_explicit_empty_tool_surface_reports_missing_tools(self) -> None:
@@ -219,7 +315,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             app = preflight_app(tmp)
 
             async def probe(profile: str) -> ToolSurface:
-                return ToolSurface.from_names(profile, [])
+                return callable_surface(profile, [])
 
             report = await run_permission_preflight(
                 app,
@@ -246,7 +342,15 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
     def test_agent_capabilities_meta_accepts_explicit_empty_surface(self) -> None:
         surface = tool_surface_from_agent_capabilities(
             "empty-profile",
-            {"_meta": {"tools": []}},
+            {
+                "_meta": {
+                    "toolSurface": {
+                        "schema_version": 1,
+                        "scope": "full_callable",
+                        "tools": [],
+                    }
+                }
+            },
         )
 
         self.assertIsNotNone(surface)
@@ -259,12 +363,11 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             {
                 "_meta": {
                     "signalHermesRouter": {
-                        "toolSurface": [
-                            {"function": {"name": "web_search"}},
-                            {"name": "read_file"},
-                            {"unexpected": "shape"},
-                            "",
-                        ]
+                        "toolSurface": {
+                            "schema_version": 1,
+                            "scope": "full_callable",
+                            "tools": ["web_search", "read_file"],
+                        }
                     }
                 }
             },
@@ -274,8 +377,10 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         assert surface is not None
         self.assertEqual(surface.tool_names, frozenset({"read_file", "web_search"}))
         self.assertIsNone(tool_surface_from_agent_capabilities("calendar", None))
-        self.assertIsNone(tool_surface_from_value("calendar", {}, source="test"))
-        self.assertIsNone(tool_surface_from_value("calendar", "not-a-list", source="test"))
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "version_missing"):
+            tool_surface_from_value("calendar", {}, source="test")
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_invalid"):
+            tool_surface_from_value("calendar", "not-an-object", source="test")
 
     def test_agent_capabilities_empty_meta_does_not_fall_through(self) -> None:
         surface = tool_surface_from_agent_capabilities(
@@ -284,6 +389,193 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(surface)
+
+    def test_agent_capabilities_rejects_ambiguous_or_non_callable_contracts(self) -> None:
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_ambiguous"):
+            tool_surface_from_agent_capabilities(
+                "calendar",
+                {
+                    "_meta": {
+                        "toolSurface": {
+                            "schema_version": 1,
+                            "scope": "full_callable",
+                            "tools": ["read_file"],
+                        },
+                        "tool_surface": {
+                            "schema_version": 1,
+                            "scope": "full_callable",
+                            "tools": ["read_file"],
+                        },
+                    }
+                },
+            )
+
+        with self.assertRaisesRegex(
+            PreflightProbeUnavailable, "contract_ambiguous"
+        ) as mixed_ambiguity:
+            tool_surface_from_agent_capabilities(
+                "calendar",
+                {
+                    "_meta": {
+                        "toolSurface": {
+                            "schema_version": 1,
+                            "scope": "full_callable",
+                            "tools": ["read_file"],
+                        },
+                        "signalHermesRouter": {
+                            "tools": ["tool_search", "tool_call"],
+                        },
+                    }
+                },
+            )
+        self.assertIn(
+            "toolSurface, signalHermesRouter.tools",
+            mixed_ambiguity.exception.error or "",
+        )
+
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_ambiguous"):
+            tool_surface_from_agent_capabilities(
+                "calendar",
+                {
+                    "_meta": {
+                        "toolSurface": {
+                            "schema_version": 1,
+                            "scope": "full_callable",
+                            "tools": ["read_file"],
+                        },
+                        "tools": ["tool_search", "tool_call"],
+                    }
+                },
+            )
+
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "scope_unsupported"):
+            tool_surface_from_agent_capabilities(
+                "calendar",
+                {
+                    "_meta": {
+                        "toolSurface": {
+                            "schema_version": 1,
+                            "scope": "model_facing",
+                            "tools": ["tool_search", "tool_call"],
+                        }
+                    }
+                },
+            )
+
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "scope_missing"):
+            tool_surface_from_value(
+                "calendar",
+                {"schema_version": 1, "tools": ["read_file"]},
+                source="test",
+            )
+
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "version_unsupported"):
+            tool_surface_from_value(
+                "calendar",
+                {"schema_version": 2, "scope": "full_callable", "tools": ["read_file"]},
+                source="test",
+            )
+
+    def test_probe_errors_require_safe_non_empty_fields(self) -> None:
+        with self.assertRaisesRegex(ValueError, "code"):
+            PreflightProbeUnavailable("")
+        with self.assertRaisesRegex(ValueError, "detail"):
+            PreflightProbeUnavailable("probe_failed", "")
+        with self.assertRaisesRegex(ValueError, "detail"):
+            PreflightProbeError(profile="calendar", code="probe_failed", error="")
+
+    async def test_preflight_validates_injected_tool_surface_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = preflight_app(tmp)
+
+            async def invalid_version(profile: str) -> ToolSurface:
+                return ToolSurface(
+                    profile=profile,
+                    tool_names=frozenset({"read_file"}),
+                    schema_version=2,
+                    scope="full_callable",
+                )
+
+            report = await run_permission_preflight(
+                app,
+                invalid_version,
+                scope=PreflightScope(active_only=True, profiles=("calendar",)),
+            )
+
+        self.assertEqual(report.missing_tools, ())
+        self.assertEqual(
+            [error.code for error in report.probe_errors],
+            ["probe_contract_version_unsupported"],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = preflight_app(tmp)
+
+            async def model_facing(profile: str) -> ToolSurface:
+                return ToolSurface(
+                    profile=profile,
+                    tool_names=frozenset({"tool_search", "tool_call"}),
+                    schema_version=1,
+                    scope="model_facing",
+                )
+
+            report = await run_permission_preflight(
+                app,
+                model_facing,
+                scope=PreflightScope(active_only=True, profiles=("calendar",)),
+            )
+
+        self.assertEqual(report.missing_tools, ())
+        self.assertEqual(
+            [error.code for error in report.probe_errors],
+            ["probe_contract_scope_unsupported"],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = preflight_app(tmp)
+
+            async def invalid_names(profile: str) -> ToolSurface:
+                return ToolSurface(
+                    profile=profile,
+                    tool_names=frozenset({"read_file", ""}),
+                    schema_version=1,
+                    scope="full_callable",
+                )
+
+            report = await run_permission_preflight(
+                app,
+                invalid_names,
+                scope=PreflightScope(active_only=True, profiles=("calendar",)),
+            )
+
+        self.assertEqual(report.missing_tools, ())
+        self.assertEqual(
+            [error.code for error in report.probe_errors],
+            ["probe_contract_invalid"],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = preflight_app(tmp)
+
+            async def mutable_names(profile: str) -> ToolSurface:
+                return ToolSurface(
+                    profile=profile,
+                    tool_names=["read_file"],  # type: ignore[arg-type]
+                    schema_version=1,
+                    scope="full_callable",
+                )
+
+            report = await run_permission_preflight(
+                app,
+                mutable_names,
+                scope=PreflightScope(active_only=True, profiles=("calendar",)),
+            )
+
+        self.assertEqual(report.missing_tools, ())
+        self.assertEqual(
+            [error.code for error in report.probe_errors],
+            ["probe_contract_invalid"],
+        )
 
     async def test_scope_with_selectors_must_match_a_route(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -493,4 +785,4 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
 
 
 async def _tool_surface_with_names(profile: str, names: tuple[str, ...]) -> ToolSurface:
-    return ToolSurface.from_names(profile, names)
+    return callable_surface(profile, names)

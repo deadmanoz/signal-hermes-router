@@ -240,10 +240,9 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
             profile.agent_capabilities = {
                 "_meta": {
                     "toolSurface": {
-                        "tools": [
-                            "read_file",
-                            {"function": {"name": "web_search"}},
-                        ]
+                        "schema_version": 1,
+                        "scope": "full_callable",
+                        "tools": ["read_file", "web_search"],
                     }
                 }
             }
@@ -252,6 +251,8 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(surface.profile, "synthetic")
         self.assertEqual(surface.tool_names, frozenset({"read_file", "web_search"}))
+        self.assertEqual(surface.schema_version, 1)
+        self.assertEqual(surface.scope, "full_callable")
         self.assertEqual(surface.source, "agent_capabilities_meta")
 
     async def test_acp_profile_tool_surface_uses_optional_json_rpc_method(self) -> None:
@@ -261,7 +262,11 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
 
             async def request(self, method: str, *args, **kwargs):
                 self.requests.append((method, kwargs.get("timeout")))
-                return {"tools": [{"name": "read_file"}]}
+                return {
+                    "schema_version": 1,
+                    "scope": "full_callable",
+                    "tools": ["read_file"],
+                }
 
         with tempfile.TemporaryDirectory() as tmp:
             peer = ToolSurfacePeer()
@@ -305,22 +310,24 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(PreflightProbeUnavailable, "probe_not_started"):
                 await profile.tool_surface()
 
-    async def test_acp_profile_tool_surface_reports_empty_probe_result(self) -> None:
-        class EmptyPeer:
+    async def test_acp_profile_tool_surface_rejects_unversioned_probe_result(self) -> None:
+        class LegacyPeer:
             async def request(self, *_args, **_kwargs):
-                return {"unexpected": "shape"}
+                return {"tools": ["read_file"]}
 
         with tempfile.TemporaryDirectory() as tmp:
             profile = ACPProfile(profile="synthetic", work_root=Path(tmp))
-            profile.peer = EmptyPeer()  # type: ignore[assignment]
+            profile.peer = LegacyPeer()  # type: ignore[assignment]
 
-            with self.assertRaisesRegex(PreflightProbeUnavailable, "probe_empty"):
+            with self.assertRaisesRegex(
+                PreflightProbeUnavailable, "probe_contract_version_missing"
+            ):
                 await profile.tool_surface()
 
     async def test_acp_profile_tool_surface_accepts_explicit_empty_surface(self) -> None:
         class EmptySurfacePeer:
             async def request(self, *_args, **_kwargs):
-                return {"tools": []}
+                return {"schema_version": 1, "scope": "full_callable", "tools": []}
 
         with tempfile.TemporaryDirectory() as tmp:
             profile = ACPProfile(profile="synthetic", work_root=Path(tmp))
@@ -330,6 +337,48 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(surface.tool_names, frozenset())
         self.assertEqual(surface.source, "_tool_surface/list")
+
+    async def test_acp_profile_tool_surface_rejects_invalid_present_meta_without_fallback(
+        self,
+    ) -> None:
+        class TrackingPeer:
+            def __init__(self) -> None:
+                self.requested = False
+
+            async def request(self, *_args, **_kwargs):
+                self.requested = True
+                return {"schema_version": 1, "scope": "full_callable", "tools": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            peer = TrackingPeer()
+            profile = ACPProfile(profile="synthetic", work_root=Path(tmp))
+            profile.peer = peer  # type: ignore[assignment]
+            profile.agent_capabilities = {"_meta": {"toolSurface": {"tools": ["read_file"]}}}
+
+            with self.assertRaisesRegex(
+                PreflightProbeUnavailable, "probe_contract_version_missing"
+            ):
+                await profile.tool_surface()
+
+        self.assertFalse(peer.requested)
+
+    async def test_acp_profile_tool_surface_rejects_model_facing_extension(self) -> None:
+        class ModelFacingPeer:
+            async def request(self, *_args, **_kwargs):
+                return {
+                    "schema_version": 1,
+                    "scope": "model_facing",
+                    "tools": ["tool_search", "tool_call"],
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = ACPProfile(profile="synthetic", work_root=Path(tmp))
+            profile.peer = ModelFacingPeer()  # type: ignore[assignment]
+
+            with self.assertRaisesRegex(
+                PreflightProbeUnavailable, "probe_contract_scope_unsupported"
+            ):
+                await profile.tool_surface()
 
     async def test_json_rpc_timeout_cleans_pending_request(self) -> None:
         peer = JsonRpcStdioPeer(

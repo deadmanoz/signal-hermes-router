@@ -361,16 +361,21 @@ remote signal-cli base URLs are rejected for attachment-bearing notifications
 even when `allow_remote_signal_base_url` permits text-only routing.
 
 `preflight-permissions` compares configured permission tool names against a
-recorded ACP tool-surface contract in offline mode, or against structured
+version 1 ACP tool-surface contract in offline mode, or against versioned
 tool-surface data from profiles managed by the running router when invoked
-through the control socket. The live path uses the router's normal
+through the control socket. Both forms must declare `schema_version: 1` and
+`scope: full_callable`; the scope means the complete dispatchable catalog, not
+the compressed tool list shown to a model by Tool Search. The live path uses the router's normal
 `ProfileSupervisor`, so probing an idle profile can start that profile's ACP
 subprocess and supervisor cooldowns still apply. If a profile is already
 handling a turn when preflight starts probing it, live preflight reports
 `probe_profile_busy` instead of waiting behind that turn. Live profile
 inspection reads `agentCapabilities._meta` first and then tries the optional
 JSON-RPC extension method `_tool_surface/list`. Agents that expose neither
-source report `probe_unsupported`.
+source report `probe_unsupported`. Unversioned, unsupported, model-facing, or
+ambiguous surfaces fail with a `probe_contract_*` error and produce no
+missing-tool findings. See [Permissions](permissions.md#permission-preflight)
+for the contract shape and production transition checklist.
 
 Reports use only `route:<name>` or `routes[<index>]` references, profile names,
 source IDs, and tool names. They do not report raw Signal IDs, direct sender

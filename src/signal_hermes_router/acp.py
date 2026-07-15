@@ -485,10 +485,7 @@ class ACPProfile:
             if exc.error.get("code") == -32601:
                 raise PreflightProbeUnavailable("probe_unsupported") from exc
             raise
-        surface = tool_surface_from_value(self.profile, result, source="_tool_surface/list")
-        if surface is None:
-            raise PreflightProbeUnavailable("probe_empty")
-        return surface
+        return tool_surface_from_value(self.profile, result, source="_tool_surface/list")
 
     def set_permission_policy(self, session_id: str, policy: StaticPermissionPolicy) -> None:
         self.permission_policies[session_id] = policy

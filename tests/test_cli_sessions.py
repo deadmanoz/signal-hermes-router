@@ -727,7 +727,13 @@ routes:
                 encoding="utf-8",
             )
             contract.write_text(
-                json.dumps({"profiles": {"example-profile": ["read_file", "web_search"]}}),
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "scope": "full_callable",
+                        "profiles": {"example-profile": {"tools": ["read_file", "web_search"]}},
+                    }
+                ),
                 encoding="utf-8",
             )
             args = argparse.Namespace(
@@ -753,7 +759,13 @@ routes:
             self.assertNotIn("private-group", printed.call_args.args[0])
 
             contract.write_text(
-                json.dumps({"profiles": {"example-profile": ["read_file"]}}),
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "scope": "full_callable",
+                        "profiles": {"example-profile": {"tools": ["read_file"]}},
+                    }
+                ),
                 encoding="utf-8",
             )
             with patch("builtins.print") as printed:
@@ -764,6 +776,25 @@ routes:
             self.assertEqual(report["status"], "failed")
             self.assertEqual(report["missing_tools"][0]["tool"], "web_search")
             self.assertNotIn("private-group", printed.call_args.args[0])
+
+            contract.write_text(
+                json.dumps({"profiles": {"example-profile": {"tools": ["read_file"]}}}),
+                encoding="utf-8",
+            )
+            with (
+                patch("builtins.print") as printed,
+                patch.object(cli_module.logging, "error") as logged_error,
+            ):
+                code = await cli_module._preflight_permissions(args)
+
+            self.assertEqual(code, 1)
+            printed.assert_not_called()
+            self.assertEqual(logged_error.call_args.args[0], "preflight-permissions failed: %s")
+            self.assertEqual(
+                logged_error.call_args.args[1],
+                f"probe contract file is invalid: {contract}: "
+                "tool-surface contract must declare schema_version=1",
+            )
 
             args.route_index = [-1]
             with (
@@ -814,7 +845,13 @@ routes:
             self.assertIn("line 1 column 2", logged_error.call_args.args[1])
 
             contract.write_text(
-                json.dumps({"profiles": {"example-profile": {"tools": ["read_file", 7]}}}),
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "scope": "full_callable",
+                        "profiles": {"example-profile": {"tools": ["read_file", 7]}},
+                    }
+                ),
                 encoding="utf-8",
             )
             with (
