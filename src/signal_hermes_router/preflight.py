@@ -15,6 +15,10 @@ ProbeCallable = Callable[[str], Awaitable["ToolSurface"]]
 SUPPORTED_TOOL_SURFACE_SCHEMA_VERSION = 1
 FULL_CALLABLE_TOOL_SURFACE_SCOPE = "full_callable"
 _MISSING = object()
+# Catalog-carrying keys other than `tools` that the metadata path recognizes.
+# On the dedicated method's native branch their coexistence with `tools` makes
+# producer intent ambiguous, so we fail closed rather than silently pick `tools`.
+_NATIVE_AMBIGUOUS_CATALOG_KEYS = ("toolSurface", "tool_surface", "tool_names")
 
 
 def _validate_probe_error_fields(code: str, error: str | None) -> None:
@@ -196,8 +200,10 @@ def tool_surface_from_hermes_tool_surface_list(
     dedicated method: if the response declares schema_version and/or scope it is
     an explicit envelope, so it is validated strictly via tool_surface_from_value
     (an unsupported version, a partial envelope, or a model_facing scope still
-    fails closed here). Hermes owns its extension response shape; the router owns
-    normalization and validation.
+    fails closed here). A native-shape response that also carries a coexisting
+    alternative catalog key (toolSurface/tool_surface/tool_names) is ambiguous and
+    fails closed, mirroring the metadata path. Hermes owns its extension response
+    shape; the router owns normalization and validation.
     """
     if not isinstance(value, dict):
         raise PreflightProbeUnavailable(
@@ -210,7 +216,17 @@ def tool_surface_from_hermes_tool_surface_list(
         return tool_surface_from_value(profile, value, source="_tool_surface/list")
     # Pure Hermes-native shape: only the tools array is present; schema_version
     # and scope are injected by the router because the dedicated method name is
-    # the callable-catalog contract.
+    # the callable-catalog contract. A coexisting alternative catalog key
+    # (toolSurface/tool_surface/tool_names) alongside `tools` leaves producer
+    # intent ambiguous, so we fail closed here just like the metadata path rather
+    # than silently stamping the top-level `tools` array as full_callable.
+    coexisting = [key for key in _NATIVE_AMBIGUOUS_CATALOG_KEYS if key in value]
+    if coexisting:
+        raise PreflightProbeUnavailable(
+            "probe_contract_ambiguous",
+            "tool-surface response carries coexisting catalog keys alongside tools: "
+            + ", ".join(coexisting),
+        )
     return ToolSurface.from_names(
         profile,
         _contract_tool_names(value.get("tools", _MISSING)),

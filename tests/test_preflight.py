@@ -570,6 +570,18 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 {"schema_version": 2, "scope": "full_callable", "tools": ["read_file"]},
             )
 
+    def test_hermes_tool_surface_list_rejects_native_shape_coexisting_catalog_keys(self) -> None:
+        # A native-shape response (no schema_version/scope) that also carries an
+        # alternative catalog key alongside `tools` leaves producer intent
+        # ambiguous; the router fails closed instead of silently picking `tools`.
+        for coexisting_key in ("toolSurface", "tool_surface", "tool_names"):
+            with self.subTest(coexisting_key=coexisting_key):
+                with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_ambiguous"):
+                    tool_surface_from_hermes_tool_surface_list(
+                        "calendar",
+                        {"tools": ["read_file"], coexisting_key: ["web_search"]},
+                    )
+
     def test_hermes_tool_surface_list_rejects_native_shape_missing_tools(self) -> None:
         # A dict with neither schema_version/scope nor a tools key takes the
         # native branch; a truncated response with no tools array fails closed
