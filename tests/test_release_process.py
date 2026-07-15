@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -76,6 +79,8 @@ class ReleaseProcessTests(unittest.TestCase):
         self.assertIn('if [ "$live_head_sha" != "$PREVIOUS_HEAD_SHA" ]', restore_run)
         self.assertIn('gh pr ready "$PR_NUMBER" --repo "$REPO"', restore_run)
         self.assertIn("pending release PR head changed while restoring ready state", restore_run)
+        self.assertIn("trap redraft_on_failure EXIT", restore_run)
+        self.assertIn("trap - EXIT", restore_run)
         self.assertIn('if [ "$RESTORE_AUTO_MERGE" = "true" ]', restore_run)
         for flag in ("--auto", "--squash", "--delete-branch"):
             self.assertIn(flag, restore_run)
@@ -145,9 +150,62 @@ class ReleaseProcessTests(unittest.TestCase):
         self.assertLess(publish_run.index("gh pr ready"), publish_run.index("gh pr review"))
         self.assertLess(publish_run.index("gh pr review"), publish_run.index("gh pr merge"))
         self.assertIn("compare/$BASE_BRANCH...$live_head_sha", publish_run)
+        self.assertIn("protection/required_status_checks", publish_run)
+        self.assertIn('if [ "$strict" != "true" ]', publish_run)
+        self.assertIn("trap redraft_on_failure EXIT", publish_run)
+        self.assertIn("trap - EXIT", publish_run)
         self.assertIn("changed or became unmergeable during ready transition", publish_run)
         self.assertIn("changed or became unmergeable before auto-merge", publish_run)
         self.assertIn('--match-head-commit "$validated_sha"', publish_run)
+
+    def test_publish_failure_after_ready_redrafts_pr(self) -> None:
+        publish_run = self.steps_by_name["Publish validated release PR"]["run"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            call_log = Path(tmp) / "gh-calls.log"
+            harness = f"""
+set -e -o pipefail
+git() {{
+  printf '%s\\n' "$VALIDATED_SHA"
+}}
+gh() {{
+  printf '%s\\n' "$*" >> "$CALL_LOG"
+  if [[ "$*" == *"protection/required_status_checks"* ]]; then
+    printf 'true\\n'
+  elif [[ "$*" == *"compare/$BASE_BRANCH"* ]]; then
+    printf '0\\n'
+  elif [[ "$*" == *"--json headRefOid,mergeable"* ]]; then
+    printf '{{"headRefOid":"%s","mergeable":"MERGEABLE"}}\\n' "$VALIDATED_SHA"
+  elif [[ "$*" == *"--json headRefOid --jq .headRefOid"* ]]; then
+    printf '%s\\n' "$VALIDATED_SHA"
+  elif [[ "$*" == "pr review "* ]]; then
+    return 42
+  fi
+}}
+{publish_run}
+"""
+            env = {
+                **os.environ,
+                "APPROVAL_TOKEN": "approval-token",
+                "BASE_BRANCH": "main",
+                "CALL_LOG": str(call_log),
+                "PR_NUMBER": "123",
+                "REPO": "example/repo",
+                "VALIDATED_SHA": "a1" * 20,
+            }
+
+            result = subprocess.run(
+                ["bash", "-c", harness],
+                check=False,
+                capture_output=True,
+                env=env,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            calls = call_log.read_text(encoding="utf-8")
+            self.assertIn("pr ready 123 --repo example/repo\n", calls)
+            self.assertIn("pr ready 123 --repo example/repo --undo\n", calls)
 
     def test_workflow_contains_no_post_generation_repair_commit(self) -> None:
         forbidden = (

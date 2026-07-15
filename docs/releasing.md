@@ -33,6 +33,8 @@ GitHub may report the draft as `BLOCKED` while approval or required checks are p
 
 The canonical `release-please--branches--main` branch is automation-owned. Do not push to it manually. Release-workflow concurrency serializes automated writers, publication rechecks the live SHA around the ready transition, and auto-merge is bound to the validated head with `--match-head-commit`.
 
+The workflow also verifies that `main` has strict required-status-check protection (`required_status_checks.strict=true`) before publishing. That repository rule atomically prevents auto-merge if `main` advances after the final compare check. Any failure after the PR becomes ready triggers an exit trap that returns it to draft.
+
 An existing ready release PR is moved back to draft before Release Please updates it. If the run is a successful no-op and the head did not change, the workflow restores the previous ready state and restores auto-merge only when it was previously enabled.
 
 If release validation fails, leave the PR in draft. Inspect the failed workflow step, fix the generating configuration or release process on `main`, and rerun the release workflow. Do not repair, mark ready, or merge the generated release branch by hand.

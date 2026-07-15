@@ -106,9 +106,13 @@ jobs:
           fi
 
           gh pr ready "$PR_NUMBER" --repo "$REPO"
+          redraft_on_failure() {
+            gh pr ready "$PR_NUMBER" --repo "$REPO" --undo || true
+          }
+          trap redraft_on_failure EXIT
+
           live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
           if [ "$live_head_sha" != "$PREVIOUS_HEAD_SHA" ]; then
-            gh pr ready "$PR_NUMBER" --repo "$REPO" --undo || true
             echo "::error::pending release PR head changed while restoring ready state"
             exit 1
           fi
@@ -120,6 +124,7 @@ jobs:
               --delete-branch \
               --match-head-commit "$PREVIOUS_HEAD_SHA"
           fi
+          trap - EXIT
 
       # Resolve the PR number once via jq on the raw `prs` string rather than
       # `fromJSON(...)` in a step `env:`. A step `env:` expression is evaluated
@@ -273,6 +278,12 @@ jobs:
           BASE_BRANCH: ${{ github.ref_name }}
         run: |
           validated_sha="$(git rev-parse HEAD)"
+          strict="$(gh api "repos/$REPO/branches/$BASE_BRANCH/protection/required_status_checks" --jq .strict)"
+          if [ "$strict" != "true" ]; then
+            echo "::error::$BASE_BRANCH must require branches to be up to date before merging"
+            exit 1
+          fi
+
           live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
           if [ "$live_head_sha" != "$validated_sha" ]; then
             echo "::error::release PR head changed before ready transition; leaving it draft"
@@ -280,6 +291,11 @@ jobs:
           fi
 
           gh pr ready "$PR_NUMBER" --repo "$REPO"
+          redraft_on_failure() {
+            gh pr ready "$PR_NUMBER" --repo "$REPO" --undo || true
+          }
+          trap redraft_on_failure EXIT
+
           live_head_sha=""
           mergeable=""
           behind_by=""
@@ -295,7 +311,6 @@ jobs:
             sleep 5
           done
           if [ "$live_head_sha" != "$validated_sha" ] || [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
-            gh pr ready "$PR_NUMBER" --repo "$REPO" --undo || true
             echo "::error::release head changed or became unmergeable during ready transition"
             exit 1
           fi
@@ -312,7 +327,6 @@ jobs:
           mergeable="$(printf '%s' "$details" | jq -r .mergeable)"
           behind_by="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$live_head_sha" --jq .behind_by)"
           if [ "$live_head_sha" != "$validated_sha" ] || [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
-            gh pr ready "$PR_NUMBER" --repo "$REPO" --undo || true
             echo "::error::release head changed or became unmergeable before auto-merge"
             exit 1
           fi
@@ -323,3 +337,4 @@ jobs:
             --squash \
             --delete-branch \
             --match-head-commit "$validated_sha"
+          trap - EXIT
