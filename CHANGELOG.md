@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.27](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.26...v0.1.27) (2026-07-15)
+
+
+### Documentation
+
+* **deployment:** harden release deployment checks ([#62](https://github.com/deadmanoz/signal-hermes-router/issues/62))
+
 ## [0.1.26](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.25...v0.1.26) (2026-07-15)
 
 
