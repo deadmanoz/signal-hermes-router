@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.30](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.29...v0.1.30) (2026-07-15)
+
+
+### Bug Fixes
+
+* **preflight:** adapt to Hermes-native _tool_surface/list response ([#68](https://github.com/deadmanoz/signal-hermes-router/issues/68)) ([ec63eef](https://github.com/deadmanoz/signal-hermes-router/commit/ec63eef99ee74f1928bf53825572e1c110d2eac0))
+
 ## [0.1.29](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.28...v0.1.29) (2026-07-15)
 
 
