@@ -133,13 +133,15 @@ falling back to `_tool_surface/list`.
 For `agentCapabilities._meta` and the offline contract file, missing versions,
 unsupported versions, missing scopes, model-facing scopes, ambiguous metadata
 candidates, and malformed contracts produce specific `probe_contract_*` errors.
+These `probe_contract_*` errors never produce missing-tool findings.
 The `_tool_surface/list` method is the one exception for a missing version/scope:
 its Hermes-native `{tools: [...]}` shape is normalized, though an explicit but
 unsupported or model-facing envelope on that method still fails closed. An
 alternative catalog key (`toolSurface`/`tool_surface`/`tool_names`) is never part
 of the dedicated method's contract, so it is rejected as ambiguous there too,
-whether it accompanies the native shape or an explicit versioned envelope. They never produce missing-tool findings. Present but
-invalid capability metadata also does not fall through to `_tool_surface/list`.
+whether it accompanies the native shape or an explicit versioned envelope.
+Present but invalid capability metadata also does not fall through to
+`_tool_surface/list`.
 Redundant aliases count as ambiguous, including a v1 `toolSurface` alongside a
 legacy or model-facing `tools` field; producers must publish exactly one
 candidate.
