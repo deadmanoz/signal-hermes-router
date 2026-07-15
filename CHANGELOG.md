@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.29](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.28...v0.1.29) (2026-07-15)
+
+
+### Bug Fixes
+
+* **preflight:** version callable tool-surface contracts ([#64](https://github.com/deadmanoz/signal-hermes-router/issues/64)) ([f1fdee5](https://github.com/deadmanoz/signal-hermes-router/commit/f1fdee58f11fae7239e7b67d62a639b1abb5d388))
+
 ## [0.1.28](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.27...v0.1.28) (2026-07-15)
 
 
