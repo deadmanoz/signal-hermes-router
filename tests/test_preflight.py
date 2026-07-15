@@ -582,6 +582,18 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                         {"tools": ["read_file"], coexisting_key: ["web_search"]},
                     )
 
+    def test_hermes_tool_surface_list_rejects_native_shape_alternative_key_without_tools(
+        self,
+    ) -> None:
+        # The same guard fires when the native response uses an alternative
+        # catalog key with no `tools` key at all; it fails closed as ambiguous
+        # rather than treating a non-dedicated shape as an empty catalog.
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_ambiguous"):
+            tool_surface_from_hermes_tool_surface_list(
+                "calendar",
+                {"tool_names": ["read_file"]},
+            )
+
     def test_hermes_tool_surface_list_rejects_native_shape_missing_tools(self) -> None:
         # A dict with neither schema_version/scope nor a tools key takes the
         # native branch; a truncated response with no tools array fails closed

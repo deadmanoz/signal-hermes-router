@@ -212,20 +212,25 @@ def tool_surface_from_hermes_tool_surface_list(
         )
     # An explicit envelope (or partial envelope) declares its own version/scope;
     # validate it strictly so unsupported/model_facing catalogs still fail closed.
+    # An explicit versioned envelope is authoritative, so `tools` is trusted as
+    # the catalog and the native-branch coexisting-key ambiguity guard below is
+    # intentionally NOT applied here (adding it would change the shared
+    # tool_surface_from_value semantics for every caller, not just this method).
     if "schema_version" in value or "scope" in value:
         return tool_surface_from_value(profile, value, source="_tool_surface/list")
     # Pure Hermes-native shape: only the tools array is present; schema_version
     # and scope are injected by the router because the dedicated method name is
-    # the callable-catalog contract. A coexisting alternative catalog key
-    # (toolSurface/tool_surface/tool_names) alongside `tools` leaves producer
-    # intent ambiguous, so we fail closed here just like the metadata path rather
-    # than silently stamping the top-level `tools` array as full_callable.
-    coexisting = [key for key in _NATIVE_AMBIGUOUS_CATALOG_KEYS if key in value]
-    if coexisting:
+    # the callable-catalog contract. An alternative catalog key
+    # (toolSurface/tool_surface/tool_names) leaves producer intent ambiguous
+    # whether or not `tools` also appears, so we fail closed here just like the
+    # metadata path rather than silently stamping the `tools` array as
+    # full_callable (or picking one alternative key when `tools` is absent).
+    alternative_keys = [key for key in _NATIVE_AMBIGUOUS_CATALOG_KEYS if key in value]
+    if alternative_keys:
         raise PreflightProbeUnavailable(
             "probe_contract_ambiguous",
-            "tool-surface response carries coexisting catalog keys alongside tools: "
-            + ", ".join(coexisting),
+            "tool-surface native response uses catalog keys other than tools: "
+            + ", ".join(alternative_keys),
         )
     return ToolSurface.from_names(
         profile,
