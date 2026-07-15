@@ -1106,9 +1106,14 @@ class SignalHermesRouter:
                             reply_text,
                             attachments=frozen_attachments,
                         ):
-                            # Fallback send failed — use existing Signal-send
-                            # failure path (retry/observability semantics).
-                            failure, last_failure_at_ms = self._signal_send_failure(route)
+                            # Preserve the ACP diagnostic as the primary
+                            # failure, matching normal Hermes failure replies.
+                            # Signal delivery is a secondary transport error.
+                            LOGGER.error(
+                                "empty-response fallback delivery failed for %s; "
+                                "preserving original route failure",
+                                self.redactor.ref("route", route.key),
+                            )
                             handled = turn.synthetic is None
                             return TurnOutcome(
                                 TurnOutcomeStatus.ERROR,

@@ -4714,6 +4714,32 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
+    async def test_synthetic_blank_reply_send_failure_preserves_acp_failure(self) -> None:
+        class FlakySignal(FakeSignal):
+            async def send_group(self, group_id: str, message: str) -> dict[str, int]:
+                raise RuntimeError("send failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = make_route(name="agenda-route")
+            profile = FakeProfile()
+            profile.reply_text = ""
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=FlakySignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            self.assertEqual(failed.error, "acp_empty_response")
+            self.assertEqual(failed.failure.code, FailureCode.ACP_EMPTY_RESPONSE)
+            self.assertEqual(
+                router._route_status_response({})["routes"][0]["last_failure"]["code"],
+                "acp_empty_response",
+            )
+
     async def test_sentinel_reply_suppresses_send_and_marks_handled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             signal = FakeSignal()
