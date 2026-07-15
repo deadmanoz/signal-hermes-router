@@ -34,7 +34,7 @@ HEX_RE = re.compile(r"\b[0-9a-fA-F]{40,}\b")
 URL_RE = re.compile(r"https?://[^\s>)\"']+")
 GITHUB_COMMIT_URL_RE = re.compile(
     r"https:"
-    r"//github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/commit/[0-9a-fA-F]{40}"
+    r"//github\.com/[A-Za-z0-9-]+/[A-Za-z0-9_.-]+/commit/[0-9a-fA-F]{40}"
     r"(?=$|[\s)\]}>.,;:'\"])"
 )
 GROUP_ID_RE = re.compile(r"\bgroup_id\s*[:=]\s*(?:[\"']([^\"']+)[\"']|([^#\s]+))", re.IGNORECASE)

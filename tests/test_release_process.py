@@ -63,6 +63,7 @@ class ReleaseProcessTests(unittest.TestCase):
         for expected in (
             "always()",
             "!cancelled()",
+            "steps.pending_pr.outcome == 'success'",
             "steps.release.outcome == 'success'",
             "steps.release.outputs.prs_created != 'true'",
             "steps.pending_pr.outputs.was_ready == 'true'",
@@ -136,6 +137,15 @@ class ReleaseProcessTests(unittest.TestCase):
             names.index("Approve release PR"),
             names.index("Enable squash auto-merge"),
         )
+        for name in (
+            "Mark release PR ready",
+            "Approve release PR",
+            "Enable squash auto-merge",
+        ):
+            self.assertIn(
+                "steps.verify_release_pr_head.outcome == 'success'",
+                self.steps_by_name[name]["if"],
+            )
 
     def test_workflow_contains_no_post_generation_repair_commit(self) -> None:
         forbidden = (

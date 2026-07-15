@@ -73,6 +73,7 @@ jobs:
           ${{
             always() &&
             !cancelled() &&
+            steps.pending_pr.outcome == 'success' &&
             steps.release.outcome == 'success' &&
             steps.release.outputs.prs_created != 'true' &&
             steps.pending_pr.outputs.was_ready == 'true'
@@ -192,6 +193,7 @@ jobs:
           git diff --exit-code -- CHANGELOG.md pyproject.toml uv.lock
 
       - name: Verify release PR head
+        id: verify_release_pr_head
         if: ${{ steps.release.outputs.prs_created == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
@@ -221,7 +223,7 @@ jobs:
           fi
 
       - name: Mark release PR ready
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        if: ${{ steps.release.outputs.prs_created == 'true' && steps.verify_release_pr_head.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
@@ -229,7 +231,7 @@ jobs:
         run: gh pr ready "$PR_NUMBER" --repo "$REPO"
 
       - name: Approve release PR
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        if: ${{ steps.release.outputs.prs_created == 'true' && steps.verify_release_pr_head.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
@@ -237,7 +239,7 @@ jobs:
         run: gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body "Automated approval for validated release PR."
 
       - name: Enable squash auto-merge
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        if: ${{ steps.release.outputs.prs_created == 'true' && steps.verify_release_pr_head.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}

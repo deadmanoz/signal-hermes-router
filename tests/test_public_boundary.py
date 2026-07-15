@@ -131,6 +131,20 @@ routes:
 
         self.assertTrue(any("long base64-like value" in finding for finding in findings))
 
+    def test_rejects_commit_url_with_invalid_github_owner(self) -> None:
+        findings: list[str] = []
+        encoded_secret = "QWxhZGRpbjpvcGVuIHNlc2FtZQ" * 2
+        commit_hash = "a1" * 20
+        suspicious_url = f"https://github.com/not_valid/{encoded_secret}/commit/{commit_hash}"
+
+        public_boundary.check_text(
+            Path("CHANGELOG.md"),
+            f"Invalid commit URL: {suspicious_url}\n",
+            findings,
+        )
+
+        self.assertTrue(any("long base64-like value" in finding for finding in findings))
+
     def test_rejects_malformed_github_commit_url_with_extra_hash_character(self) -> None:
         findings: list[str] = []
         malformed_hash = ("a1" * 20) + "Q"
