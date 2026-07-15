@@ -60,31 +60,30 @@ class ReleaseProcessTests(unittest.TestCase):
         ):
             self.assertIn(expected, capture_run)
 
-    def test_noop_restores_only_the_exact_previous_ready_state(self) -> None:
-        restore = self.steps_by_name["Restore unchanged pending release PR"]
-        condition = restore["if"]
-        restore_run = restore["run"]
+    def test_pending_pr_noop_enters_full_validation_and_recovers_draft(self) -> None:
+        resolve = self.steps_by_name["Resolve release PR number"]
+        resolve_run = resolve["run"]
 
-        for expected in (
-            "always()",
-            "!cancelled()",
-            "steps.pending_pr.outcome == 'success'",
-            "steps.release.outcome == 'success'",
-            "steps.release.outputs.prs_created != 'true'",
-            "steps.pending_pr.outputs.was_ready == 'true'",
+        self.assertEqual(resolve["if"], "${{ steps.release.outcome == 'success' }}")
+        self.assertIn('elif [ -n "$PENDING_PR_NUMBER" ]', resolve_run)
+        self.assertIn('number="$PENDING_PR_NUMBER"', resolve_run)
+        self.assertIn('branch="release-please--branches--$BASE_BRANCH"', resolve_run)
+        self.assertIn('if [ "$PENDING_WAS_READY" = "true" ]', resolve_run)
+        self.assertIn('enable_auto_merge="$PENDING_AUTO_MERGE"', resolve_run)
+        self.assertIn('enable_auto_merge="true"', resolve_run)
+        self.assertIn('echo "has_release_pr=true"', resolve_run)
+
+        for name in (
+            "Ensure release PR branch is current",
+            "Check out release PR branch",
+            "Set up uv",
+            "Install Python 3.12",
+            "Validate generated release head",
+            "Verify release PR head",
         ):
-            self.assertIn(expected, condition)
-        self.assertIn("for attempt in 1 2 3 4 5", restore_run)
-        self.assertIn("could not read pending release PR head after 5 attempts", restore_run)
-        self.assertIn('if [ "$live_head_sha" != "$PREVIOUS_HEAD_SHA" ]', restore_run)
-        self.assertIn('gh pr ready "$PR_NUMBER" --repo "$REPO"', restore_run)
-        self.assertIn("pending release PR head changed while restoring ready state", restore_run)
-        self.assertIn("trap redraft_on_failure EXIT", restore_run)
-        self.assertIn("trap - EXIT", restore_run)
-        self.assertIn('if [ "$RESTORE_AUTO_MERGE" = "true" ]', restore_run)
-        for flag in ("--auto", "--squash", "--delete-branch"):
-            self.assertIn(flag, restore_run)
-        self.assertIn('--match-head-commit "$PREVIOUS_HEAD_SHA"', restore_run)
+            self.assertIn(
+                "steps.release_pr.outputs.has_release_pr == 'true'", self.steps_by_name[name]["if"]
+            )
 
     def test_release_head_is_synchronized_before_checkout_and_validation(self) -> None:
         names = [step["name"] for step in self.steps]
@@ -146,6 +145,7 @@ class ReleaseProcessTests(unittest.TestCase):
             names.index("Verify release PR head"),
             names.index("Publish validated release PR"),
         )
+        self.assertIn("steps.release_pr.outputs.has_release_pr == 'true'", publish["if"])
         self.assertIn("steps.verify_release_pr_head.outcome == 'success'", publish["if"])
         self.assertLess(publish_run.index("gh pr ready"), publish_run.index("gh pr review"))
         self.assertLess(publish_run.index("gh pr review"), publish_run.index("gh pr merge"))
@@ -156,6 +156,7 @@ class ReleaseProcessTests(unittest.TestCase):
         self.assertIn("trap - EXIT", publish_run)
         self.assertIn("changed or became unmergeable during ready transition", publish_run)
         self.assertIn("changed or became unmergeable before auto-merge", publish_run)
+        self.assertIn('if [ "$ENABLE_AUTO_MERGE" = "true" ]', publish_run)
         self.assertIn('--match-head-commit "$validated_sha"', publish_run)
 
     def test_publish_failure_after_ready_redrafts_pr(self) -> None:
@@ -189,6 +190,7 @@ gh() {{
                 "APPROVAL_TOKEN": "approval-token",
                 "BASE_BRANCH": "main",
                 "CALL_LOG": str(call_log),
+                "ENABLE_AUTO_MERGE": "true",
                 "PR_NUMBER": "123",
                 "REPO": "example/repo",
                 "VALIDATED_SHA": "a1" * 20,

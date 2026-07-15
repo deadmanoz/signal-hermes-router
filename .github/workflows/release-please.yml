@@ -70,85 +70,53 @@ jobs:
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
-      - name: Restore unchanged pending release PR
-        if: >-
-          ${{
-            always() &&
-            !cancelled() &&
-            steps.pending_pr.outcome == 'success' &&
-            steps.release.outcome == 'success' &&
-            steps.release.outputs.prs_created != 'true' &&
-            steps.pending_pr.outputs.was_ready == 'true'
-          }}
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-          PR_NUMBER: ${{ steps.pending_pr.outputs.number }}
-          PREVIOUS_HEAD_SHA: ${{ steps.pending_pr.outputs.head_sha }}
-          RESTORE_AUTO_MERGE: ${{ steps.pending_pr.outputs.auto_merge_enabled }}
-          REPO: ${{ github.repository }}
-        run: |
-          live_head_sha=""
-          for attempt in 1 2 3 4 5; do
-            if live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"; then
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "::error::could not read pending release PR head after 5 attempts"
-              exit 1
-            fi
-            echo "could not read pending release PR head on attempt $attempt; retrying"
-            sleep 5
-          done
-
-          if [ "$live_head_sha" != "$PREVIOUS_HEAD_SHA" ]; then
-            echo "::error::pending release PR head changed during a reported no-op"
-            exit 1
-          fi
-
-          gh pr ready "$PR_NUMBER" --repo "$REPO"
-          redraft_on_failure() {
-            gh pr ready "$PR_NUMBER" --repo "$REPO" --undo || true
-          }
-          trap redraft_on_failure EXIT
-
-          live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
-          if [ "$live_head_sha" != "$PREVIOUS_HEAD_SHA" ]; then
-            echo "::error::pending release PR head changed while restoring ready state"
-            exit 1
-          fi
-          if [ "$RESTORE_AUTO_MERGE" = "true" ]; then
-            gh pr merge "$PR_NUMBER" \
-              --repo "$REPO" \
-              --auto \
-              --squash \
-              --delete-branch \
-              --match-head-commit "$PREVIOUS_HEAD_SHA"
-          fi
-          trap - EXIT
-
-      # Resolve the PR number once via jq on the raw `prs` string rather than
+      # Resolve the PR identity once via jq on the raw `prs` string rather than
       # `fromJSON(...)` in a step `env:`. A step `env:` expression is evaluated
       # even when the step is skipped by `if:`, so `fromJSON` of the empty `prs`
-      # output (every push that creates no release PR) would fail the whole job.
+      # output would fail the whole job. A pending PR with no generated changes
+      # still enters the full validation path, which also recovers drafts left
+      # by an earlier failed run.
       - name: Resolve release PR number
         id: release_pr
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        if: ${{ steps.release.outcome == 'success' }}
         env:
+          PRS_CREATED: ${{ steps.release.outputs.prs_created }}
           PRS_JSON: ${{ steps.release.outputs.prs }}
+          PENDING_PR_NUMBER: ${{ steps.pending_pr.outputs.number }}
+          PENDING_WAS_READY: ${{ steps.pending_pr.outputs.was_ready }}
+          PENDING_AUTO_MERGE: ${{ steps.pending_pr.outputs.auto_merge_enabled }}
+          BASE_BRANCH: ${{ github.ref_name }}
         run: |
-          number="$(printf '%s' "$PRS_JSON" | jq -r '.[0].number')"
-          branch="$(printf '%s' "$PRS_JSON" | jq -r '.[0].headBranchName')"
+          if [ "$PRS_CREATED" = "true" ]; then
+            number="$(printf '%s' "$PRS_JSON" | jq -r '.[0].number')"
+            branch="$(printf '%s' "$PRS_JSON" | jq -r '.[0].headBranchName')"
+            enable_auto_merge="true"
+          elif [ -n "$PENDING_PR_NUMBER" ]; then
+            number="$PENDING_PR_NUMBER"
+            branch="release-please--branches--$BASE_BRANCH"
+            if [ "$PENDING_WAS_READY" = "true" ]; then
+              enable_auto_merge="$PENDING_AUTO_MERGE"
+            else
+              enable_auto_merge="true"
+            fi
+          else
+            echo "has_release_pr=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [ -z "$number" ] || [ "$number" = "null" ] || [ -z "$branch" ] || [ "$branch" = "null" ]; then
             echo "could not resolve release PR identity from release output" >&2
             exit 1
           fi
+          echo "has_release_pr=true" >> "$GITHUB_OUTPUT"
           echo "number=$number" >> "$GITHUB_OUTPUT"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "enable_auto_merge=$enable_auto_merge" >> "$GITHUB_OUTPUT"
 
       # Synchronize a stale release branch before checkout. Validation must run
       # on the exact head that will later be marked ready and merged.
       - name: Ensure release PR branch is current
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
@@ -202,25 +170,25 @@ jobs:
           fi
 
       - name: Check out release PR branch
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ steps.release_pr.outputs.branch }}
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
       - name: Set up uv
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
       - name: Install Python 3.12
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
         run: uv python install 3.12
 
       - name: Validate generated release head
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
         run: |
           uv lock --check
           uv run --locked python scripts/check-public-boundary.py
@@ -228,7 +196,7 @@ jobs:
 
       - name: Verify release PR head
         id: verify_release_pr_head
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
@@ -267,7 +235,7 @@ jobs:
       - name: Publish validated release PR
         if: >-
           ${{
-            steps.release.outputs.prs_created == 'true' &&
+            steps.release_pr.outputs.has_release_pr == 'true' &&
             steps.verify_release_pr_head.outcome == 'success'
           }}
         env:
@@ -276,6 +244,7 @@ jobs:
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
           BASE_BRANCH: ${{ github.ref_name }}
+          ENABLE_AUTO_MERGE: ${{ steps.release_pr.outputs.enable_auto_merge }}
         run: |
           validated_sha="$(git rev-parse HEAD)"
           strict="$(gh api "repos/$REPO/branches/$BASE_BRANCH/protection/required_status_checks" --jq .strict)"
@@ -331,10 +300,12 @@ jobs:
             exit 1
           fi
 
-          gh pr merge "$PR_NUMBER" \
-            --repo "$REPO" \
-            --auto \
-            --squash \
-            --delete-branch \
-            --match-head-commit "$validated_sha"
+          if [ "$ENABLE_AUTO_MERGE" = "true" ]; then
+            gh pr merge "$PR_NUMBER" \
+              --repo "$REPO" \
+              --auto \
+              --squash \
+              --delete-branch \
+              --match-head-commit "$validated_sha"
+          fi
           trap - EXIT

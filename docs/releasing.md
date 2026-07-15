@@ -35,11 +35,9 @@ The canonical `release-please--branches--main` branch is automation-owned. Do no
 
 The workflow also verifies that `main` has strict required-status-check protection (`required_status_checks.strict=true`) before publishing. That repository rule atomically prevents auto-merge if `main` advances after the final compare check. Any failure after the PR becomes ready triggers an exit trap that returns it to draft.
 
-An existing ready release PR is moved back to draft before Release Please updates it. If the run is a successful no-op and the head did not change, the workflow restores the previous ready state and restores auto-merge only when it was previously enabled.
+An existing ready release PR is moved back to draft before Release Please updates it. Even when Release Please generates no new files, the pending PR runs through the same synchronization, validation, live-head, and publication gates. This also lets a rerun recover an automation-owned draft left by a previous failed run. A successful no-op preserves a ready PR's previous auto-merge setting; a recovered draft resumes the normal auto-merge path.
 
 If release validation fails, leave the PR in draft. Inspect the failed workflow step, fix the generating configuration or release process on `main`, and rerun the release workflow. Do not repair, mark ready, or merge the generated release branch by hand.
-
-If a reported no-op finds a different live head, treat it as a concurrent update: leave the PR draft and inspect both the PR history and workflow run before rerunning.
 
 Do not hand-edit [CHANGELOG.md](../CHANGELOG.md) or add `[Unreleased]` entries. Release Please generates changelog entries from merged commit titles.
 
