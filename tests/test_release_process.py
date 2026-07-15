@@ -27,6 +27,10 @@ class ReleaseProcessTests(unittest.TestCase):
     def test_release_please_generates_draft_pr_and_updates_uv_lock(self) -> None:
         package = self.config["packages"]["."]
 
+        self.assertEqual(
+            self.workflow["jobs"]["release-please"]["defaults"]["run"]["shell"],
+            "bash",
+        )
         self.assertIs(self.config["draft-pull-request"], True)
         self.assertEqual(
             package["extra-files"],
@@ -251,6 +255,10 @@ gh() {{
         self.assertIn("Administration read permission", publish_run)
         self.assertIn('if [ "$strict" != "true" ]', publish_run)
         self.assertIn("trap redraft_on_failure EXIT", publish_run)
+        self.assertLess(
+            publish_run.index("trap redraft_on_failure EXIT"),
+            publish_run.index('gh pr ready "$PR_NUMBER" --repo "$REPO"\n'),
+        )
         self.assertIn("trap - EXIT", publish_run)
         self.assertIn("changed or became unmergeable during ready transition", publish_run)
         self.assertIn("changed or became unmergeable before auto-merge", publish_run)

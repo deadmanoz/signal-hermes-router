@@ -16,6 +16,9 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       # Release Please opens new PRs as drafts. Existing ready release PRs must
       # also be drafted before an update so no reviewer can snapshot an
@@ -323,11 +326,11 @@ jobs:
             exit 1
           fi
 
-          gh pr ready "$PR_NUMBER" --repo "$REPO"
           redraft_on_failure() {
             gh pr ready "$PR_NUMBER" --repo "$REPO" --undo || true
           }
           trap redraft_on_failure EXIT
+          gh pr ready "$PR_NUMBER" --repo "$REPO"
 
           live_head_sha=""
           mergeable=""
