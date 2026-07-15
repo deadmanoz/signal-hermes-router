@@ -32,6 +32,11 @@ UUID_RE = re.compile(
 LONG_BASE64_RE = re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b")
 HEX_RE = re.compile(r"\b[0-9a-fA-F]{40,}\b")
 URL_RE = re.compile(r"https?://[^\s>)\"']+")
+GITHUB_COMMIT_URL_RE = re.compile(
+    r"https:"
+    r"//github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/commit/[0-9a-fA-F]{40}"
+    r"(?=$|[\s)\]}>.,;:'\"])"
+)
 GROUP_ID_RE = re.compile(r"\bgroup_id\s*[:=]\s*(?:[\"']([^\"']+)[\"']|([^#\s]+))", re.IGNORECASE)
 FRIENDLY_NAME_RE = re.compile(
     r"\bfriendly_name\s*[:=]\s*(?:[\"']([^\"']+)[\"']|([^#\n]+))", re.IGNORECASE
@@ -128,14 +133,21 @@ def should_scan(relative: Path, path: Path) -> bool:
 
 def check_text(relative: Path, text: str, findings: list[str]) -> None:
     for line_number, line in enumerate(text.splitlines(), 1):
+        public_commit_spans = [match.span() for match in GITHUB_COMMIT_URL_RE.finditer(line)]
         for phone in PHONE_RE.findall(line):
             if phone not in ALLOWED_PHONES:
                 findings.append(f"{relative}:{line_number}: phone-like identifier {phone!r}")
         for uuid in UUID_RE.findall(line):
             if uuid.lower() not in ALLOWED_UUIDS:
                 findings.append(f"{relative}:{line_number}: UUID-like identifier {uuid!r}")
-        for value in LONG_BASE64_RE.findall(line):
+        for match in LONG_BASE64_RE.finditer(line):
+            value = match.group(0)
             if HEX_RE.fullmatch(value):
+                continue
+            if any(
+                allowed_start <= match.start() and match.end() <= allowed_end
+                for allowed_start, allowed_end in public_commit_spans
+            ):
                 continue
             if "EXAMPLE" not in value and "PLACEHOLDER" not in value:
                 findings.append(f"{relative}:{line_number}: long base64-like value")

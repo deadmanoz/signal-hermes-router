@@ -81,6 +81,14 @@ PYTHONPATH=src python -m unittest tests.test_router.TestRouter.test_<name>
 
 Hermes is not a Python dependency of this package. The router supervises the `hermes` CLI as a black-box subprocess at runtime. Do not `import hermes_agent` here.
 
+## Review guidelines
+
+Release Please PRs are generated release artefacts when all of the following are true: the head branch is `release-please--branches--main`, the title starts with `chore(main): release`, and the diff is limited to `CHANGELOG.md`, `.release-please-manifest.json`, `pyproject.toml`, and `uv.lock`. Once the release workflow has validated that generated head, do not publish implementation findings about those generated contents.
+
+Before publishing any PR finding, confirm that the reviewed commit is still the live PR head. If the head has changed, discard findings from the stale snapshot and review the current head instead.
+
+Apply normal review to ordinary implementation PRs, including changes to the release workflow, Release Please configuration, public-boundary scanner, and their tests.
+
 ## Commits
 
 Conventional commits (`type(scope): description`), scope = module name (e.g. `feat(router):`, `fix(sessions):`). One logical change per commit. Never reference AI tools in messages.

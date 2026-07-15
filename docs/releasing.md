@@ -23,9 +23,15 @@ Patch bumps cover bug fixes, log/metric changes, internal refactors with no publ
 ## Automated release flow
 
 1. Merge PRs with Conventional Commit squash titles.
-2. Release Please opens or updates a release PR after releasable commits land on `main`.
-3. The same release workflow normalizes the release PR branch (strips changelog commit links and refreshes `uv.lock` so `uv sync --locked` stays green), then approves and arms squash auto-merge on that normalized head, so the PR can only ever merge after normalization has landed.
-4. When the release PR auto-merges, Release Please creates the `vX.Y.Z` tag and GitHub Release.
+2. Release Please opens or updates a draft release PR after releasable commits land on `main`. It generates `CHANGELOG.md`, updates `pyproject.toml`, and updates the matching project version in `uv.lock` from the same release metadata.
+3. The release workflow synchronizes a stale release branch, checks out the resulting head, and runs nonmutating validation with `uv lock --check`, the public-boundary scanner, and a clean-tree check for all generated release files.
+4. Immediately before changing the PR to ready, the workflow confirms that the validated checkout is still the live PR head and that the branch is neither behind nor conflicted.
+5. Only that validated head is marked ready, approved, and armed for squash auto-merge.
+6. When the release PR auto-merges, Release Please creates the `vX.Y.Z` tag and GitHub Release.
+
+An existing ready release PR is moved back to draft before Release Please updates it. If the run is a successful no-op and the head did not change, the workflow restores the previous ready state and restores auto-merge only when it was previously enabled.
+
+If release validation fails, leave the PR in draft. Inspect the failed workflow step, fix the generating configuration or release process on `main`, and rerun the release workflow. Do not repair, mark ready, or merge the generated release branch by hand.
 
 Do not hand-edit [CHANGELOG.md](../CHANGELOG.md) or add `[Unreleased]` entries. Release Please generates changelog entries from merged commit titles.
 

@@ -17,46 +17,83 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
+      # Release Please opens new PRs as drafts. Existing ready release PRs must
+      # also be drafted before an update so no reviewer can snapshot an
+      # unvalidated head. Preserve enough state to restore a successful no-op.
+      - name: Capture pending release PR state
+        id: pending_pr
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_BRANCH: ${{ github.ref_name }}
+        run: |
+          pending="$(gh pr list \
+            --repo "$REPO" \
+            --state open \
+            --base "$BASE_BRANCH" \
+            --label "autorelease: pending" \
+            --json number,isDraft,headRefOid,autoMergeRequest)"
+          count="$(printf '%s' "$pending" | jq 'length')"
+          if [ "$count" -gt 1 ]; then
+            echo "found multiple pending release PRs for $BASE_BRANCH" >&2
+            exit 1
+          fi
+
+          if [ "$count" -eq 0 ]; then
+            echo "number=" >> "$GITHUB_OUTPUT"
+            echo "was_ready=false" >> "$GITHUB_OUTPUT"
+            echo "head_sha=" >> "$GITHUB_OUTPUT"
+            echo "auto_merge_enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          number="$(printf '%s' "$pending" | jq -r '.[0].number')"
+          is_draft="$(printf '%s' "$pending" | jq -r '.[0].isDraft')"
+          head_sha="$(printf '%s' "$pending" | jq -r '.[0].headRefOid')"
+          auto_merge_enabled="$(printf '%s' "$pending" | jq -r '.[0].autoMergeRequest != null')"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "auto_merge_enabled=$auto_merge_enabled" >> "$GITHUB_OUTPUT"
+
+          if [ "$is_draft" = "true" ]; then
+            echo "was_ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "was_ready=true" >> "$GITHUB_OUTPUT"
+            gh pr ready "$number" --repo "$REPO" --undo
+          fi
+
       - name: Run Release Please
         id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
-      - name: Check out release PR branch
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          ref: ${{ fromJSON(steps.release.outputs.prs)[0].headBranchName }}
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-
-      - name: Set up uv
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
-        with:
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-
-      - name: Strip changelog commit links and refresh uv.lock
-        if: ${{ steps.release.outputs.prs_created == 'true' }}
+      - name: Restore unchanged pending release PR
+        if: >-
+          ${{
+            always() &&
+            steps.release.outcome == 'success' &&
+            steps.release.outputs.prs_created != 'true' &&
+            steps.pending_pr.outputs.was_ready == 'true'
+          }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          PR_NUMBER: ${{ steps.pending_pr.outputs.number }}
+          PREVIOUS_HEAD_SHA: ${{ steps.pending_pr.outputs.head_sha }}
+          RESTORE_AUTO_MERGE: ${{ steps.pending_pr.outputs.auto_merge_enabled }}
+          REPO: ${{ github.repository }}
         run: |
-          perl -0pi -e 's/ \(\[[0-9a-f]{7,40}\]\(https:\/\/github\.com\/[^)]+\/commit\/[0-9a-f]{40}\)\)//g' CHANGELOG.md
-          uv lock
-          if git diff --quiet -- CHANGELOG.md uv.lock; then
-            echo "changelog and uv.lock already match release metadata"
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add CHANGELOG.md uv.lock
-            git commit -m "chore(release): normalize changelog and uv.lock"
-            git push
+          live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
+          if [ "$live_head_sha" != "$PREVIOUS_HEAD_SHA" ]; then
+            echo "pending release PR head changed during a reported no-op" >&2
+            exit 1
           fi
 
-      # Arm auto-merge on the release PR from within this job, AFTER the normalize
-      # commit has been pushed, so the PR can never be squash-merged on a
-      # pre-normalize head. This owns the release-PR path that the Auto Merge
-      # workflow used to handle; Auto Merge now covers Dependabot only.
-      #
+          gh pr ready "$PR_NUMBER" --repo "$REPO"
+          if [ "$RESTORE_AUTO_MERGE" = "true" ]; then
+            gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --squash --delete-branch
+          fi
+
       # Resolve the PR number once via jq on the raw `prs` string rather than
       # `fromJSON(...)` in a step `env:`. A step `env:` expression is evaluated
       # even when the step is skipped by `if:`, so `fromJSON` of the empty `prs`
@@ -68,14 +105,17 @@ jobs:
           PRS_JSON: ${{ steps.release.outputs.prs }}
         run: |
           number="$(printf '%s' "$PRS_JSON" | jq -r '.[0].number')"
-          if [ -z "$number" ] || [ "$number" = "null" ]; then
-            echo "could not resolve release PR number from release output" >&2
+          branch="$(printf '%s' "$PRS_JSON" | jq -r '.[0].headBranchName')"
+          if [ -z "$number" ] || [ "$number" = "null" ] || [ -z "$branch" ] || [ "$branch" = "null" ]; then
+            echo "could not resolve release PR identity from release output" >&2
             exit 1
           fi
           echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve release PR merge state
-        id: merge_state
+      # Synchronize a stale release branch before checkout. Validation must run
+      # on the exact head that will later be marked ready and merged.
+      - name: Ensure release PR branch is current
         if: ${{ steps.release.outputs.prs_created == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
@@ -91,38 +131,89 @@ jobs:
             echo "mergeStateStatus is UNKNOWN on attempt $attempt; retrying"
             sleep 5
           done
-          echo "merge_state=$state" >> "$GITHUB_OUTPUT"
 
-      - name: Update stale release branch
-        id: update_branch
-        if: ${{ steps.release.outputs.prs_created == 'true' && steps.merge_state.outputs.merge_state == 'BEHIND' }}
-        continue-on-error: true
+          case "$state" in
+            BEHIND)
+              gh pr update-branch "$PR_NUMBER" --repo "$REPO"
+              ;;
+            DIRTY|UNKNOWN)
+              echo "release PR merge state is $state; leaving it draft" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Check out release PR branch
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.release_pr.outputs.branch }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+
+      - name: Set up uv
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python 3.12
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        run: uv python install 3.12
+
+      - name: Validate generated release head
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        run: |
+          uv lock --check
+          uv run --locked python scripts/check-public-boundary.py
+          git diff --exit-code -- CHANGELOG.md pyproject.toml uv.lock
+
+      - name: Verify release PR head
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
-        run: gh pr update-branch "$PR_NUMBER" --repo "$REPO"
+        run: |
+          checked_out_sha="$(git rev-parse HEAD)"
+          state=""
+          for attempt in 1 2 3 4 5; do
+            details="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,mergeStateStatus)"
+            live_head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
+            state="$(printf '%s' "$details" | jq -r .mergeStateStatus)"
+            if [ "$state" != "UNKNOWN" ]; then
+              break
+            fi
+            echo "mergeStateStatus is UNKNOWN on attempt $attempt; retrying"
+            sleep 5
+          done
+
+          if [ "$live_head_sha" != "$checked_out_sha" ]; then
+            echo "release PR head changed after validation; leaving it draft" >&2
+            exit 1
+          fi
+          if [ "$state" = "BEHIND" ] || [ "$state" = "DIRTY" ] || [ "$state" = "UNKNOWN" ]; then
+            echo "release PR merge state became $state after validation; leaving it draft" >&2
+            exit 1
+          fi
+
+      - name: Mark release PR ready
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          PR_NUMBER: ${{ steps.release_pr.outputs.number }}
+          REPO: ${{ github.repository }}
+        run: gh pr ready "$PR_NUMBER" --repo "$REPO"
 
       - name: Approve release PR
-        if: >-
-          ${{
-            steps.release.outputs.prs_created == 'true' &&
-            steps.merge_state.outputs.merge_state != 'DIRTY' &&
-            steps.update_branch.outcome != 'failure'
-          }}
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
-        run: gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body "Automated approval for normalized release PR."
+        run: gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body "Automated approval for validated release PR."
 
       - name: Enable squash auto-merge
-        if: >-
-          ${{
-            steps.release.outputs.prs_created == 'true' &&
-            steps.merge_state.outputs.merge_state != 'DIRTY' &&
-            steps.update_branch.outcome != 'failure'
-          }}
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}

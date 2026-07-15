@@ -94,6 +94,71 @@ routes:
 
         self.assertEqual(findings, [])
 
+    def test_allows_canonical_github_commit_url_in_markdown(self) -> None:
+        findings: list[str] = []
+        commit_url = "https://github.com/deadmanoz/signal-hermes-router/commit/" + "a1" * 20
+
+        public_boundary.check_text(
+            Path("CHANGELOG.md"),
+            f"Fixed release handling ([commit]({commit_url})).\n",
+            findings,
+        )
+
+        self.assertEqual(findings, [])
+
+    def test_rejects_unrelated_long_base64_value(self) -> None:
+        findings: list[str] = []
+        encoded_secret = "QWxhZGRpbjpvcGVuIHNlc2FtZQ" * 2
+
+        public_boundary.check_text(
+            Path("README.md"),
+            f"opaque value: {encoded_secret}\n",
+            findings,
+        )
+
+        self.assertTrue(any("long base64-like value" in finding for finding in findings))
+
+    def test_rejects_long_value_on_non_commit_github_path(self) -> None:
+        findings: list[str] = []
+        encoded_secret = "QWxhZGRpbjpvcGVuIHNlc2FtZQ" * 2
+        suspicious_url = f"https://github.com/deadmanoz/{encoded_secret}/issues"
+
+        public_boundary.check_text(
+            Path("README.md"),
+            f"See [issue]({suspicious_url}).\n",
+            findings,
+        )
+
+        self.assertTrue(any("long base64-like value" in finding for finding in findings))
+
+    def test_rejects_malformed_github_commit_url_with_extra_hash_character(self) -> None:
+        findings: list[str] = []
+        malformed_hash = ("a1" * 20) + "Q"
+        malformed_url = "https://github.com/deadmanoz/signal-hermes-router/commit/" + malformed_hash
+
+        public_boundary.check_text(
+            Path("CHANGELOG.md"),
+            f"Malformed commit URL: {malformed_url}\n",
+            findings,
+        )
+
+        self.assertTrue(any("long base64-like value" in finding for finding in findings))
+
+    def test_rejects_github_commit_url_with_query_or_fragment_suffix(self) -> None:
+        commit_url = "https://github.com/deadmanoz/signal-hermes-router/commit/" + "a1" * 20
+
+        for suffix in ("?token=Q" + "X" * 40, "#" + "Q" * 48):
+            with self.subTest(suffix=suffix[0]):
+                self.assertIsNone(public_boundary.GITHUB_COMMIT_URL_RE.search(commit_url + suffix))
+                findings: list[str] = []
+                public_boundary.check_text(
+                    Path("CHANGELOG.md"),
+                    f"Commit URL: {commit_url}{suffix}\n",
+                    findings,
+                )
+
+                self.assertTrue(any("long base64-like value" in finding for finding in findings))
+
 
 if __name__ == "__main__":
     unittest.main()
