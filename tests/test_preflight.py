@@ -550,6 +550,16 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 {"scope": "full_callable", "tools": ["read_file"]},
             )
 
+    def test_hermes_tool_surface_list_rejects_version_only_partial_envelope(self) -> None:
+        # schema_version present but scope absent is the symmetric partial
+        # explicit envelope; the wrapper routes it to strict validation, which
+        # fails closed on the missing scope rather than injecting full_callable.
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "scope_missing"):
+            tool_surface_from_hermes_tool_surface_list(
+                "calendar",
+                {"schema_version": 1, "tools": ["read_file"]},
+            )
+
     def test_hermes_tool_surface_list_rejects_explicit_unsupported_version(self) -> None:
         # An explicit envelope declaring schema_version=2 is routed to the strict
         # validator, so an unsupported version fails closed rather than being
