@@ -24,7 +24,7 @@ Patch bumps cover bug fixes, log/metric changes, internal refactors with no publ
 
 1. Merge PRs with Conventional Commit squash titles.
 2. Release Please opens or updates a draft release PR after releasable commits land on `main`. It generates `CHANGELOG.md`, updates `pyproject.toml`, and updates the matching project version in `uv.lock` from the same release metadata.
-3. The release workflow synchronizes a stale release branch, checks out the resulting head, and runs nonmutating validation with `uv lock --check`, the public-boundary scanner, and a clean-tree check for all generated release files.
+3. The release workflow synchronizes a stale release branch, checks its diff through the GitHub API, and rejects every path except `CHANGELOG.md`, `.release-please-manifest.json`, `pyproject.toml`, and `uv.lock` before checkout. It then checks out the inspected SHA without persisted credentials and runs nonmutating validation with `uv lock --check`, the public-boundary scanner, and a clean-tree check for all generated release files.
 4. Immediately before changing the PR to ready, the workflow confirms that the validated checkout is still the live PR head, GitHub reports it as mergeable rather than conflicting, and the compare API reports `behind_by=0`. These signals remain meaningful while the PR is draft.
 5. Only that validated head is marked ready, approved, and armed for squash auto-merge.
 6. When the release PR auto-merges, Release Please creates the `vX.Y.Z` tag and GitHub Release.
@@ -34,6 +34,8 @@ GitHub may report the draft as `BLOCKED` while approval or required checks are p
 The canonical `release-please--branches--main` branch is automation-owned. Do not push to it manually. Release-workflow concurrency serializes automated writers, publication rechecks the live SHA around the ready transition, and auto-merge is bound to the validated head with `--match-head-commit`.
 
 The workflow also verifies that `main` has strict required-status-check protection (`required_status_checks.strict=true`) before publishing. That repository rule atomically prevents auto-merge if `main` advances after the final compare check. Any failure after the PR becomes ready triggers an exit trap that returns it to draft.
+
+`RELEASE_PLEASE_TOKEN` must be a classic personal access token with `repo` scope, or a fine-grained token with repository Contents, Pull requests, and Issues read/write permissions plus Administration read permission. Administration read is required only to inspect strict status-check protection; the workflow does not change repository settings.
 
 An existing ready release PR is moved back to draft before Release Please updates it. Even when Release Please generates no new files, the pending PR runs through the same synchronization, validation, live-head, and publication gates. This also lets a rerun recover an automation-owned draft left by a previous failed run. A successful no-op preserves a ready PR's previous auto-merge setting; a recovered draft resumes the normal auto-merge path.
 

@@ -116,6 +116,7 @@ jobs:
       # Synchronize a stale release branch before checkout. Validation must run
       # on the exact head that will later be marked ready and merged.
       - name: Ensure release PR branch is current
+        id: current_release_pr
         if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
@@ -169,12 +170,72 @@ jobs:
               exit 1
           fi
 
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+      # Inspect the immutable PR head through GitHub before checking out any of
+      # its content. Only Release Please's four generated files are permitted.
+      - name: Validate generated release diff
+        if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          PR_NUMBER: ${{ steps.release_pr.outputs.number }}
+          REPO: ${{ github.repository }}
+          EXPECTED_HEAD_SHA: ${{ steps.current_release_pr.outputs.head_sha }}
+        run: |
+          details="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,changedFiles)"
+          live_head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
+          changed_files="$(printf '%s' "$details" | jq -r .changedFiles)"
+          if [ "$live_head_sha" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "::error::release PR head changed before diff validation; leaving it draft"
+            exit 1
+          fi
+          case "$changed_files" in
+            ''|*[!0-9]*|0)
+              echo "::error::invalid release PR changed-file count '$changed_files'; leaving it draft"
+              exit 1
+              ;;
+          esac
+
+          files_json="$(gh api \
+            --paginate \
+            --slurp \
+            "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100")"
+          listed_files="$(printf '%s' "$files_json" | jq '[.[][]] | length')"
+          if [ "$listed_files" != "$changed_files" ]; then
+            echo "::error::release PR file listing is incomplete ($listed_files of $changed_files); leaving it draft"
+            exit 1
+          fi
+
+          unexpected="$(printf '%s' "$files_json" | jq -c '
+            [
+              .[][]
+              | .filename, (.previous_filename // empty)
+              | select(
+                  . != "CHANGELOG.md"
+                  and . != ".release-please-manifest.json"
+                  and . != "pyproject.toml"
+                  and . != "uv.lock"
+                )
+            ]
+            | unique
+          ')"
+          if [ "$unexpected" != "[]" ]; then
+            echo "::error::release PR contains non-generated paths: $unexpected"
+            exit 1
+          fi
+
+          live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
+          if [ "$live_head_sha" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "::error::release PR head changed during diff validation; leaving it draft"
+            exit 1
+          fi
+
       - name: Check out release PR branch
         if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ steps.release_pr.outputs.branch }}
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          ref: ${{ steps.current_release_pr.outputs.head_sha }}
+          persist-credentials: false
 
       - name: Set up uv
         if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
@@ -192,7 +253,7 @@ jobs:
         run: |
           uv lock --check
           uv run --locked python scripts/check-public-boundary.py
-          git diff --exit-code -- CHANGELOG.md pyproject.toml uv.lock
+          git diff --exit-code -- CHANGELOG.md .release-please-manifest.json pyproject.toml uv.lock
 
       - name: Verify release PR head
         id: verify_release_pr_head
@@ -247,7 +308,10 @@ jobs:
           ENABLE_AUTO_MERGE: ${{ steps.release_pr.outputs.enable_auto_merge }}
         run: |
           validated_sha="$(git rev-parse HEAD)"
-          strict="$(gh api "repos/$REPO/branches/$BASE_BRANCH/protection/required_status_checks" --jq .strict)"
+          if ! strict="$(gh api "repos/$REPO/branches/$BASE_BRANCH/protection/required_status_checks" --jq .strict)"; then
+            echo "::error::could not read $BASE_BRANCH status-check protection; RELEASE_PLEASE_TOKEN needs Administration read permission"
+            exit 1
+          fi
           if [ "$strict" != "true" ]; then
             echo "::error::$BASE_BRANCH must require branches to be up to date before merging"
             exit 1

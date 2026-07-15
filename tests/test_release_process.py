@@ -75,6 +75,7 @@ class ReleaseProcessTests(unittest.TestCase):
 
         for name in (
             "Ensure release PR branch is current",
+            "Validate generated release diff",
             "Check out release PR branch",
             "Set up uv",
             "Install Python 3.12",
@@ -97,12 +98,108 @@ class ReleaseProcessTests(unittest.TestCase):
             names.index("Validate generated release head"),
         )
         current_run = self.steps_by_name["Ensure release PR branch is current"]["run"]
+        current = self.steps_by_name["Ensure release PR branch is current"]
+        checkout = self.steps_by_name["Check out release PR branch"]
+        diff_validation = self.steps_by_name["Validate generated release diff"]
         self.assertIn('gh pr update-branch "$PR_NUMBER" --repo "$REPO"', current_run)
         self.assertIn("--json headRefOid,mergeable", current_run)
         self.assertIn("compare/$BASE_BRANCH...$head_sha", current_run)
         self.assertIn("CONFLICTING", current_run)
         self.assertIn('behind_by" -gt 0', current_run)
+        self.assertEqual(current["id"], "current_release_pr")
+        self.assertIn('echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"', current_run)
+        self.assertLess(
+            names.index("Ensure release PR branch is current"),
+            names.index("Validate generated release diff"),
+        )
+        self.assertLess(
+            names.index("Validate generated release diff"),
+            names.index("Check out release PR branch"),
+        )
+        self.assertEqual(
+            checkout["with"]["ref"],
+            "${{ steps.current_release_pr.outputs.head_sha }}",
+        )
+        self.assertIs(checkout["with"]["persist-credentials"], False)
+        self.assertNotIn("token", checkout["with"])
+        self.assertEqual(
+            diff_validation["env"]["EXPECTED_HEAD_SHA"],
+            "${{ steps.current_release_pr.outputs.head_sha }}",
+        )
         self.assertNotIn("mergeStateStatus", current_run)
+
+    def test_generated_diff_allowlist_precedes_checkout_and_branch_execution(self) -> None:
+        names = [step["name"] for step in self.steps]
+        validation_run = self.steps_by_name["Validate generated release diff"]["run"]
+
+        self.assertLess(
+            names.index("Validate generated release diff"),
+            names.index("Check out release PR branch"),
+        )
+        self.assertLess(
+            names.index("Validate generated release diff"),
+            names.index("Validate generated release head"),
+        )
+        for expected in (
+            "headRefOid,changedFiles",
+            "pulls/$PR_NUMBER/files?per_page=100",
+            "--paginate",
+            "--slurp",
+            'if [ "$listed_files" != "$changed_files" ]',
+            'if [ "$live_head_sha" != "$EXPECTED_HEAD_SHA" ]',
+            '"CHANGELOG.md"',
+            '".release-please-manifest.json"',
+            '"pyproject.toml"',
+            '"uv.lock"',
+        ):
+            self.assertIn(expected, validation_run)
+
+        cases = {
+            "allowed": (
+                [[{"filename": "CHANGELOG.md"}, {"filename": "uv.lock"}]],
+                0,
+            ),
+            "unexpected": (
+                [[{"filename": "CHANGELOG.md"}, {"filename": "scripts/payload.sh"}]],
+                1,
+            ),
+            "incomplete": (
+                [[{"filename": "CHANGELOG.md"}]],
+                1,
+            ),
+        }
+        for name, (files, expected_failure) in cases.items():
+            with self.subTest(name=name):
+                changed_files = 2
+                harness = f"""
+set -e -o pipefail
+gh() {{
+  if [[ "$*" == *"--json headRefOid,changedFiles"* ]]; then
+    printf '{{"headRefOid":"%s","changedFiles":%s}}\\n' "$EXPECTED_HEAD_SHA" "$CHANGED_FILES"
+  elif [[ "$*" == *"pulls/$PR_NUMBER/files?per_page=100"* ]]; then
+    printf '%s\\n' "$FILES_JSON"
+  elif [[ "$*" == *"--json headRefOid --jq .headRefOid"* ]]; then
+    printf '%s\\n' "$EXPECTED_HEAD_SHA"
+  fi
+}}
+{validation_run}
+"""
+                env = {
+                    **os.environ,
+                    "CHANGED_FILES": str(changed_files),
+                    "EXPECTED_HEAD_SHA": "a1" * 20,
+                    "FILES_JSON": json.dumps(files),
+                    "PR_NUMBER": "123",
+                    "REPO": "example/repo",
+                }
+                result = subprocess.run(
+                    ["bash", "-c", harness],
+                    check=False,
+                    capture_output=True,
+                    env=env,
+                    text=True,
+                )
+                self.assertEqual(result.returncode != 0, bool(expected_failure), result.stderr)
 
     def test_validation_is_nonmutating_and_precedes_live_head_gate(self) -> None:
         names = [step["name"] for step in self.steps]
@@ -113,7 +210,7 @@ class ReleaseProcessTests(unittest.TestCase):
             [
                 "uv lock --check",
                 "uv run --locked python scripts/check-public-boundary.py",
-                "git diff --exit-code -- CHANGELOG.md pyproject.toml uv.lock",
+                "git diff --exit-code -- CHANGELOG.md .release-please-manifest.json pyproject.toml uv.lock",
             ],
         )
         self.assertLess(
@@ -151,6 +248,7 @@ class ReleaseProcessTests(unittest.TestCase):
         self.assertLess(publish_run.index("gh pr review"), publish_run.index("gh pr merge"))
         self.assertIn("compare/$BASE_BRANCH...$live_head_sha", publish_run)
         self.assertIn("protection/required_status_checks", publish_run)
+        self.assertIn("Administration read permission", publish_run)
         self.assertIn('if [ "$strict" != "true" ]', publish_run)
         self.assertIn("trap redraft_on_failure EXIT", publish_run)
         self.assertIn("trap - EXIT", publish_run)
