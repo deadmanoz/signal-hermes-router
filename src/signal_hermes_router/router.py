@@ -1109,7 +1109,7 @@ class SignalHermesRouter:
                             # Fallback send failed — use existing Signal-send
                             # failure path (retry/observability semantics).
                             failure, last_failure_at_ms = self._signal_send_failure(route)
-                            handled = True
+                            handled = turn.synthetic is None
                             return TurnOutcome(
                                 TurnOutcomeStatus.ERROR,
                                 route_state=state,
