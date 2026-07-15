@@ -1,11 +1,19 @@
 {
+  "draft-pull-request": true,
   "packages": {
     ".": {
       "release-type": "python",
       "include-v-in-tag": true,
       "include-component-in-tag": false,
       "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": true
+      "bump-patch-for-minor-pre-major": true,
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='signal-hermes-router')].version"
+        }
+      ]
     }
   }
 }
