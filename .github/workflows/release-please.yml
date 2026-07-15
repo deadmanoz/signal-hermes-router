@@ -335,6 +335,10 @@ jobs:
             echo "::error::$BASE_BRANCH must require branches to be up to date before merging"
             exit 1
           fi
+          if ! gh pr merge --help | grep -q -- '--match-head-commit'; then
+            echo "::error::installed gh does not support --match-head-commit; leaving release PR draft"
+            exit 1
+          fi
 
           live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
           if [ "$live_head_sha" != "$validated_sha" ]; then

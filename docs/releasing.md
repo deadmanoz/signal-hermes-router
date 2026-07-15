@@ -37,6 +37,8 @@ The workflow also verifies that `main` has strict required-status-check protecti
 
 `RELEASE_PLEASE_TOKEN` must be a classic personal access token with `repo` scope, or a fine-grained token with repository Contents, Pull requests, and Issues read/write permissions plus Administration read permission. Administration read is required only to inspect strict status-check protection; the workflow does not change repository settings.
 
+The repository Actions setting **Allow GitHub Actions to create and approve pull requests** must remain enabled. The release PR is created by `RELEASE_PLEASE_TOKEN`, then the separate `GITHUB_TOKEN` identity supplies the required approval after validation. An approval failure leaves or returns the release PR to draft.
+
 An existing ready release PR is moved back to draft before Release Please updates it. Even when Release Please generates no new files, the pending PR runs through the same synchronization, validation, live-head, and publication gates. This also lets a rerun recover an automation-owned draft left by a previous failed run. A successful no-op preserves a ready PR's previous auto-merge setting; a recovered draft resumes the normal auto-merge path.
 
 If release validation fails, leave the PR in draft. Inspect the failed workflow step, fix the generating configuration or release process on `main`, and rerun the release workflow. Do not repair, mark ready, or merge the generated release branch by hand.

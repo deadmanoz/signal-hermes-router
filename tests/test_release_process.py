@@ -264,11 +264,20 @@ gh() {{
         self.assertIn("steps.release_pr.outputs.has_release_pr == 'true'", publish["if"])
         self.assertIn("steps.verify_release_pr_head.outcome == 'success'", publish["if"])
         self.assertLess(publish_run.index("gh pr ready"), publish_run.index("gh pr review"))
-        self.assertLess(publish_run.index("gh pr review"), publish_run.index("gh pr merge"))
+        self.assertLess(
+            publish_run.index("gh pr review"),
+            publish_run.index('gh pr merge "$PR_NUMBER"'),
+        )
         self.assertIn("compare/$BASE_BRANCH...$live_head_sha", publish_run)
         self.assertIn("protection/required_status_checks", publish_run)
         self.assertIn("Administration read permission", publish_run)
         self.assertIn('if [ "$strict" != "true" ]', publish_run)
+        self.assertIn("gh pr merge --help", publish_run)
+        self.assertIn("--match-head-commit; leaving release PR draft", publish_run)
+        self.assertLess(
+            publish_run.index("gh pr merge --help"),
+            publish_run.index('gh pr ready "$PR_NUMBER" --repo "$REPO"\n'),
+        )
         self.assertIn("trap redraft_on_failure EXIT", publish_run)
         self.assertLess(
             publish_run.index("trap redraft_on_failure EXIT"),
@@ -292,7 +301,9 @@ git() {{
 }}
 gh() {{
   printf '%s\\n' "$*" >> "$CALL_LOG"
-  if [[ "$*" == *"protection/required_status_checks"* ]]; then
+  if [[ "$*" == "pr merge --help" ]]; then
+    printf '%s\\n' '--match-head-commit'
+  elif [[ "$*" == *"protection/required_status_checks"* ]]; then
     printf 'true\\n'
   elif [[ "$*" == *"compare/$BASE_BRANCH"* ]]; then
     printf '0\\n'
