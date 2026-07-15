@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.28](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.27...v0.1.28) (2026-07-15)
+
+
+### Bug Fixes
+
+* **release:** prevent stale automated release reviews ([1979a24](https://github.com/deadmanoz/signal-hermes-router/commit/1979a2423a8ab1aada6d26fdbf3199f0d7ff64ab))
+
 ## [0.1.27](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.26...v0.1.27) (2026-07-15)
 
 
