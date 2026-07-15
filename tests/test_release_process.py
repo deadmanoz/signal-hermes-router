@@ -48,8 +48,10 @@ class ReleaseProcessTests(unittest.TestCase):
         for expected in (
             "--state open",
             '--base "$BASE_BRANCH"',
-            '--label "autorelease: pending"',
-            "number,isDraft,headRefOid,autoMergeRequest",
+            'release_branch="release-please--branches--$BASE_BRANCH"',
+            '--head "$release_branch"',
+            "number,isDraft,headRefOid,autoMergeRequest,isCrossRepository",
+            "select(.isCrossRepository == false)",
             'if [ "$count" -gt 1 ]',
             'gh pr ready "$number" --repo "$REPO" --undo',
         ):
@@ -73,8 +75,11 @@ class ReleaseProcessTests(unittest.TestCase):
         self.assertIn("could not read pending release PR head after 5 attempts", restore_run)
         self.assertIn('if [ "$live_head_sha" != "$PREVIOUS_HEAD_SHA" ]', restore_run)
         self.assertIn('gh pr ready "$PR_NUMBER" --repo "$REPO"', restore_run)
+        self.assertIn("pending release PR head changed while restoring ready state", restore_run)
         self.assertIn('if [ "$RESTORE_AUTO_MERGE" = "true" ]', restore_run)
-        self.assertIn("--auto --squash --delete-branch", restore_run)
+        for flag in ("--auto", "--squash", "--delete-branch"):
+            self.assertIn(flag, restore_run)
+        self.assertIn('--match-head-commit "$PREVIOUS_HEAD_SHA"', restore_run)
 
     def test_release_head_is_synchronized_before_checkout_and_validation(self) -> None:
         names = [step["name"] for step in self.steps]
@@ -110,7 +115,7 @@ class ReleaseProcessTests(unittest.TestCase):
         )
         self.assertLess(
             names.index("Verify release PR head"),
-            names.index("Mark release PR ready"),
+            names.index("Publish validated release PR"),
         )
 
     def test_live_head_gate_rejects_stale_or_unmergeable_head(self) -> None:
@@ -124,28 +129,19 @@ class ReleaseProcessTests(unittest.TestCase):
 
     def test_ready_approval_and_auto_merge_follow_validation_gate(self) -> None:
         names = [step["name"] for step in self.steps]
+        publish = self.steps_by_name["Publish validated release PR"]
+        publish_run = publish["run"]
 
         self.assertLess(
             names.index("Verify release PR head"),
-            names.index("Mark release PR ready"),
+            names.index("Publish validated release PR"),
         )
-        self.assertLess(
-            names.index("Mark release PR ready"),
-            names.index("Approve release PR"),
-        )
-        self.assertLess(
-            names.index("Approve release PR"),
-            names.index("Enable squash auto-merge"),
-        )
-        for name in (
-            "Mark release PR ready",
-            "Approve release PR",
-            "Enable squash auto-merge",
-        ):
-            self.assertIn(
-                "steps.verify_release_pr_head.outcome == 'success'",
-                self.steps_by_name[name]["if"],
-            )
+        self.assertIn("steps.verify_release_pr_head.outcome == 'success'", publish["if"])
+        self.assertLess(publish_run.index("gh pr ready"), publish_run.index("gh pr review"))
+        self.assertLess(publish_run.index("gh pr review"), publish_run.index("gh pr merge"))
+        self.assertIn("release PR head changed during ready transition", publish_run)
+        self.assertIn("release PR head changed before auto-merge", publish_run)
+        self.assertIn('--match-head-commit "$validated_sha"', publish_run)
 
     def test_workflow_contains_no_post_generation_repair_commit(self) -> None:
         forbidden = (

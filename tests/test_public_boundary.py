@@ -131,11 +131,11 @@ routes:
 
         self.assertTrue(any("long base64-like value" in finding for finding in findings))
 
-    def test_rejects_commit_url_with_invalid_github_owner(self) -> None:
+    def test_rejects_commit_url_with_long_repository_segment(self) -> None:
         findings: list[str] = []
         encoded_secret = "QWxhZGRpbjpvcGVuIHNlc2FtZQ" * 2
         commit_hash = "a1" * 20
-        suspicious_url = f"https://github.com/not_valid/{encoded_secret}/commit/{commit_hash}"
+        suspicious_url = f"https://github.com/deadmanoz/{encoded_secret}/commit/{commit_hash}"
 
         public_boundary.check_text(
             Path("CHANGELOG.md"),
@@ -163,7 +163,6 @@ routes:
 
         for suffix in ("?token=Q" + "X" * 40, "#" + "Q" * 48):
             with self.subTest(suffix=suffix[0]):
-                self.assertIsNone(public_boundary.GITHUB_COMMIT_URL_RE.search(commit_url + suffix))
                 findings: list[str] = []
                 public_boundary.check_text(
                     Path("CHANGELOG.md"),

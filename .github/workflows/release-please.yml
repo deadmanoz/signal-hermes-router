@@ -27,12 +27,14 @@ jobs:
           REPO: ${{ github.repository }}
           BASE_BRANCH: ${{ github.ref_name }}
         run: |
+          release_branch="release-please--branches--$BASE_BRANCH"
           pending="$(gh pr list \
             --repo "$REPO" \
             --state open \
             --base "$BASE_BRANCH" \
-            --label "autorelease: pending" \
-            --json number,isDraft,headRefOid,autoMergeRequest)"
+            --head "$release_branch" \
+            --json number,isDraft,headRefOid,autoMergeRequest,isCrossRepository)"
+          pending="$(printf '%s' "$pending" | jq '[.[] | select(.isCrossRepository == false)]')"
           count="$(printf '%s' "$pending" | jq 'length')"
           if [ "$count" -gt 1 ]; then
             echo "found multiple pending release PRs for $BASE_BRANCH" >&2
@@ -104,8 +106,19 @@ jobs:
           fi
 
           gh pr ready "$PR_NUMBER" --repo "$REPO"
+          live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
+          if [ "$live_head_sha" != "$PREVIOUS_HEAD_SHA" ]; then
+            gh pr ready "$PR_NUMBER" --repo "$REPO" --undo || true
+            echo "::error::pending release PR head changed while restoring ready state"
+            exit 1
+          fi
           if [ "$RESTORE_AUTO_MERGE" = "true" ]; then
-            gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --squash --delete-branch
+            gh pr merge "$PR_NUMBER" \
+              --repo "$REPO" \
+              --auto \
+              --squash \
+              --delete-branch \
+              --match-head-commit "$PREVIOUS_HEAD_SHA"
           fi
 
       # Resolve the PR number once via jq on the raw `prs` string rather than
@@ -228,10 +241,11 @@ jobs:
             exit 1
           fi
 
-      # Both release generation and successful live-head verification are
-      # required. The explicit outcome dependency prevents a future
-      # continue-on-error change from exposing an unverified head.
-      - name: Mark release PR ready
+      # Release Please is the only writer to its canonical branch, and this
+      # workflow's concurrency group serializes every automated update. Recheck
+      # the SHA around the ready transition to catch an out-of-process push,
+      # then bind auto-merge to the validated commit.
+      - name: Publish validated release PR
         if: >-
           ${{
             steps.release.outputs.prs_created == 'true' &&
@@ -239,32 +253,42 @@ jobs:
           }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          APPROVAL_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
-        run: gh pr ready "$PR_NUMBER" --repo "$REPO"
+        run: |
+          validated_sha="$(git rev-parse HEAD)"
+          live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
+          if [ "$live_head_sha" != "$validated_sha" ]; then
+            echo "::error::release PR head changed before ready transition; leaving it draft"
+            exit 1
+          fi
 
-      - name: Approve release PR
-        if: >-
-          ${{
-            steps.release.outputs.prs_created == 'true' &&
-            steps.verify_release_pr_head.outcome == 'success'
-          }}
-        env:
+          gh pr ready "$PR_NUMBER" --repo "$REPO"
+          live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
+          if [ "$live_head_sha" != "$validated_sha" ]; then
+            gh pr ready "$PR_NUMBER" --repo "$REPO" --undo || true
+            echo "::error::release PR head changed during ready transition"
+            exit 1
+          fi
+
           # Approval must come from an identity other than the token that
           # created and updates the Release Please PR.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ steps.release_pr.outputs.number }}
-          REPO: ${{ github.repository }}
-        run: gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body "Automated approval for validated release PR."
+          GH_TOKEN="$APPROVAL_TOKEN" gh pr review "$PR_NUMBER" \
+            --repo "$REPO" \
+            --approve \
+            --body "Automated approval for validated release PR."
 
-      - name: Enable squash auto-merge
-        if: >-
-          ${{
-            steps.release.outputs.prs_created == 'true' &&
-            steps.verify_release_pr_head.outcome == 'success'
-          }}
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-          PR_NUMBER: ${{ steps.release_pr.outputs.number }}
-          REPO: ${{ github.repository }}
-        run: gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --squash --delete-branch
+          live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
+          if [ "$live_head_sha" != "$validated_sha" ]; then
+            gh pr ready "$PR_NUMBER" --repo "$REPO" --undo || true
+            echo "::error::release PR head changed before auto-merge"
+            exit 1
+          fi
+
+          gh pr merge "$PR_NUMBER" \
+            --repo "$REPO" \
+            --auto \
+            --squash \
+            --delete-branch \
+            --match-head-commit "$validated_sha"
