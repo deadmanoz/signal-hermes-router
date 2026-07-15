@@ -32,7 +32,6 @@ jobs:
         run: |
           repo_owner="${REPO%%/*}"
           release_branch="release-please--branches--$BASE_BRANCH"
-          release_title_prefix="chore($BASE_BRANCH): release "
           pending="$(gh api \
             --method GET \
             --paginate \
@@ -45,13 +44,11 @@ jobs:
           pending="$(printf '%s' "$pending" | jq \
             --arg repo "$REPO" \
             --arg release_branch "$release_branch" \
-            --arg release_title_prefix "$release_title_prefix" \
             '[
               .[][]
               | select(
                   .head.repo.full_name == $repo
                   and .head.ref == $release_branch
-                  and (.title | startswith($release_title_prefix))
                 )
             ]')"
           count="$(printf '%s' "$pending" | jq 'length')"
@@ -132,10 +129,10 @@ jobs:
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
           echo "enable_auto_merge=$enable_auto_merge" >> "$GITHUB_OUTPUT"
 
-      # Synchronize a stale release branch before checkout. Validation must run
-      # on the exact head that will later be marked ready and merged.
-      - name: Ensure release PR branch is current
-        id: current_release_pr
+      # The canonical branch is drafted before Release Please runs regardless
+      # of mutable title. Validate the complete PR identity separately before
+      # allowing it into synchronization or publication.
+      - name: Validate release PR identity
         if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
@@ -143,6 +140,45 @@ jobs:
           REPO: ${{ github.repository }}
           BASE_BRANCH: ${{ github.ref_name }}
         run: |
+          release_branch="release-please--branches--$BASE_BRANCH"
+          release_title_prefix="chore($BASE_BRANCH): release "
+          details="$(gh pr view "$PR_NUMBER" \
+            --repo "$REPO" \
+            --json headRefName,baseRefName,title,isCrossRepository)"
+          head_ref="$(printf '%s' "$details" | jq -r .headRefName)"
+          base_ref="$(printf '%s' "$details" | jq -r .baseRefName)"
+          title="$(printf '%s' "$details" | jq -r .title)"
+          cross_repository="$(printf '%s' "$details" | jq -r .isCrossRepository)"
+          if [ "$cross_repository" != "false" ] || [ "$head_ref" != "$release_branch" ] || [ "$base_ref" != "$BASE_BRANCH" ]; then
+            echo "::error::release PR identity is not the canonical same-repository branch; leaving it draft"
+            exit 1
+          fi
+          case "$title" in
+            "$release_title_prefix"*) ;;
+            *)
+              echo "::error::release PR title does not match '$release_title_prefix*'; leaving it draft"
+              exit 1
+              ;;
+          esac
+
+      # Never merge a newer base into metadata generated for this run's SHA.
+      # If main advances, the queued workflow run must regenerate the release.
+      - name: Require stable release base
+        id: current_release_pr
+        if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          PR_NUMBER: ${{ steps.release_pr.outputs.number }}
+          REPO: ${{ github.repository }}
+          BASE_BRANCH: ${{ github.ref_name }}
+          EXPECTED_BASE_SHA: ${{ github.sha }}
+        run: |
+          live_base_sha="$(gh api "repos/$REPO/commits/$BASE_BRANCH" --jq .sha)"
+          if [ "$live_base_sha" != "$EXPECTED_BASE_SHA" ]; then
+            echo "::error::$BASE_BRANCH advanced after Release Please ran; leaving the PR draft for the queued run to regenerate"
+            exit 1
+          fi
+
           head_sha=""
           mergeable=""
           behind_by=""
@@ -150,7 +186,7 @@ jobs:
             details="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,mergeable)"
             head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
             mergeable="$(printf '%s' "$details" | jq -r .mergeable)"
-            behind_by="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$head_sha" --jq .behind_by)"
+            behind_by="$(gh api "repos/$REPO/compare/$EXPECTED_BASE_SHA...$head_sha" --jq .behind_by)"
             if [ "$mergeable" != "UNKNOWN" ]; then
               break
             fi
@@ -164,28 +200,14 @@ jobs:
               exit 1
               ;;
           esac
-          if [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ]; then
-            echo "::error::release PR mergeable state is $mergeable; leaving it draft"
+          if [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
+            echo "::error::release head is mergeable=$mergeable behind_by=$behind_by against the triggering base; leaving it draft for regeneration"
             exit 1
           fi
 
-          if [ "$behind_by" -gt 0 ]; then
-            gh pr update-branch "$PR_NUMBER" --repo "$REPO"
-            for attempt in 1 2 3 4 5; do
-              details="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,mergeable)"
-              head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
-              mergeable="$(printf '%s' "$details" | jq -r .mergeable)"
-              behind_by="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$head_sha" --jq .behind_by)"
-              if [ "$mergeable" != "UNKNOWN" ] && [ "$behind_by" = "0" ]; then
-                break
-              fi
-              echo "release head is mergeable=$mergeable behind_by=$behind_by after update on attempt $attempt; retrying"
-              sleep 5
-            done
-          fi
-
-          if [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
-            echo "::error::release head remains mergeable=$mergeable behind_by=$behind_by; leaving it draft"
+          live_base_sha="$(gh api "repos/$REPO/commits/$BASE_BRANCH" --jq .sha)"
+          if [ "$live_base_sha" != "$EXPECTED_BASE_SHA" ]; then
+            echo "::error::$BASE_BRANCH advanced during release validation; leaving the PR draft for the queued run to regenerate"
             exit 1
           fi
 
@@ -243,6 +265,20 @@ jobs:
             exit 1
           fi
 
+          expected_paths='[".release-please-manifest.json","CHANGELOG.md","pyproject.toml","uv.lock"]'
+          actual_paths="$(printf '%s' "$files_json" | jq -c '[.[][] | .filename] | sort')"
+          invalid_statuses="$(printf '%s' "$files_json" | jq -c '
+            [
+              .[][]
+              | select(.status != "modified" or .previous_filename != null)
+              | {filename, status, previous_filename}
+            ]
+          ')"
+          if [ "$actual_paths" != "$expected_paths" ] || [ "$invalid_statuses" != "[]" ]; then
+            echo "::error::release PR must modify exactly the four existing generated files; paths=$actual_paths invalid_statuses=$invalid_statuses"
+            exit 1
+          fi
+
           live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
           if [ "$live_head_sha" != "$EXPECTED_HEAD_SHA" ]; then
             echo "::error::release PR head changed during diff validation; leaving it draft"
@@ -254,6 +290,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ steps.current_release_pr.outputs.head_sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up uv
@@ -270,6 +307,7 @@ jobs:
       - name: Validate generated release head
         if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
         run: |
+          "$(uv python find 3.12)" scripts/check-release-head.py --base-sha "${{ github.sha }}"
           uv lock --check
           "$(uv python find 3.12)" scripts/check-public-boundary.py
           git diff --exit-code -- CHANGELOG.md .release-please-manifest.json pyproject.toml uv.lock
@@ -282,6 +320,7 @@ jobs:
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
           BASE_BRANCH: ${{ github.ref_name }}
+          EXPECTED_BASE_SHA: ${{ github.sha }}
         run: |
           checked_out_sha="$(git rev-parse HEAD)"
           live_head_sha=""
@@ -291,7 +330,7 @@ jobs:
             details="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,mergeable)"
             live_head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
             mergeable="$(printf '%s' "$details" | jq -r .mergeable)"
-            behind_by="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$live_head_sha" --jq .behind_by)"
+            behind_by="$(gh api "repos/$REPO/compare/$EXPECTED_BASE_SHA...$live_head_sha" --jq .behind_by)"
             if [ "$mergeable" != "UNKNOWN" ]; then
               break
             fi
@@ -303,8 +342,9 @@ jobs:
             echo "::error::release PR head changed after validation; leaving it draft"
             exit 1
           fi
-          if [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
-            echo "::error::release head became mergeable=$mergeable behind_by=$behind_by after validation; leaving it draft"
+          live_base_sha="$(gh api "repos/$REPO/commits/$BASE_BRANCH" --jq .sha)"
+          if [ "$live_base_sha" != "$EXPECTED_BASE_SHA" ] || [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
+            echo "::error::release base/head changed or became mergeable=$mergeable behind_by=$behind_by after validation; leaving it draft"
             exit 1
           fi
 
@@ -324,6 +364,7 @@ jobs:
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
           BASE_BRANCH: ${{ github.ref_name }}
+          EXPECTED_BASE_SHA: ${{ github.sha }}
           ENABLE_AUTO_MERGE: ${{ steps.release_pr.outputs.enable_auto_merge }}
         run: |
           validated_sha="$(git rev-parse HEAD)"
@@ -341,8 +382,9 @@ jobs:
           fi
 
           live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
-          if [ "$live_head_sha" != "$validated_sha" ]; then
-            echo "::error::release PR head changed before ready transition; leaving it draft"
+          live_base_sha="$(gh api "repos/$REPO/commits/$BASE_BRANCH" --jq .sha)"
+          if [ "$live_head_sha" != "$validated_sha" ] || [ "$live_base_sha" != "$EXPECTED_BASE_SHA" ]; then
+            echo "::error::release base or PR head changed before ready transition; leaving it draft"
             exit 1
           fi
 
@@ -359,15 +401,16 @@ jobs:
             details="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,mergeable)"
             live_head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
             mergeable="$(printf '%s' "$details" | jq -r .mergeable)"
-            behind_by="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$live_head_sha" --jq .behind_by)"
+            behind_by="$(gh api "repos/$REPO/compare/$EXPECTED_BASE_SHA...$live_head_sha" --jq .behind_by)"
             if [ "$mergeable" != "UNKNOWN" ]; then
               break
             fi
             echo "mergeable is UNKNOWN after ready on attempt $attempt; retrying"
             sleep 5
           done
-          if [ "$live_head_sha" != "$validated_sha" ] || [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
-            echo "::error::release head changed or became unmergeable during ready transition"
+          live_base_sha="$(gh api "repos/$REPO/commits/$BASE_BRANCH" --jq .sha)"
+          if [ "$live_base_sha" != "$EXPECTED_BASE_SHA" ] || [ "$live_head_sha" != "$validated_sha" ] || [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
+            echo "::error::release base/head changed or became unmergeable during ready transition"
             exit 1
           fi
 
@@ -381,9 +424,10 @@ jobs:
           details="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,mergeable)"
           live_head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
           mergeable="$(printf '%s' "$details" | jq -r .mergeable)"
-          behind_by="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$live_head_sha" --jq .behind_by)"
-          if [ "$live_head_sha" != "$validated_sha" ] || [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
-            echo "::error::release head changed or became unmergeable before auto-merge"
+          behind_by="$(gh api "repos/$REPO/compare/$EXPECTED_BASE_SHA...$live_head_sha" --jq .behind_by)"
+          live_base_sha="$(gh api "repos/$REPO/commits/$BASE_BRANCH" --jq .sha)"
+          if [ "$live_base_sha" != "$EXPECTED_BASE_SHA" ] || [ "$live_head_sha" != "$validated_sha" ] || [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
+            echo "::error::release base/head changed or became unmergeable before auto-merge"
             exit 1
           fi
 

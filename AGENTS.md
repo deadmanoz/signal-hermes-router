@@ -83,7 +83,7 @@ Hermes is not a Python dependency of this package. The router supervises the `he
 
 ## Review guidelines
 
-Release Please PRs are generated release artefacts when all of the following are true: the head branch is `release-please--branches--main`, the title starts with `chore(main): release`, and the diff is limited to `CHANGELOG.md`, `.release-please-manifest.json`, `pyproject.toml`, and `uv.lock`. Once the release workflow has validated that generated head, do not publish implementation findings about those generated contents.
+Release Please PRs are generated release artefacts when all of the following are true: the head branch is exactly `release-please--branches--main`, the title starts with `chore(main): release`, the diff modifies exactly `CHANGELOG.md`, `.release-please-manifest.json`, `pyproject.toml`, and `uv.lock`, `main` still matches the workflow's triggering SHA, and `scripts/check-release-head.py` confirms the expected version and changelog transformations against that SHA. Once the release workflow has validated that generated head, do not publish implementation findings about those generated contents.
 
 Before publishing any PR finding, confirm that the reviewed commit is still the live PR head. If the head has changed, discard findings from the stale snapshot and review the current head instead.
 
