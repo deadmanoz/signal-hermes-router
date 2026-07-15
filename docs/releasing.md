@@ -29,6 +29,8 @@ Patch bumps cover bug fixes, log/metric changes, internal refactors with no publ
 5. Only that validated head is marked ready, approved, and armed for squash auto-merge.
 6. When the release PR auto-merges, Release Please creates the `vX.Y.Z` tag and GitHub Release.
 
+GitHub may report the draft as `BLOCKED` while approval or required checks are pending. The workflow permits that state because it adds approval and arms auto-merge only after validating the live head; `BEHIND`, `DIRTY`, and persistent `UNKNOWN` states still fail closed.
+
 An existing ready release PR is moved back to draft before Release Please updates it. If the run is a successful no-op and the head did not change, the workflow restores the previous ready state and restores auto-merge only when it was previously enabled.
 
 If release validation fails, leave the PR in draft. Inspect the failed workflow step, fix the generating configuration or release process on `main`, and rerun the release workflow. Do not repair, mark ready, or merge the generated release branch by hand.

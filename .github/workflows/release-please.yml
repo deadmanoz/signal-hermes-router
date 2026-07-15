@@ -166,6 +166,10 @@ jobs:
               exit 1
               ;;
           esac
+          # BLOCKED is expected while a draft still lacks approval or required
+          # checks. Those gates remain owned by the ready/approve/auto-merge
+          # sequence below, so only stale, conflicted, or indeterminate states
+          # fail this synchronization gate.
 
       - name: Check out release PR branch
         if: ${{ steps.release.outputs.prs_created == 'true' }}
@@ -217,11 +221,15 @@ jobs:
             echo "::error::release PR head changed after validation; leaving it draft"
             exit 1
           fi
+          # BLOCKED can reflect the approval and checks armed below. It does
+          # not mean the validated head is stale or conflicted.
           if [ "$state" = "BEHIND" ] || [ "$state" = "DIRTY" ] || [ "$state" = "UNKNOWN" ]; then
             echo "::error::release PR merge state became $state after validation; leaving it draft"
             exit 1
           fi
 
+      # The explicit outcome dependency prevents a future continue-on-error
+      # change on the verification step from exposing an unverified head.
       - name: Mark release PR ready
         if: ${{ steps.release.outputs.prs_created == 'true' && steps.verify_release_pr_head.outcome == 'success' }}
         env:
