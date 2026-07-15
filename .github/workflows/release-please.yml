@@ -31,13 +31,24 @@ jobs:
           BASE_BRANCH: ${{ github.ref_name }}
         run: |
           release_branch="release-please--branches--$BASE_BRANCH"
+          release_title_prefix="chore($BASE_BRANCH): release "
           pending="$(gh pr list \
             --repo "$REPO" \
             --state open \
             --base "$BASE_BRANCH" \
             --head "$release_branch" \
-            --json number,isDraft,headRefOid,autoMergeRequest,isCrossRepository)"
-          pending="$(printf '%s' "$pending" | jq '[.[] | select(.isCrossRepository == false)]')"
+            --json number,isDraft,headRefOid,headRefName,title,autoMergeRequest,isCrossRepository)"
+          pending="$(printf '%s' "$pending" | jq \
+            --arg release_branch "$release_branch" \
+            --arg release_title_prefix "$release_title_prefix" \
+            '[
+              .[]
+              | select(
+                  .isCrossRepository == false
+                  and .headRefName == $release_branch
+                  and (.title | startswith($release_title_prefix))
+                )
+            ]')"
           count="$(printf '%s' "$pending" | jq 'length')"
           if [ "$count" -gt 1 ]; then
             echo "found multiple pending release PRs for $BASE_BRANCH" >&2
