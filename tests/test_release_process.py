@@ -62,11 +62,14 @@ class ReleaseProcessTests(unittest.TestCase):
 
         for expected in (
             "always()",
+            "!cancelled()",
             "steps.release.outcome == 'success'",
             "steps.release.outputs.prs_created != 'true'",
             "steps.pending_pr.outputs.was_ready == 'true'",
         ):
             self.assertIn(expected, condition)
+        self.assertIn("for attempt in 1 2 3 4 5", restore_run)
+        self.assertIn("could not read pending release PR head after 5 attempts", restore_run)
         self.assertIn('if [ "$live_head_sha" != "$PREVIOUS_HEAD_SHA" ]', restore_run)
         self.assertIn('gh pr ready "$PR_NUMBER" --repo "$REPO"', restore_run)
         self.assertIn('if [ "$RESTORE_AUTO_MERGE" = "true" ]', restore_run)
@@ -85,7 +88,8 @@ class ReleaseProcessTests(unittest.TestCase):
         )
         current_run = self.steps_by_name["Ensure release PR branch is current"]["run"]
         self.assertIn('gh pr update-branch "$PR_NUMBER" --repo "$REPO"', current_run)
-        self.assertIn("DIRTY|UNKNOWN", current_run)
+        self.assertIn("mergeStateStatus is $state after update", current_run)
+        self.assertIn("BEHIND|DIRTY|UNKNOWN", current_run)
 
     def test_validation_is_nonmutating_and_precedes_live_head_gate(self) -> None:
         names = [step["name"] for step in self.steps]
@@ -113,6 +117,7 @@ class ReleaseProcessTests(unittest.TestCase):
 
         self.assertIn("--json headRefOid,mergeStateStatus", verify_run)
         self.assertIn('if [ "$live_head_sha" != "$checked_out_sha" ]', verify_run)
+        self.assertIn("::error::release PR head changed after validation", verify_run)
         for state in ("BEHIND", "DIRTY", "UNKNOWN"):
             self.assertIn(f'[ "$state" = "{state}" ]', verify_run)
 

@@ -72,6 +72,7 @@ jobs:
         if: >-
           ${{
             always() &&
+            !cancelled() &&
             steps.release.outcome == 'success' &&
             steps.release.outputs.prs_created != 'true' &&
             steps.pending_pr.outputs.was_ready == 'true'
@@ -83,9 +84,21 @@ jobs:
           RESTORE_AUTO_MERGE: ${{ steps.pending_pr.outputs.auto_merge_enabled }}
           REPO: ${{ github.repository }}
         run: |
-          live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
+          live_head_sha=""
+          for attempt in 1 2 3 4 5; do
+            if live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::could not read pending release PR head after 5 attempts"
+              exit 1
+            fi
+            echo "could not read pending release PR head on attempt $attempt; retrying"
+            sleep 5
+          done
+
           if [ "$live_head_sha" != "$PREVIOUS_HEAD_SHA" ]; then
-            echo "pending release PR head changed during a reported no-op" >&2
+            echo "::error::pending release PR head changed during a reported no-op"
             exit 1
           fi
 
@@ -135,9 +148,20 @@ jobs:
           case "$state" in
             BEHIND)
               gh pr update-branch "$PR_NUMBER" --repo "$REPO"
+              for attempt in 1 2 3 4 5; do
+                state="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeStateStatus --jq .mergeStateStatus)"
+                if [ "$state" != "UNKNOWN" ] && [ "$state" != "BEHIND" ]; then
+                  break
+                fi
+                echo "mergeStateStatus is $state after update on attempt $attempt; retrying"
+                sleep 5
+              done
               ;;
-            DIRTY|UNKNOWN)
-              echo "release PR merge state is $state; leaving it draft" >&2
+          esac
+
+          case "$state" in
+            BEHIND|DIRTY|UNKNOWN)
+              echo "::error::release PR merge state is $state; leaving it draft"
               exit 1
               ;;
           esac
@@ -188,11 +212,11 @@ jobs:
           done
 
           if [ "$live_head_sha" != "$checked_out_sha" ]; then
-            echo "release PR head changed after validation; leaving it draft" >&2
+            echo "::error::release PR head changed after validation; leaving it draft"
             exit 1
           fi
           if [ "$state" = "BEHIND" ] || [ "$state" = "DIRTY" ] || [ "$state" = "UNKNOWN" ]; then
-            echo "release PR merge state became $state after validation; leaving it draft" >&2
+            echo "::error::release PR merge state became $state after validation; leaving it draft"
             exit 1
           fi
 

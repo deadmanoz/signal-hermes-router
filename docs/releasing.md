@@ -33,6 +33,8 @@ An existing ready release PR is moved back to draft before Release Please update
 
 If release validation fails, leave the PR in draft. Inspect the failed workflow step, fix the generating configuration or release process on `main`, and rerun the release workflow. Do not repair, mark ready, or merge the generated release branch by hand.
 
+If a reported no-op finds a different live head, treat it as a concurrent update: leave the PR draft and inspect both the PR history and workflow run before rerunning.
+
 Do not hand-edit [CHANGELOG.md](../CHANGELOG.md) or add `[Unreleased]` entries. Release Please generates changelog entries from merged commit titles.
 
 ## PR title policy
