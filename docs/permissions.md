@@ -99,7 +99,7 @@ The running-router probe is intentionally structured. It reads a tool-surface
 candidate from `agentCapabilities._meta`, including candidates nested under
 `signalHermesRouter`, `signal-hermes-router`, or `signal_hermes_router`. If no
 metadata surface is present, the router tries an optional JSON-RPC extension
-method named `_tool_surface/list`. Either source must return this envelope:
+method named `_tool_surface/list`. The `_meta` source must return this envelope:
 
 ```json
 {
@@ -109,9 +109,19 @@ method named `_tool_surface/list`. Either source must return this envelope:
 }
 ```
 
+The `_tool_surface/list` source may return the Hermes-native dedicated response
+shape `{tools: [...]}`; the router normalizes this into the version-1
+`full_callable` contract internally. Hermes owns its extension response shape;
+the router owns normalization and validation. The same unversioned `{tools: [...]}`
+shape from `agentCapabilities` metadata or generic external input remains rejected
+unless explicitly wrapped in a versioned envelope.
+
 The producer must assemble `tools` before Tool Search compression. The router
 does not import Hermes or inspect its private implementation; it validates only
-this producer contract.
+this producer contract. For `_tool_surface/list`, the router accepts the Hermes
+native `{tools: [...]}` response and injects the required `schema_version` and
+`scope` fields because the dedicated extension method is semantically the
+complete callable catalog.
 Agents that do not expose either source report `probe_unsupported`; that means
 the agent needs a structured tool-surface integration before live preflight can
 validate it.
@@ -120,10 +130,18 @@ An explicit v1 empty surface with `"tools": []` is authoritative. Any
 configured allowlist tools for that profile are reported as missing rather than
 falling back to `_tool_surface/list`.
 
-Missing versions, unsupported versions, missing scopes, model-facing scopes,
-ambiguous metadata candidates, and malformed contracts produce specific
-`probe_contract_*` errors. They never produce missing-tool findings. Present but
-invalid capability metadata also does not fall through to `_tool_surface/list`.
+For `agentCapabilities._meta` and the offline contract file, missing versions,
+unsupported versions, missing scopes, model-facing scopes, ambiguous metadata
+candidates, and malformed contracts produce specific `probe_contract_*` errors.
+These `probe_contract_*` errors never produce missing-tool findings.
+The `_tool_surface/list` method is the one exception for a missing version/scope:
+its Hermes-native `{tools: [...]}` shape is normalized, though an explicit but
+unsupported or model-facing envelope on that method still fails closed. An
+alternative catalog key (`toolSurface`/`tool_surface`/`tool_names`) is never part
+of the dedicated method's contract, so it is rejected as ambiguous there too,
+whether it accompanies the native shape or an explicit versioned envelope.
+Present but invalid capability metadata also does not fall through to
+`_tool_surface/list`.
 Redundant aliases count as ambiguous, including a v1 `toolSurface` alongside a
 legacy or model-facing `tools` field; producers must publish exactly one
 candidate.
@@ -145,10 +163,13 @@ Regenerate and verify the recorded contract whenever a profile's callable tool
 catalog changes during that transition.
 
 Unversioned recorded files are rejected before preflight with a validation
-message that names the required `schema_version=1` field. Unversioned live
-Hermes responses fail with `probe_contract_version_missing`. The router does
-not grandfather either shape because an unversioned list cannot prove whether
-it is complete or compressed.
+message that names the required `schema_version=1` field. An unversioned
+`agentCapabilities._meta` surface fails with `probe_contract_version_missing`.
+The router does not grandfather either shape because an unversioned list cannot
+prove whether it is complete or compressed. The `_tool_surface/list` method is
+different: because its method name is itself the dedicated callable-catalog
+contract, the router normalizes the Hermes-native `{tools: [...]}` response into
+the version-1 `full_callable` envelope instead of rejecting it.
 
 Because the live path uses the router's normal `ProfileSupervisor`, probing an
 idle profile can start that profile's ACP subprocess. Supervisor cooldowns and

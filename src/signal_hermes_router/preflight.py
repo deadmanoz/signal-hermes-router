@@ -15,6 +15,11 @@ ProbeCallable = Callable[[str], Awaitable["ToolSurface"]]
 SUPPORTED_TOOL_SURFACE_SCHEMA_VERSION = 1
 FULL_CALLABLE_TOOL_SURFACE_SCOPE = "full_callable"
 _MISSING = object()
+# Catalog-carrying keys other than `tools` that the metadata path recognizes.
+# They are never part of the dedicated _tool_surface/list contract, so their
+# presence there makes producer intent ambiguous and the router fails closed
+# rather than silently trusting `tools` (or picking one when `tools` is absent).
+_TOOL_SURFACE_ALIAS_CATALOG_KEYS = ("toolSurface", "tool_surface", "tool_names")
 
 
 def _validate_probe_error_fields(code: str, error: str | None) -> None:
@@ -174,6 +179,67 @@ def tool_surface_from_value(
         schema_version=schema_version,
         scope=scope,
         source=source,
+    )
+
+
+def tool_surface_from_hermes_tool_surface_list(
+    profile: str,
+    value: Any,
+) -> ToolSurface:
+    """Normalize a Hermes _tool_surface/list response into router-owned metadata.
+
+    Hermes returns its stable dedicated response as the native {tools: [...]}
+    shape (observed on Hermes v0.18.2 during 0.1.29 production validation). The
+    _tool_surface/list method name is itself the
+    dedicated callable-catalog contract, so when the response carries NEITHER
+    schema_version NOR scope the router injects its own version-1 full_callable
+    contract and validates the tool list. This path is source-aware: the same
+    unversioned {tools: [...]} shape from agentCapabilities metadata or generic
+    external input remains rejected by tool_surface_from_value().
+
+    Fail-closed handling is preserved for explicit envelopes even on this
+    dedicated method: if the response declares schema_version and/or scope it is
+    an explicit envelope, so it is validated strictly via tool_surface_from_value
+    (an unsupported version, a partial envelope, or a model_facing scope still
+    fails closed here). An alternative catalog key
+    (toolSurface/tool_surface/tool_names) is never part of this method's contract,
+    so its presence is rejected as ambiguous uniformly for both the explicit
+    envelope and the native shape, mirroring the metadata path's redundant-alias
+    handling. Hermes owns its extension response shape; the router owns
+    normalization and validation.
+    """
+    if not isinstance(value, dict):
+        raise PreflightProbeUnavailable(
+            "probe_contract_invalid",
+            "tool-surface contract must be a JSON object",
+        )
+    # The dedicated method's response is the `tools` catalog (optionally wrapped
+    # in a version/scope envelope). An alternative catalog key
+    # (toolSurface/tool_surface/tool_names) is never part of that contract, so its
+    # presence leaves producer intent ambiguous. Reject it uniformly here — before
+    # the envelope/native split — so redundant aliases fail closed on this path
+    # exactly as the metadata path treats them, without changing the shared
+    # tool_surface_from_value semantics used by the other sources.
+    alternative_keys = [key for key in _TOOL_SURFACE_ALIAS_CATALOG_KEYS if key in value]
+    if alternative_keys:
+        raise PreflightProbeUnavailable(
+            "probe_contract_ambiguous",
+            "tool-surface response uses catalog keys other than tools: "
+            + ", ".join(alternative_keys),
+        )
+    # An explicit envelope (or partial envelope) declares its own version/scope;
+    # validate it strictly so unsupported/model_facing catalogs still fail closed.
+    if "schema_version" in value or "scope" in value:
+        return tool_surface_from_value(profile, value, source="_tool_surface/list")
+    # Pure Hermes-native shape: only the tools array is present; schema_version
+    # and scope are injected by the router because the dedicated method name is
+    # the callable-catalog contract.
+    return ToolSurface.from_names(
+        profile,
+        _contract_tool_names(value.get("tools", _MISSING)),
+        schema_version=SUPPORTED_TOOL_SURFACE_SCHEMA_VERSION,
+        scope=FULL_CALLABLE_TOOL_SURFACE_SCOPE,
+        source="_tool_surface/list",
     )
 
 

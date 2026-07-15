@@ -21,6 +21,7 @@ from signal_hermes_router.preflight import (
     parse_preflight_scope,
     run_permission_preflight,
     tool_surface_from_agent_capabilities,
+    tool_surface_from_hermes_tool_surface_list,
     tool_surface_from_value,
     unavailable_tool_surface_probe,
 )
@@ -493,6 +494,155 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(surface)
+
+    def test_hermes_tool_surface_list_normalizes_native_shape(self) -> None:
+        surface = tool_surface_from_hermes_tool_surface_list(
+            "calendar",
+            {"tools": ["read_file", "web_search"]},
+        )
+        self.assertEqual(surface.profile, "calendar")
+        self.assertEqual(surface.tool_names, frozenset({"read_file", "web_search"}))
+        self.assertEqual(surface.schema_version, 1)
+        self.assertEqual(surface.scope, "full_callable")
+        self.assertEqual(surface.source, "_tool_surface/list")
+
+    def test_hermes_tool_surface_list_accepts_explicit_empty_surface(self) -> None:
+        surface = tool_surface_from_hermes_tool_surface_list(
+            "empty-profile",
+            {"tools": []},
+        )
+        self.assertEqual(surface.tool_names, frozenset())
+
+    def test_hermes_tool_surface_list_rejects_malformed_tools(self) -> None:
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_invalid"):
+            tool_surface_from_hermes_tool_surface_list(
+                "calendar",
+                {"tools": ["read_file", 7]},
+            )
+
+    def test_hermes_tool_surface_list_rejects_non_dict_result(self) -> None:
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_invalid"):
+            tool_surface_from_hermes_tool_surface_list("calendar", ["read_file"])
+
+    def test_hermes_tool_surface_list_accepts_explicit_versioned_envelope(self) -> None:
+        surface = tool_surface_from_hermes_tool_surface_list(
+            "calendar",
+            {"schema_version": 1, "scope": "full_callable", "tools": ["read_file"]},
+        )
+        self.assertEqual(surface.tool_names, frozenset({"read_file"}))
+        self.assertEqual(surface.schema_version, 1)
+        self.assertEqual(surface.scope, "full_callable")
+        self.assertEqual(surface.source, "_tool_surface/list")
+
+    def test_hermes_tool_surface_list_rejects_explicit_model_facing_scope(self) -> None:
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "scope_unsupported"):
+            tool_surface_from_hermes_tool_surface_list(
+                "calendar",
+                {"schema_version": 1, "scope": "model_facing", "tools": ["tool_search"]},
+            )
+
+    def test_hermes_tool_surface_list_rejects_partial_envelope(self) -> None:
+        # scope present but schema_version absent is a partial explicit envelope,
+        # not the pure native shape, so strict validation still fails it closed.
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "version_missing"):
+            tool_surface_from_hermes_tool_surface_list(
+                "calendar",
+                {"scope": "full_callable", "tools": ["read_file"]},
+            )
+
+    def test_hermes_tool_surface_list_rejects_version_only_partial_envelope(self) -> None:
+        # schema_version present but scope absent is the symmetric partial
+        # explicit envelope; the wrapper routes it to strict validation, which
+        # fails closed on the missing scope rather than injecting full_callable.
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "scope_missing"):
+            tool_surface_from_hermes_tool_surface_list(
+                "calendar",
+                {"schema_version": 1, "tools": ["read_file"]},
+            )
+
+    def test_hermes_tool_surface_list_rejects_explicit_unsupported_version(self) -> None:
+        # An explicit envelope declaring schema_version=2 is routed to the strict
+        # validator, so an unsupported version fails closed rather than being
+        # silently normalized as the native shape.
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "version_unsupported"):
+            tool_surface_from_hermes_tool_surface_list(
+                "calendar",
+                {"schema_version": 2, "scope": "full_callable", "tools": ["read_file"]},
+            )
+
+    def test_hermes_tool_surface_list_rejects_coexisting_catalog_keys(self) -> None:
+        # A response that carries an alternative catalog key alongside `tools`
+        # leaves producer intent ambiguous; the router fails closed instead of
+        # silently picking `tools`. The guard is uniform, so it applies to both
+        # the native shape and an explicit versioned envelope.
+        for coexisting_key in ("toolSurface", "tool_surface", "tool_names"):
+            with self.subTest(coexisting_key=coexisting_key):
+                with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_ambiguous"):
+                    tool_surface_from_hermes_tool_surface_list(
+                        "calendar",
+                        {"tools": ["read_file"], coexisting_key: ["web_search"]},
+                    )
+
+    def test_hermes_tool_surface_list_rejects_versioned_envelope_with_redundant_alias(
+        self,
+    ) -> None:
+        # The alias guard runs before the envelope/native split, so a redundant
+        # alias alongside an explicit versioned envelope fails closed too, matching
+        # how the metadata path treats redundant aliases as ambiguous.
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_ambiguous"):
+            tool_surface_from_hermes_tool_surface_list(
+                "calendar",
+                {
+                    "schema_version": 1,
+                    "scope": "full_callable",
+                    "tools": ["read_file"],
+                    "tool_names": ["web_search"],
+                },
+            )
+
+    def test_hermes_tool_surface_list_rejects_alternative_key_without_tools(
+        self,
+    ) -> None:
+        # The same guard fires when the response uses an alternative catalog key
+        # with no `tools` key at all; it fails closed as ambiguous rather than
+        # treating a non-dedicated shape as an empty catalog.
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_ambiguous"):
+            tool_surface_from_hermes_tool_surface_list(
+                "calendar",
+                {"tool_names": ["read_file"]},
+            )
+
+    def test_hermes_tool_surface_list_rejects_native_shape_missing_tools(self) -> None:
+        # A dict with neither schema_version/scope nor a tools key takes the
+        # native branch; a truncated response with no tools array fails closed
+        # instead of normalizing to an empty callable catalog.
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_invalid"):
+            tool_surface_from_hermes_tool_surface_list("calendar", {"other": 1})
+
+    def test_tool_surface_from_value_still_rejects_unversioned_dict(self) -> None:
+        """Unversioned {tools: [...]} from generic external input remains rejected."""
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "version_missing"):
+            tool_surface_from_value(
+                "calendar",
+                {"tools": ["read_file"]},
+                source="external_contract",
+            )
+
+    def test_tool_surface_from_value_still_rejects_missing_scope(self) -> None:
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "scope_missing"):
+            tool_surface_from_value(
+                "calendar",
+                {"schema_version": 1, "tools": ["read_file"]},
+                source="external_contract",
+            )
+
+    def test_agent_capabilities_still_rejects_unversioned_tools(self) -> None:
+        """Unversioned {tools: [...]} in agentCapabilities metadata remains rejected."""
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_invalid"):
+            tool_surface_from_agent_capabilities(
+                "calendar",
+                {"_meta": {"tools": ["read_file"]}},
+            )
 
     def test_agent_capabilities_rejects_ambiguous_or_non_callable_contracts(self) -> None:
         with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_ambiguous"):

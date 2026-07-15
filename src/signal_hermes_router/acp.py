@@ -20,7 +20,7 @@ from .preflight import (
     PreflightProbeUnavailable,
     ToolSurface,
     tool_surface_from_agent_capabilities,
-    tool_surface_from_value,
+    tool_surface_from_hermes_tool_surface_list,
 )
 from .private_fs import ensure_private_dir_tree
 
@@ -485,7 +485,7 @@ class ACPProfile:
             if exc.error.get("code") == -32601:
                 raise PreflightProbeUnavailable("probe_unsupported") from exc
             raise
-        return tool_surface_from_value(self.profile, result, source="_tool_surface/list")
+        return tool_surface_from_hermes_tool_surface_list(self.profile, result)
 
     def set_permission_policy(self, session_id: str, policy: StaticPermissionPolicy) -> None:
         self.permission_policies[session_id] = policy
