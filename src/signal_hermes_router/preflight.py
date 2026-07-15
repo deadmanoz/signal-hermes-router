@@ -12,16 +12,81 @@ from .permissions import StaticPermissionPolicy
 
 
 ProbeCallable = Callable[[str], Awaitable["ToolSurface"]]
+SUPPORTED_TOOL_SURFACE_SCHEMA_VERSION = 1
+FULL_CALLABLE_TOOL_SURFACE_SCOPE = "full_callable"
+_MISSING = object()
+
+
+def _validate_probe_error_fields(code: str, error: str | None) -> None:
+    """Keep internal probe failures safe and useful at the reporting boundary."""
+    if not isinstance(code, str) or not code:
+        raise ValueError("probe error code must be a non-empty string")
+    if error is not None and (not isinstance(error, str) or not error):
+        raise ValueError("probe error detail must be a non-empty string when provided")
 
 
 class PreflightProbeUnavailable(RuntimeError):
     """Raised when the router has no trusted runtime tool-surface source yet."""
 
+    def __init__(self, code: str, error: str | None = None) -> None:
+        _validate_probe_error_fields(code, error)
+        super().__init__(code)
+        self.code = code
+        self.error = error
+
+
+def _require_schema_version(value: Any = _MISSING) -> int:
+    if value is _MISSING:
+        raise PreflightProbeUnavailable(
+            "probe_contract_version_missing",
+            "tool-surface contract must declare schema_version=1",
+        )
+    if isinstance(value, bool):
+        raise PreflightProbeUnavailable(
+            "probe_contract_version_unsupported",
+            "tool-surface schema_version is unsupported; expected integer 1",
+        )
+    if not isinstance(value, int) or value != SUPPORTED_TOOL_SURFACE_SCHEMA_VERSION:
+        raise PreflightProbeUnavailable(
+            "probe_contract_version_unsupported",
+            "tool-surface schema_version is unsupported; expected integer 1",
+        )
+    return value
+
+
+def _require_surface_scope(value: Any = _MISSING) -> str:
+    if value is _MISSING:
+        raise PreflightProbeUnavailable(
+            "probe_contract_scope_missing",
+            "tool-surface contract must declare scope=full_callable",
+        )
+    if value != FULL_CALLABLE_TOOL_SURFACE_SCOPE:
+        raise PreflightProbeUnavailable(
+            "probe_contract_scope_unsupported",
+            "tool-surface scope must be full_callable",
+        )
+    return value
+
+
+def _contract_tool_names(value: Any = _MISSING) -> frozenset[str]:
+    # Wire contracts use JSON arrays, which standard json.loads represents as
+    # lists. Programmatic callers normalize through ToolSurface.from_names.
+    if not isinstance(value, list) or not all(isinstance(tool, str) and tool for tool in value):
+        raise PreflightProbeUnavailable(
+            "probe_contract_invalid",
+            "tool-surface tools must be a list of non-empty strings",
+        )
+    return frozenset(value)
+
 
 @dataclass(frozen=True)
 class ToolSurface:
+    # Direct construction is intentionally not trusted. The permission-
+    # preflight consumer validates every injected probe result at its boundary.
     profile: str
     tool_names: frozenset[str]
+    schema_version: int
+    scope: str
     source: str = "injected"
 
     @classmethod
@@ -30,12 +95,36 @@ class ToolSurface:
         profile: str,
         tool_names: list[str] | tuple[str, ...] | set[str] | frozenset[str],
         *,
+        schema_version: int,
+        scope: str,
         source: str = "injected",
     ) -> "ToolSurface":
-        return cls(
+        """Construct a programmatic surface; wire contracts remain list-only."""
+        surface = cls(
             profile=profile,
-            tool_names=frozenset(str(tool) for tool in tool_names),
+            tool_names=frozenset(tool_names),
+            schema_version=schema_version,
+            scope=scope,
             source=source,
+        )
+        validate_tool_surface(surface)
+        return surface
+
+
+def validate_tool_surface(surface: ToolSurface) -> None:
+    _require_schema_version(surface.schema_version)
+    _require_surface_scope(surface.scope)
+    # Keep the normalized representation immutable as well as validating its
+    # elements; a tuple of valid strings would otherwise pass the next check.
+    if not isinstance(surface.tool_names, frozenset):
+        raise PreflightProbeUnavailable(
+            "probe_contract_invalid",
+            "normalized tool-surface names must be a frozenset",
+        )
+    if any(not isinstance(tool, str) or not tool for tool in surface.tool_names):
+        raise PreflightProbeUnavailable(
+            "probe_contract_invalid",
+            "normalized tool-surface names must contain only non-empty strings",
         )
 
 
@@ -52,11 +141,18 @@ def tool_surface_from_agent_capabilities(
     )
     if not isinstance(meta, dict):
         return None
-    for value in _tool_surface_metadata_candidates(meta):
-        surface = tool_surface_from_value(profile, value, source="agent_capabilities_meta")
-        if surface is not None:
-            return surface
-    return None
+    candidates = _tool_surface_metadata_candidates(meta)
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        # Never prefer an apparently valid candidate over a coexisting legacy
+        # or model-facing list: their coexistence leaves producer intent unclear.
+        raise PreflightProbeUnavailable(
+            "probe_contract_ambiguous",
+            "multiple tool-surface metadata candidates are present: "
+            + ", ".join(path for path, _value in candidates),
+        )
+    return tool_surface_from_value(profile, candidates[0][1], source="agent_capabilities_meta")
 
 
 def tool_surface_from_value(
@@ -64,11 +160,21 @@ def tool_surface_from_value(
     value: Any,
     *,
     source: str,
-) -> ToolSurface | None:
-    tool_names = _extract_tool_names(value)
-    if tool_names is None:
-        return None
-    return ToolSurface.from_names(profile, tool_names, source=source)
+) -> ToolSurface:
+    if not isinstance(value, dict):
+        raise PreflightProbeUnavailable(
+            "probe_contract_invalid",
+            "tool-surface contract must be a JSON object",
+        )
+    schema_version = _require_schema_version(value.get("schema_version", _MISSING))
+    scope = _require_surface_scope(value.get("scope", _MISSING))
+    return ToolSurface.from_names(
+        profile,
+        _contract_tool_names(value.get("tools", _MISSING)),
+        schema_version=schema_version,
+        scope=scope,
+        source=source,
+    )
 
 
 @dataclass(frozen=True)
@@ -133,6 +239,9 @@ class PreflightProbeError:
     profile: str
     code: str
     error: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_probe_error_fields(self.code, self.error)
 
     def to_dict(self) -> dict[str, Any]:
         return {"profile": self.profile, "code": self.code, "error": self.error or self.code}
@@ -340,10 +449,19 @@ async def run_permission_preflight(
     profiles_to_probe = () if scope_errors else profiles
     for profile in profiles_to_probe:
         try:
-            surfaces[profile] = await probe(profile)
+            surface = await probe(profile)
+            # Revalidate even built-in probe results so injected/custom probes
+            # cannot bypass the callable-catalog contract.
+            validate_tool_surface(surface)
+            surfaces[profile] = surface
         except PreflightProbeUnavailable as exc:
-            code = str(exc) or "probe_unavailable"
-            probe_errors.append(PreflightProbeError(profile=profile, code=code))
+            probe_errors.append(
+                PreflightProbeError(
+                    profile=profile,
+                    code=exc.code,
+                    error=exc.error,
+                )
+            )
         except Exception as exc:
             probe_errors.append(
                 PreflightProbeError(
@@ -355,8 +473,8 @@ async def run_permission_preflight(
 
     missing: list[ExpectedPermissionTool] = []
     for tool in expected:
-        surface = surfaces.get(tool.profile)
-        if surface is not None and tool.tool_name not in surface.tool_names:
+        checked_surface = surfaces.get(tool.profile)
+        if checked_surface is not None and tool.tool_name not in checked_surface.tool_names:
             missing.append(tool)
     missing.sort(key=lambda item: (item.profile, item.route_ref, item.source_kind, item.tool_name))
     return PreflightReport(
@@ -450,61 +568,51 @@ def _policy_expected_tools(
 def _parse_probe_contract(raw: Any, *, source: str) -> dict[str, ToolSurface]:
     if not isinstance(raw, dict):
         raise ValueError("probe contract must be a JSON object")
-    profiles = raw.get("profiles", raw)
+    try:
+        schema_version = _require_schema_version(raw.get("schema_version", _MISSING))
+        scope = _require_surface_scope(raw.get("scope", _MISSING))
+    except PreflightProbeUnavailable as exc:
+        raise ValueError(exc.error or exc.code) from exc
+    profiles = raw.get("profiles")
     if not isinstance(profiles, dict):
         raise ValueError("probe contract profiles must be a mapping")
     surfaces: dict[str, ToolSurface] = {}
     for profile, value in profiles.items():
-        profile_name = str(profile)
-        if isinstance(value, dict):
-            tools = value.get("tools", value.get("tool_names"))
-        else:
-            tools = value
-        if not isinstance(tools, list) or not all(isinstance(tool, str) for tool in tools):
-            raise ValueError("probe contract profile tools must be a string list")
-        surfaces[profile_name] = ToolSurface.from_names(profile_name, tools, source=source)
+        if not isinstance(profile, str) or not profile:
+            raise ValueError("probe contract profile names must be non-empty strings")
+        if not isinstance(value, dict):
+            raise ValueError("probe contract profile must be a mapping with tools")
+        try:
+            surfaces[profile] = ToolSurface.from_names(
+                profile,
+                _contract_tool_names(value.get("tools", _MISSING)),
+                schema_version=schema_version,
+                scope=scope,
+                source=source,
+            )
+        except PreflightProbeUnavailable as exc:
+            raise ValueError(exc.error or exc.code) from exc
     return surfaces
 
 
-def _tool_surface_metadata_candidates(meta: dict[str, Any]) -> list[Any]:
-    candidates: list[Any] = []
+def _tool_surface_metadata_candidates(meta: dict[str, Any]) -> list[tuple[str, Any]]:
+    candidates: list[tuple[str, Any]] = []
     for key in ("toolSurface", "tool_surface", "tools", "tool_names"):
         if key in meta:
-            candidates.append(meta[key])
+            candidates.append((key, meta[key]))
     for key in ("signalHermesRouter", "signal-hermes-router", "signal_hermes_router"):
         nested = meta.get(key)
         if isinstance(nested, dict):
-            for nested_key in ("toolSurface", "tool_surface", "tools", "tool_names"):
-                if nested_key in nested:
-                    candidates.append(nested[nested_key])
+            # Version/scope metadata makes the namespace itself an envelope
+            # candidate. Passing the whole object preserves its contract metadata;
+            # partial envelopes then fail closed in tool_surface_from_value().
+            if "schema_version" in nested or "scope" in nested:
+                candidates.append((key, nested))
+            else:
+                for nested_key in ("toolSurface", "tool_surface", "tools", "tool_names"):
+                    if nested_key in nested:
+                        candidates.append((f"{key}.{nested_key}", nested[nested_key]))
     return candidates
-
-
-def _extract_tool_names(value: Any) -> frozenset[str] | None:
-    if isinstance(value, dict):
-        for key in ("tools", "tool_names"):
-            if key in value:
-                return _extract_tool_names(value[key])
-        function = value.get("function")
-        if isinstance(function, dict):
-            name = function.get("name")
-            if isinstance(name, str) and name:
-                return frozenset({name})
-        name = value.get("name")
-        if isinstance(name, str) and name:
-            return frozenset({name})
-        return None
-    if not isinstance(value, list):
-        return None
-    names: set[str] = set()
-    for item in value:
-        if isinstance(item, str) and item:
-            names.add(item)
-            continue
-        nested = _extract_tool_names(item)
-        if nested is not None:
-            names.update(nested)
-    return frozenset(names)
 
 
 def _string_tuple(

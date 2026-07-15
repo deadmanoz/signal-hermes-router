@@ -3749,7 +3749,12 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
     async def test_control_preflight_uses_profile_tool_surface(self) -> None:
         class ToolSurfaceProfile(FakeProfile):
             async def tool_surface(self) -> ToolSurface:
-                return ToolSurface.from_names(self.profile, ["read_file"])
+                return ToolSurface.from_names(
+                    self.profile,
+                    ["read_file"],
+                    schema_version=1,
+                    scope="full_callable",
+                )
 
         with tempfile.TemporaryDirectory() as tmp:
             route = Route(

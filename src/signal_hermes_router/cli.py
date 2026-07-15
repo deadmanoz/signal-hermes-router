@@ -75,7 +75,11 @@ def main(argv: list[str] | None = None) -> None:
     preflight.add_argument("--route", action="append", default=[])
     preflight.add_argument("--route-index", action="append", type=int, default=[])
     preflight.add_argument("--profile", action="append", default=[])
-    preflight.add_argument("--probe-contract-file", type=Path)
+    preflight.add_argument(
+        "--probe-contract-file",
+        type=Path,
+        help="version 1 full_callable ACP tool-surface contract",
+    )
     preflight.add_argument("--json", action="store_true")
     preflight.add_argument(
         "--client-timeout",
