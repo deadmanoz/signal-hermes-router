@@ -16,9 +16,10 @@ SUPPORTED_TOOL_SURFACE_SCHEMA_VERSION = 1
 FULL_CALLABLE_TOOL_SURFACE_SCOPE = "full_callable"
 _MISSING = object()
 # Catalog-carrying keys other than `tools` that the metadata path recognizes.
-# On the dedicated method's native branch their coexistence with `tools` makes
-# producer intent ambiguous, so we fail closed rather than silently pick `tools`.
-_NATIVE_AMBIGUOUS_CATALOG_KEYS = ("toolSurface", "tool_surface", "tool_names")
+# They are never part of the dedicated _tool_surface/list contract, so their
+# presence there makes producer intent ambiguous and the router fails closed
+# rather than silently trusting `tools` (or picking one when `tools` is absent).
+_TOOL_SURFACE_ALIAS_CATALOG_KEYS = ("toolSurface", "tool_surface", "tool_names")
 
 
 def _validate_probe_error_fields(code: str, error: str | None) -> None:
@@ -200,38 +201,39 @@ def tool_surface_from_hermes_tool_surface_list(
     dedicated method: if the response declares schema_version and/or scope it is
     an explicit envelope, so it is validated strictly via tool_surface_from_value
     (an unsupported version, a partial envelope, or a model_facing scope still
-    fails closed here). A native-shape response that also carries a coexisting
-    alternative catalog key (toolSurface/tool_surface/tool_names) is ambiguous and
-    fails closed, mirroring the metadata path. Hermes owns its extension response
-    shape; the router owns normalization and validation.
+    fails closed here). An alternative catalog key
+    (toolSurface/tool_surface/tool_names) is never part of this method's contract,
+    so its presence is rejected as ambiguous uniformly for both the explicit
+    envelope and the native shape, mirroring the metadata path's redundant-alias
+    handling. Hermes owns its extension response shape; the router owns
+    normalization and validation.
     """
     if not isinstance(value, dict):
         raise PreflightProbeUnavailable(
             "probe_contract_invalid",
             "tool-surface contract must be a JSON object",
         )
+    # The dedicated method's response is the `tools` catalog (optionally wrapped
+    # in a version/scope envelope). An alternative catalog key
+    # (toolSurface/tool_surface/tool_names) is never part of that contract, so its
+    # presence leaves producer intent ambiguous. Reject it uniformly here — before
+    # the envelope/native split — so redundant aliases fail closed on this path
+    # exactly as the metadata path treats them, without changing the shared
+    # tool_surface_from_value semantics used by the other sources.
+    alternative_keys = [key for key in _TOOL_SURFACE_ALIAS_CATALOG_KEYS if key in value]
+    if alternative_keys:
+        raise PreflightProbeUnavailable(
+            "probe_contract_ambiguous",
+            "tool-surface response uses catalog keys other than tools: "
+            + ", ".join(alternative_keys),
+        )
     # An explicit envelope (or partial envelope) declares its own version/scope;
     # validate it strictly so unsupported/model_facing catalogs still fail closed.
-    # An explicit versioned envelope is authoritative, so `tools` is trusted as
-    # the catalog and the native-branch coexisting-key ambiguity guard below is
-    # intentionally NOT applied here (adding it would change the shared
-    # tool_surface_from_value semantics for every caller, not just this method).
     if "schema_version" in value or "scope" in value:
         return tool_surface_from_value(profile, value, source="_tool_surface/list")
     # Pure Hermes-native shape: only the tools array is present; schema_version
     # and scope are injected by the router because the dedicated method name is
-    # the callable-catalog contract. An alternative catalog key
-    # (toolSurface/tool_surface/tool_names) leaves producer intent ambiguous
-    # whether or not `tools` also appears, so we fail closed here just like the
-    # metadata path rather than silently stamping the `tools` array as
-    # full_callable (or picking one alternative key when `tools` is absent).
-    alternative_keys = [key for key in _NATIVE_AMBIGUOUS_CATALOG_KEYS if key in value]
-    if alternative_keys:
-        raise PreflightProbeUnavailable(
-            "probe_contract_ambiguous",
-            "tool-surface native response uses catalog keys other than tools: "
-            + ", ".join(alternative_keys),
-        )
+    # the callable-catalog contract.
     return ToolSurface.from_names(
         profile,
         _contract_tool_names(value.get("tools", _MISSING)),

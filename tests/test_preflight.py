@@ -570,10 +570,11 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 {"schema_version": 2, "scope": "full_callable", "tools": ["read_file"]},
             )
 
-    def test_hermes_tool_surface_list_rejects_native_shape_coexisting_catalog_keys(self) -> None:
-        # A native-shape response (no schema_version/scope) that also carries an
-        # alternative catalog key alongside `tools` leaves producer intent
-        # ambiguous; the router fails closed instead of silently picking `tools`.
+    def test_hermes_tool_surface_list_rejects_coexisting_catalog_keys(self) -> None:
+        # A response that carries an alternative catalog key alongside `tools`
+        # leaves producer intent ambiguous; the router fails closed instead of
+        # silently picking `tools`. The guard is uniform, so it applies to both
+        # the native shape and an explicit versioned envelope.
         for coexisting_key in ("toolSurface", "tool_surface", "tool_names"):
             with self.subTest(coexisting_key=coexisting_key):
                 with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_ambiguous"):
@@ -582,12 +583,29 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                         {"tools": ["read_file"], coexisting_key: ["web_search"]},
                     )
 
-    def test_hermes_tool_surface_list_rejects_native_shape_alternative_key_without_tools(
+    def test_hermes_tool_surface_list_rejects_versioned_envelope_with_redundant_alias(
         self,
     ) -> None:
-        # The same guard fires when the native response uses an alternative
-        # catalog key with no `tools` key at all; it fails closed as ambiguous
-        # rather than treating a non-dedicated shape as an empty catalog.
+        # The alias guard runs before the envelope/native split, so a redundant
+        # alias alongside an explicit versioned envelope fails closed too, matching
+        # how the metadata path treats redundant aliases as ambiguous.
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_ambiguous"):
+            tool_surface_from_hermes_tool_surface_list(
+                "calendar",
+                {
+                    "schema_version": 1,
+                    "scope": "full_callable",
+                    "tools": ["read_file"],
+                    "tool_names": ["web_search"],
+                },
+            )
+
+    def test_hermes_tool_surface_list_rejects_alternative_key_without_tools(
+        self,
+    ) -> None:
+        # The same guard fires when the response uses an alternative catalog key
+        # with no `tools` key at all; it fails closed as ambiguous rather than
+        # treating a non-dedicated shape as an empty catalog.
         with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_ambiguous"):
             tool_surface_from_hermes_tool_surface_list(
                 "calendar",
