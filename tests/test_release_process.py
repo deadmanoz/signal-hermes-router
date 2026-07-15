@@ -94,8 +94,11 @@ class ReleaseProcessTests(unittest.TestCase):
         )
         current_run = self.steps_by_name["Ensure release PR branch is current"]["run"]
         self.assertIn('gh pr update-branch "$PR_NUMBER" --repo "$REPO"', current_run)
-        self.assertIn("mergeStateStatus is $state after update", current_run)
-        self.assertIn("BEHIND|DIRTY|UNKNOWN", current_run)
+        self.assertIn("--json headRefOid,mergeable", current_run)
+        self.assertIn("compare/$BASE_BRANCH...$head_sha", current_run)
+        self.assertIn("CONFLICTING", current_run)
+        self.assertIn('behind_by" -gt 0', current_run)
+        self.assertNotIn("mergeStateStatus", current_run)
 
     def test_validation_is_nonmutating_and_precedes_live_head_gate(self) -> None:
         names = [step["name"] for step in self.steps]
@@ -118,14 +121,16 @@ class ReleaseProcessTests(unittest.TestCase):
             names.index("Publish validated release PR"),
         )
 
-    def test_live_head_gate_rejects_stale_or_unmergeable_head(self) -> None:
+    def test_live_head_gate_uses_draft_independent_merge_evidence(self) -> None:
         verify_run = self.steps_by_name["Verify release PR head"]["run"]
 
-        self.assertIn("--json headRefOid,mergeStateStatus", verify_run)
+        self.assertIn("--json headRefOid,mergeable", verify_run)
+        self.assertIn("compare/$BASE_BRANCH...$live_head_sha", verify_run)
         self.assertIn('if [ "$live_head_sha" != "$checked_out_sha" ]', verify_run)
         self.assertIn("::error::release PR head changed after validation", verify_run)
-        for state in ("BEHIND", "DIRTY", "UNKNOWN"):
-            self.assertIn(f'[ "$state" = "{state}" ]', verify_run)
+        self.assertIn("CONFLICTING", verify_run)
+        self.assertIn('behind_by" != "0', verify_run)
+        self.assertNotIn("mergeStateStatus", verify_run)
 
     def test_ready_approval_and_auto_merge_follow_validation_gate(self) -> None:
         names = [step["name"] for step in self.steps]
@@ -139,8 +144,9 @@ class ReleaseProcessTests(unittest.TestCase):
         self.assertIn("steps.verify_release_pr_head.outcome == 'success'", publish["if"])
         self.assertLess(publish_run.index("gh pr ready"), publish_run.index("gh pr review"))
         self.assertLess(publish_run.index("gh pr review"), publish_run.index("gh pr merge"))
-        self.assertIn("release PR head changed during ready transition", publish_run)
-        self.assertIn("release PR head changed before auto-merge", publish_run)
+        self.assertIn("compare/$BASE_BRANCH...$live_head_sha", publish_run)
+        self.assertIn("changed or became unmergeable during ready transition", publish_run)
+        self.assertIn("changed or became unmergeable before auto-merge", publish_run)
         self.assertIn('--match-head-commit "$validated_sha"', publish_run)
 
     def test_workflow_contains_no_post_generation_repair_commit(self) -> None:

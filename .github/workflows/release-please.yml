@@ -148,41 +148,53 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
+          BASE_BRANCH: ${{ github.ref_name }}
         run: |
-          state=""
+          head_sha=""
+          mergeable=""
+          behind_by=""
           for attempt in 1 2 3 4 5; do
-            state="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeStateStatus --jq .mergeStateStatus)"
-            if [ "$state" != "UNKNOWN" ]; then
+            details="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,mergeable)"
+            head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
+            mergeable="$(printf '%s' "$details" | jq -r .mergeable)"
+            behind_by="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$head_sha" --jq .behind_by)"
+            if [ "$mergeable" != "UNKNOWN" ]; then
               break
             fi
-            echo "mergeStateStatus is UNKNOWN on attempt $attempt; retrying"
+            echo "mergeable is UNKNOWN on attempt $attempt; retrying"
             sleep 5
           done
 
-          case "$state" in
-            BEHIND)
-              gh pr update-branch "$PR_NUMBER" --repo "$REPO"
-              for attempt in 1 2 3 4 5; do
-                state="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeStateStatus --jq .mergeStateStatus)"
-                if [ "$state" != "UNKNOWN" ] && [ "$state" != "BEHIND" ]; then
-                  break
-                fi
-                echo "mergeStateStatus is $state after update on attempt $attempt; retrying"
-                sleep 5
-              done
-              ;;
-          esac
-
-          case "$state" in
-            BEHIND|DIRTY|UNKNOWN)
-              echo "::error::release PR merge state is $state; leaving it draft"
+          case "$behind_by" in
+            ''|*[!0-9]*)
+              echo "::error::invalid behind_by value '$behind_by'; leaving release PR draft"
               exit 1
               ;;
           esac
-          # BLOCKED is expected while a draft still lacks approval or required
-          # checks. Those gates remain owned by the ready/approve/auto-merge
-          # sequence below, so only stale, conflicted, or indeterminate states
-          # fail this synchronization gate.
+          if [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ]; then
+            echo "::error::release PR mergeable state is $mergeable; leaving it draft"
+            exit 1
+          fi
+
+          if [ "$behind_by" -gt 0 ]; then
+            gh pr update-branch "$PR_NUMBER" --repo "$REPO"
+            for attempt in 1 2 3 4 5; do
+              details="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,mergeable)"
+              head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
+              mergeable="$(printf '%s' "$details" | jq -r .mergeable)"
+              behind_by="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$head_sha" --jq .behind_by)"
+              if [ "$mergeable" != "UNKNOWN" ] && [ "$behind_by" = "0" ]; then
+                break
+              fi
+              echo "release head is mergeable=$mergeable behind_by=$behind_by after update on attempt $attempt; retrying"
+              sleep 5
+            done
+          fi
+
+          if [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
+              echo "::error::release head remains mergeable=$mergeable behind_by=$behind_by; leaving it draft"
+              exit 1
+          fi
 
       - name: Check out release PR branch
         if: ${{ steps.release.outputs.prs_created == 'true' }}
@@ -216,17 +228,21 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
+          BASE_BRANCH: ${{ github.ref_name }}
         run: |
           checked_out_sha="$(git rev-parse HEAD)"
-          state=""
+          live_head_sha=""
+          mergeable=""
+          behind_by=""
           for attempt in 1 2 3 4 5; do
-            details="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,mergeStateStatus)"
+            details="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,mergeable)"
             live_head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
-            state="$(printf '%s' "$details" | jq -r .mergeStateStatus)"
-            if [ "$state" != "UNKNOWN" ]; then
+            mergeable="$(printf '%s' "$details" | jq -r .mergeable)"
+            behind_by="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$live_head_sha" --jq .behind_by)"
+            if [ "$mergeable" != "UNKNOWN" ]; then
               break
             fi
-            echo "mergeStateStatus is UNKNOWN on attempt $attempt; retrying"
+            echo "mergeable is UNKNOWN on attempt $attempt; retrying"
             sleep 5
           done
 
@@ -234,10 +250,8 @@ jobs:
             echo "::error::release PR head changed after validation; leaving it draft"
             exit 1
           fi
-          # BLOCKED can reflect the approval and checks armed below. It does
-          # not mean the validated head is stale or conflicted.
-          if [ "$state" = "BEHIND" ] || [ "$state" = "DIRTY" ] || [ "$state" = "UNKNOWN" ]; then
-            echo "::error::release PR merge state became $state after validation; leaving it draft"
+          if [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
+            echo "::error::release head became mergeable=$mergeable behind_by=$behind_by after validation; leaving it draft"
             exit 1
           fi
 
@@ -256,6 +270,7 @@ jobs:
           APPROVAL_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
+          BASE_BRANCH: ${{ github.ref_name }}
         run: |
           validated_sha="$(git rev-parse HEAD)"
           live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
@@ -265,10 +280,23 @@ jobs:
           fi
 
           gh pr ready "$PR_NUMBER" --repo "$REPO"
-          live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
-          if [ "$live_head_sha" != "$validated_sha" ]; then
+          live_head_sha=""
+          mergeable=""
+          behind_by=""
+          for attempt in 1 2 3 4 5; do
+            details="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,mergeable)"
+            live_head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
+            mergeable="$(printf '%s' "$details" | jq -r .mergeable)"
+            behind_by="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$live_head_sha" --jq .behind_by)"
+            if [ "$mergeable" != "UNKNOWN" ]; then
+              break
+            fi
+            echo "mergeable is UNKNOWN after ready on attempt $attempt; retrying"
+            sleep 5
+          done
+          if [ "$live_head_sha" != "$validated_sha" ] || [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
             gh pr ready "$PR_NUMBER" --repo "$REPO" --undo || true
-            echo "::error::release PR head changed during ready transition"
+            echo "::error::release head changed or became unmergeable during ready transition"
             exit 1
           fi
 
@@ -279,10 +307,13 @@ jobs:
             --approve \
             --body "Automated approval for validated release PR."
 
-          live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
-          if [ "$live_head_sha" != "$validated_sha" ]; then
+          details="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,mergeable)"
+          live_head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
+          mergeable="$(printf '%s' "$details" | jq -r .mergeable)"
+          behind_by="$(gh api "repos/$REPO/compare/$BASE_BRANCH...$live_head_sha" --jq .behind_by)"
+          if [ "$live_head_sha" != "$validated_sha" ] || [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
             gh pr ready "$PR_NUMBER" --repo "$REPO" --undo || true
-            echo "::error::release PR head changed before auto-merge"
+            echo "::error::release head changed or became unmergeable before auto-merge"
             exit 1
           fi
 

@@ -25,7 +25,7 @@ Patch bumps cover bug fixes, log/metric changes, internal refactors with no publ
 1. Merge PRs with Conventional Commit squash titles.
 2. Release Please opens or updates a draft release PR after releasable commits land on `main`. It generates `CHANGELOG.md`, updates `pyproject.toml`, and updates the matching project version in `uv.lock` from the same release metadata.
 3. The release workflow synchronizes a stale release branch, checks out the resulting head, and runs nonmutating validation with `uv lock --check`, the public-boundary scanner, and a clean-tree check for all generated release files.
-4. Immediately before changing the PR to ready, the workflow confirms that the validated checkout is still the live PR head and that the branch is neither behind nor conflicted.
+4. Immediately before changing the PR to ready, the workflow confirms that the validated checkout is still the live PR head, GitHub reports it as mergeable rather than conflicting, and the compare API reports `behind_by=0`. These signals remain meaningful while the PR is draft.
 5. Only that validated head is marked ready, approved, and armed for squash auto-merge.
 6. When the release PR auto-merges, Release Please creates the `vX.Y.Z` tag and GitHub Release.
 
