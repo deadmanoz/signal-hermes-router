@@ -1080,6 +1080,62 @@ class SignalHermesRouter:
                         reply_text = ""
                     elif frozen_attachments and not reply_text.strip():
                         reply_text = ATTACHMENT_ONLY_FALLBACK_TEXT
+                    elif not reply_text.strip():
+                        # Unmarked empty/whitespace completion — not a sentinel,
+                        # not attachment-only.  Synthesize a router-owned
+                        # ACP_EMPTY_RESPONSE diagnostic and send the configured
+                        # fallback reply. Do NOT treat this as a
+                        # successful silent reply.
+                        LOGGER.info(
+                            "ACP_EMPTY_RESPONSE for %s: unmarked empty completion",
+                            self.redactor.ref("route", route.key),
+                        )
+                        failure = failure_info(
+                            FailureCode.ACP_EMPTY_RESPONSE,
+                            detail="ACP_EMPTY_RESPONSE",
+                            redactor=self.redactor.redact,
+                        )
+                        last_failure_at_ms = self._record_route_failure(route, failure)
+                        # No breaker success/failure, no profile restart.
+                        # Preserve route-specific failure-reply overrides,
+                        # including an explicit empty reply that suppresses
+                        # transport output while retaining the diagnostic.
+                        reply_text = self._failure_reply_for(route, failure)
+                        if reply_text and not await self._send_once(
+                            route,
+                            reply_text,
+                            attachments=frozen_attachments,
+                        ):
+                            # Fallback send failed — use existing Signal-send
+                            # failure path (retry/observability semantics).
+                            failure, last_failure_at_ms = self._signal_send_failure(route)
+                            handled = True
+                            return TurnOutcome(
+                                TurnOutcomeStatus.ERROR,
+                                route_state=state,
+                                result=result,
+                                error=failure.code.value,
+                                failure=failure,
+                                reply_sent=False,
+                                **self._synthetic_failure_fields(turn, route, last_failure_at_ms),
+                            )
+                        # Fallback was sent; mark handled but do not record
+                        # circuit success (this was a synthetic reply, not a
+                        # model response).
+                        # Signal turns are consumed after their fallback
+                        # attempt. Synthetic jobs retain their retry semantics
+                        # for failed Hermes work, including this malformed ACP
+                        # completion.
+                        handled = turn.synthetic is None
+                        return TurnOutcome(
+                            TurnOutcomeStatus.ERROR,
+                            route_state=state,
+                            result=result,
+                            error=failure.code.value,
+                            failure=failure,
+                            reply_sent=bool(reply_text),
+                            **self._synthetic_failure_fields(turn, route, last_failure_at_ms),
+                        )
                     if reply_text and not await self._send_once(
                         route,
                         reply_text,

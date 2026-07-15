@@ -12,6 +12,7 @@ class FailureCode(StrEnum):
     ROUTER_ERROR = "router_error"
     ACP_SUBPROCESS_FAILED = "acp_subprocess_failed"
     ACP_PROTOCOL_ERROR = "acp_protocol_error"
+    ACP_EMPTY_RESPONSE = "acp_empty_response"
     ACP_SESSION_FAILED = "acp_session_failed"
     ACP_PROMPT_TIMEOUT = "acp_prompt_timeout"
     PERMISSION_DENIED = "permission_denied"
@@ -38,6 +39,7 @@ _CODE_MESSAGES: dict[FailureCode, str] = {
     FailureCode.ROUTER_ERROR: "Router-owned failure while handling the turn.",
     FailureCode.ACP_SUBPROCESS_FAILED: "ACP subprocess exited or could not be reached.",
     FailureCode.ACP_PROTOCOL_ERROR: "ACP protocol exchange failed.",
+    FailureCode.ACP_EMPTY_RESPONSE: "ACP returned an unmarked empty response.",
     FailureCode.ACP_SESSION_FAILED: "ACP session setup or recovery failed.",
     FailureCode.ACP_PROMPT_TIMEOUT: "ACP prompt request timed out in the router.",
     FailureCode.PERMISSION_DENIED: "Required permission was denied or unavailable.",
@@ -55,6 +57,7 @@ _STRUCTURED_CODE_MAP: dict[str, FailureCode] = {
     "router_error": FailureCode.ROUTER_ERROR,
     "acp_subprocess_failed": FailureCode.ACP_SUBPROCESS_FAILED,
     "acp_protocol_error": FailureCode.ACP_PROTOCOL_ERROR,
+    "acp_empty_response": FailureCode.ACP_EMPTY_RESPONSE,
     "acp_session_failed": FailureCode.ACP_SESSION_FAILED,
     "acp_prompt_timeout": FailureCode.ACP_PROMPT_TIMEOUT,
     "permission_denied": FailureCode.PERMISSION_DENIED,
