@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.26](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.25...v0.1.26) (2026-07-15)
+
+
+### Bug Fixes
+
+* **router:** surface unmarked ACP empty replies ([0265f6a](https://github.com/deadmanoz/signal-hermes-router/commit/0265f6a73ae3a5006db396b70882e42c305191b2))
+
 ## [0.1.25](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.24...v0.1.25) (2026-07-12)
 
 
