@@ -4630,23 +4630,115 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 [("sender-uuid", "still working"), ("sender-uuid", "reply")],
             )
 
-    async def test_active_route_with_empty_reply_marks_handled_without_send(self) -> None:
+    async def test_active_route_with_unmarked_blank_reply_records_failure_without_restart(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             signal = FakeSignal()
             profile = FakeProfile()
-            profile.reply_text = ""
+            profile.reply_text = " \t\n"
             dedupe = DedupeStore()
+            supervisor = FakeSupervisor(profile)
             router = SignalHermesRouter(
                 make_app(tmp, RouteState.ACTIVE),
                 signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                supervisor=supervisor,  # type: ignore[arg-type]
                 dedupe=dedupe,
             )
 
             await router.handle_event(make_event())
 
-            self.assertEqual(signal.sends, [])
-            self.assertFalse(dedupe.claim("signal:group", "sender", 1))
+            self.assertEqual(
+                signal.sends,
+                [("group", "I hit an internal router error handling that message.")],
+            )
+            self.assertEqual(dedupe.status("signal:group", "sender", 1), "handled")
+            last_failure_at_ms, failure = router._last_failures["signal:group"]
+            self.assertGreater(last_failure_at_ms, 0)
+            self.assertEqual(failure.code, FailureCode.ACP_EMPTY_RESPONSE)
+            self.assertEqual(router.circuit.failure_count("signal:group"), 0)
+            self.assertEqual(supervisor.restarts, 0)
+            self.assertEqual(
+                router._route_status_response({})["routes"][0]["last_failure"]["code"],
+                "acp_empty_response",
+            )
+
+    async def test_blank_reply_uses_route_failure_reply_override_and_allows_suppression(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for route_failure_reply, expected_sends in (
+                ("Route-specific fallback.", [("group", "Route-specific fallback.")]),
+                ("", []),
+            ):
+                with self.subTest(route_failure_reply=route_failure_reply):
+                    signal = FakeSignal()
+                    profile = FakeProfile()
+                    profile.reply_text = ""
+                    route = make_route(failure_reply=route_failure_reply)
+                    router = SignalHermesRouter(
+                        make_app(tmp, RouteState.ACTIVE, routes=(route,)),
+                        signal_client=signal,  # type: ignore[arg-type]
+                        supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                        dedupe=DedupeStore(),
+                    )
+
+                    await router.handle_event(make_event())
+
+                    self.assertEqual(signal.sends, expected_sends)
+
+    async def test_synthetic_blank_reply_releases_dedupe_for_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = make_route(name="agenda-route")
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = ""
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+            profile.reply_text = "reply"
+            retry = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            self.assertEqual(failed.error, "acp_empty_response")
+            self.assertEqual(retry.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(
+                [body for _, body in signal.sends],
+                [
+                    "I hit an internal router error handling that message.",
+                    "reply",
+                ],
+            )
+
+    async def test_synthetic_blank_reply_send_failure_preserves_acp_failure(self) -> None:
+        class FlakySignal(FakeSignal):
+            async def send_group(self, group_id: str, message: str) -> dict[str, int]:
+                raise RuntimeError("send failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = make_route(name="agenda-route")
+            profile = FakeProfile()
+            profile.reply_text = ""
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route),
+                signal_client=FlakySignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            with self.assertLogs("signal_hermes_router.router", level="ERROR"):
+                failed = await router.handle_synthetic_job("daily-agenda", scheduled_at=1000)
+
+            self.assertEqual(failed.error, "acp_empty_response")
+            self.assertEqual(failed.failure.code, FailureCode.ACP_EMPTY_RESPONSE)
+            self.assertEqual(
+                router._route_status_response({})["routes"][0]["last_failure"]["code"],
+                "acp_empty_response",
+            )
 
     async def test_sentinel_reply_suppresses_send_and_marks_handled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

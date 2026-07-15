@@ -47,6 +47,12 @@ collision-resistant contract that profiles can rely on across deployments.
   `acp_prompt_timeout_seconds` so the notice can never fire before the turn
   resolves.
 
+An arbitrary blank or whitespace-only ACP completion is not deliberate
+silence. The router records it as `acp_empty_response` and uses the configured
+failure reply (including any route-specific override) without restarting the
+otherwise healthy profile or feeding the circuit breaker. Synthetic turns keep
+their normal failed-turn retry semantics.
+
 ## Profile adoption
 
 Instruct the profile (in its own configuration, not in this repo) to emit the
