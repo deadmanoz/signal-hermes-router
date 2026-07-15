@@ -228,10 +228,15 @@ jobs:
             exit 1
           fi
 
-      # The explicit outcome dependency prevents a future continue-on-error
-      # change on the verification step from exposing an unverified head.
+      # Both release generation and successful live-head verification are
+      # required. The explicit outcome dependency prevents a future
+      # continue-on-error change from exposing an unverified head.
       - name: Mark release PR ready
-        if: ${{ steps.release.outputs.prs_created == 'true' && steps.verify_release_pr_head.outcome == 'success' }}
+        if: >-
+          ${{
+            steps.release.outputs.prs_created == 'true' &&
+            steps.verify_release_pr_head.outcome == 'success'
+          }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
@@ -239,15 +244,25 @@ jobs:
         run: gh pr ready "$PR_NUMBER" --repo "$REPO"
 
       - name: Approve release PR
-        if: ${{ steps.release.outputs.prs_created == 'true' && steps.verify_release_pr_head.outcome == 'success' }}
+        if: >-
+          ${{
+            steps.release.outputs.prs_created == 'true' &&
+            steps.verify_release_pr_head.outcome == 'success'
+          }}
         env:
+          # Approval must come from an identity other than the token that
+          # created and updates the Release Please PR.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
         run: gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body "Automated approval for validated release PR."
 
       - name: Enable squash auto-merge
-        if: ${{ steps.release.outputs.prs_created == 'true' && steps.verify_release_pr_head.outcome == 'success' }}
+        if: >-
+          ${{
+            steps.release.outputs.prs_created == 'true' &&
+            steps.verify_release_pr_head.outcome == 'success'
+          }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}

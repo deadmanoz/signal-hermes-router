@@ -32,6 +32,8 @@ UUID_RE = re.compile(
 LONG_BASE64_RE = re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b")
 HEX_RE = re.compile(r"\b[0-9a-fA-F]{40,}\b")
 URL_RE = re.compile(r"https?://[^\s>)\"']+")
+# Release Please emits public github.com commit links. Deployment and
+# enterprise hosts remain outside this public-repository exemption.
 GITHUB_COMMIT_URL_RE = re.compile(
     r"https:"
     r"//github\.com/[A-Za-z0-9-]+/[A-Za-z0-9_.-]+/commit/[0-9a-fA-F]{40}"
