@@ -550,6 +550,23 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 {"scope": "full_callable", "tools": ["read_file"]},
             )
 
+    def test_hermes_tool_surface_list_rejects_explicit_unsupported_version(self) -> None:
+        # An explicit envelope declaring schema_version=2 is routed to the strict
+        # validator, so an unsupported version fails closed rather than being
+        # silently normalized as the native shape.
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "version_unsupported"):
+            tool_surface_from_hermes_tool_surface_list(
+                "calendar",
+                {"schema_version": 2, "scope": "full_callable", "tools": ["read_file"]},
+            )
+
+    def test_hermes_tool_surface_list_rejects_native_shape_missing_tools(self) -> None:
+        # A dict with neither schema_version/scope nor a tools key takes the
+        # native branch; a truncated response with no tools array fails closed
+        # instead of normalizing to an empty callable catalog.
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_invalid"):
+            tool_surface_from_hermes_tool_surface_list("calendar", {"other": 1})
+
     def test_tool_surface_from_value_still_rejects_unversioned_dict(self) -> None:
         """Unversioned {tools: [...]} from generic external input remains rejected."""
         with self.assertRaisesRegex(PreflightProbeUnavailable, "version_missing"):
