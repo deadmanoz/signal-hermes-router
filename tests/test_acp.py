@@ -310,7 +310,9 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(PreflightProbeUnavailable, "probe_not_started"):
                 await profile.tool_surface()
 
-    async def test_acp_profile_tool_surface_accepts_hermes_native_unversioned_response(self) -> None:
+    async def test_acp_profile_tool_surface_accepts_hermes_native_unversioned_response(
+        self,
+    ) -> None:
         class HermesNativePeer:
             async def request(self, *_args, **_kwargs):
                 return {"tools": ["read_file"]}
