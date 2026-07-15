@@ -5,7 +5,7 @@
 
 ### Documentation
 
-* **deployment:** harden release deployment checks ([#62](https://github.com/deadmanoz/signal-hermes-router/issues/62)) ([f1a143b](https://github.com/deadmanoz/signal-hermes-router/commit/f1a143baec9b39c3c4c35d8e312f59a4f59a6975))
+* **deployment:** harden release deployment checks ([#62](https://github.com/deadmanoz/signal-hermes-router/issues/62))
 
 ## [0.1.26](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.25...v0.1.26) (2026-07-15)
 
