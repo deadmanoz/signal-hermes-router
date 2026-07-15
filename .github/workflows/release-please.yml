@@ -30,22 +30,27 @@ jobs:
           REPO: ${{ github.repository }}
           BASE_BRANCH: ${{ github.ref_name }}
         run: |
+          repo_owner="${REPO%%/*}"
           release_branch="release-please--branches--$BASE_BRANCH"
           release_title_prefix="chore($BASE_BRANCH): release "
-          pending="$(gh pr list \
-            --repo "$REPO" \
-            --state open \
-            --base "$BASE_BRANCH" \
-            --head "$release_branch" \
-            --json number,isDraft,headRefOid,headRefName,title,autoMergeRequest,isCrossRepository)"
+          pending="$(gh api \
+            --method GET \
+            --paginate \
+            --slurp \
+            "repos/$REPO/pulls" \
+            -f state=open \
+            -f base="$BASE_BRANCH" \
+            -f head="$repo_owner:$release_branch" \
+            -f per_page=100)"
           pending="$(printf '%s' "$pending" | jq \
+            --arg repo "$REPO" \
             --arg release_branch "$release_branch" \
             --arg release_title_prefix "$release_title_prefix" \
             '[
-              .[]
+              .[][]
               | select(
-                  .isCrossRepository == false
-                  and .headRefName == $release_branch
+                  .head.repo.full_name == $repo
+                  and .head.ref == $release_branch
                   and (.title | startswith($release_title_prefix))
                 )
             ]')"
@@ -64,9 +69,9 @@ jobs:
           fi
 
           number="$(printf '%s' "$pending" | jq -r '.[0].number')"
-          is_draft="$(printf '%s' "$pending" | jq -r '.[0].isDraft')"
-          head_sha="$(printf '%s' "$pending" | jq -r '.[0].headRefOid')"
-          auto_merge_enabled="$(printf '%s' "$pending" | jq -r '.[0].autoMergeRequest != null')"
+          is_draft="$(printf '%s' "$pending" | jq -r '.[0].draft')"
+          head_sha="$(printf '%s' "$pending" | jq -r '.[0].head.sha')"
+          auto_merge_enabled="$(printf '%s' "$pending" | jq -r '.[0].auto_merge != null')"
           echo "number=$number" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "auto_merge_enabled=$auto_merge_enabled" >> "$GITHUB_OUTPUT"
@@ -180,8 +185,8 @@ jobs:
           fi
 
           if [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
-              echo "::error::release head remains mergeable=$mergeable behind_by=$behind_by; leaving it draft"
-              exit 1
+            echo "::error::release head remains mergeable=$mergeable behind_by=$behind_by; leaving it draft"
+            exit 1
           fi
 
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
@@ -266,7 +271,7 @@ jobs:
         if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
         run: |
           uv lock --check
-          uv run --locked python scripts/check-public-boundary.py
+          "$(uv python find 3.12)" scripts/check-public-boundary.py
           git diff --exit-code -- CHANGELOG.md .release-please-manifest.json pyproject.toml uv.lock
 
       - name: Verify release PR head

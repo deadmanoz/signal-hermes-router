@@ -53,17 +53,26 @@ class ReleaseProcessTests(unittest.TestCase):
             names.index("Run Release Please"),
         )
         for expected in (
-            "--state open",
-            '--base "$BASE_BRANCH"',
+            'repo_owner="${REPO%%/*}"',
             'release_branch="release-please--branches--$BASE_BRANCH"',
             'release_title_prefix="chore($BASE_BRANCH): release "',
-            '--head "$release_branch"',
-            "number,isDraft,headRefOid,headRefName,title,autoMergeRequest,isCrossRepository",
+            "--method GET",
+            "--paginate",
+            "--slurp",
+            '"repos/$REPO/pulls"',
+            "-f state=open",
+            '-f base="$BASE_BRANCH"',
+            '-f head="$repo_owner:$release_branch"',
+            "-f per_page=100",
+            '--arg repo "$REPO"',
             '--arg release_branch "$release_branch"',
             '--arg release_title_prefix "$release_title_prefix"',
-            ".isCrossRepository == false",
-            ".headRefName == $release_branch",
+            ".head.repo.full_name == $repo",
+            ".head.ref == $release_branch",
             ".title | startswith($release_title_prefix)",
+            "'.[0].draft'",
+            "'.[0].head.sha'",
+            "'.[0].auto_merge != null'",
             'if [ "$count" -gt 1 ]',
             'gh pr ready "$number" --repo "$REPO" --undo',
         ):
@@ -218,10 +227,11 @@ gh() {{
             validation_run.splitlines(),
             [
                 "uv lock --check",
-                "uv run --locked python scripts/check-public-boundary.py",
+                '"$(uv python find 3.12)" scripts/check-public-boundary.py',
                 "git diff --exit-code -- CHANGELOG.md .release-please-manifest.json pyproject.toml uv.lock",
             ],
         )
+        self.assertNotIn("uv run", validation_run)
         self.assertLess(
             names.index("Validate generated release head"),
             names.index("Verify release PR head"),
@@ -319,6 +329,10 @@ gh() {{
             calls = call_log.read_text(encoding="utf-8")
             self.assertIn("pr ready 123 --repo example/repo\n", calls)
             self.assertIn("pr ready 123 --repo example/repo --undo\n", calls)
+            self.assertLess(
+                calls.index("pr ready 123 --repo example/repo\n"),
+                calls.index("pr ready 123 --repo example/repo --undo\n"),
+            )
 
     def test_workflow_contains_no_post_generation_repair_commit(self) -> None:
         forbidden = (
