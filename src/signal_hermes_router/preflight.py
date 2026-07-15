@@ -603,9 +603,15 @@ def _tool_surface_metadata_candidates(meta: dict[str, Any]) -> list[tuple[str, A
     for key in ("signalHermesRouter", "signal-hermes-router", "signal_hermes_router"):
         nested = meta.get(key)
         if isinstance(nested, dict):
-            for nested_key in ("toolSurface", "tool_surface", "tools", "tool_names"):
-                if nested_key in nested:
-                    candidates.append((f"{key}.{nested_key}", nested[nested_key]))
+            # Version/scope metadata makes the namespace itself an envelope
+            # candidate. Passing the whole object preserves its contract metadata;
+            # partial envelopes then fail closed in tool_surface_from_value().
+            if "schema_version" in nested or "scope" in nested:
+                candidates.append((key, nested))
+            else:
+                for nested_key in ("toolSurface", "tool_surface", "tools", "tool_names"):
+                    if nested_key in nested:
+                        candidates.append((f"{key}.{nested_key}", nested[nested_key]))
     return candidates
 
 

@@ -357,6 +357,110 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         assert surface is not None
         self.assertEqual(surface.tool_names, frozenset())
 
+    def test_tool_surface_metadata_accepts_directly_namespaced_v1_envelope(self) -> None:
+        for ns in ("signalHermesRouter", "signal-hermes-router", "signal_hermes_router"):
+            with self.subTest(namespace=ns):
+                surface = tool_surface_from_agent_capabilities(
+                    "calendar",
+                    {
+                        "_meta": {
+                            ns: {
+                                "schema_version": 1,
+                                "scope": "full_callable",
+                                "tools": ["web_search", "read_file"],
+                            }
+                        }
+                    },
+                )
+                self.assertIsNotNone(surface)
+                assert surface is not None
+                self.assertEqual(surface.tool_names, frozenset({"read_file", "web_search"}))
+
+    def test_tool_surface_metadata_avoids_duplicate_when_namespace_is_envelope_and_has_nested_key(
+        self,
+    ) -> None:
+        surface = tool_surface_from_agent_capabilities(
+            "calendar",
+            {
+                "_meta": {
+                    "signalHermesRouter": {
+                        "schema_version": 1,
+                        "scope": "full_callable",
+                        "tools": ["web_search", "read_file"],
+                        "toolSurface": {
+                            "schema_version": 1,
+                            "scope": "full_callable",
+                            "tools": ["web_search", "read_file"],
+                        },
+                    }
+                }
+            },
+        )
+        self.assertIsNotNone(surface)
+        assert surface is not None
+        self.assertEqual(surface.tool_names, frozenset({"read_file", "web_search"}))
+
+    def test_tool_surface_metadata_rejects_malformed_namespace_envelopes(self) -> None:
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "version_missing"):
+            tool_surface_from_agent_capabilities(
+                "calendar",
+                {
+                    "_meta": {
+                        "signalHermesRouter": {
+                            "scope": "full_callable",
+                            "tools": ["read_file"],
+                        }
+                    }
+                },
+            )
+
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "scope_unsupported"):
+            tool_surface_from_agent_capabilities(
+                "calendar",
+                {
+                    "_meta": {
+                        "signalHermesRouter": {
+                            "schema_version": 1,
+                            "scope": "model_facing",
+                            "tools": ["read_file"],
+                        }
+                    }
+                },
+            )
+
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_invalid"):
+            tool_surface_from_agent_capabilities(
+                "calendar",
+                {
+                    "_meta": {
+                        "signalHermesRouter": {
+                            "schema_version": 1,
+                            "scope": "full_callable",
+                            "tools": ["read_file", 7],
+                        }
+                    }
+                },
+            )
+
+        with self.assertRaisesRegex(PreflightProbeUnavailable, "contract_ambiguous"):
+            tool_surface_from_agent_capabilities(
+                "calendar",
+                {
+                    "_meta": {
+                        "signalHermesRouter": {
+                            "schema_version": 1,
+                            "scope": "full_callable",
+                            "tools": ["read_file"],
+                        },
+                        "toolSurface": {
+                            "schema_version": 1,
+                            "scope": "full_callable",
+                            "tools": ["read_file"],
+                        },
+                    }
+                },
+            )
+
     def test_tool_surface_metadata_accepts_nested_and_named_shapes(self) -> None:
         surface = tool_surface_from_agent_capabilities(
             "calendar",
