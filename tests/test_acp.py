@@ -310,19 +310,37 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(PreflightProbeUnavailable, "probe_not_started"):
                 await profile.tool_surface()
 
-    async def test_acp_profile_tool_surface_rejects_unversioned_probe_result(self) -> None:
-        class LegacyPeer:
+    async def test_acp_profile_tool_surface_accepts_hermes_native_unversioned_response(self) -> None:
+        class HermesNativePeer:
             async def request(self, *_args, **_kwargs):
                 return {"tools": ["read_file"]}
 
         with tempfile.TemporaryDirectory() as tmp:
             profile = ACPProfile(profile="synthetic", work_root=Path(tmp))
-            profile.peer = LegacyPeer()  # type: ignore[assignment]
+            profile.peer = HermesNativePeer()  # type: ignore[assignment]
 
-            with self.assertRaisesRegex(
-                PreflightProbeUnavailable, "probe_contract_version_missing"
-            ):
-                await profile.tool_surface()
+            surface = await profile.tool_surface()
+
+        self.assertEqual(surface.tool_names, frozenset({"read_file"}))
+        self.assertEqual(surface.schema_version, 1)
+        self.assertEqual(surface.scope, "full_callable")
+        self.assertEqual(surface.source, "_tool_surface/list")
+
+    async def test_acp_profile_tool_surface_normalizes_hermes_native_response(self) -> None:
+        class HermesNativePeer:
+            async def request(self, *_args, **_kwargs):
+                return {"tools": ["read_file", "web_search"]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = ACPProfile(profile="synthetic", work_root=Path(tmp))
+            profile.peer = HermesNativePeer()  # type: ignore[assignment]
+
+            surface = await profile.tool_surface()
+
+        self.assertEqual(surface.tool_names, frozenset({"read_file", "web_search"}))
+        self.assertEqual(surface.schema_version, 1)
+        self.assertEqual(surface.scope, "full_callable")
+        self.assertEqual(surface.source, "_tool_surface/list")
 
     async def test_acp_profile_tool_surface_accepts_explicit_empty_surface(self) -> None:
         class EmptySurfacePeer:
