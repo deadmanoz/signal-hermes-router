@@ -30,11 +30,22 @@ notes or private artefacts that should survive source syncs but never be
 published in this repo.
 
 After syncing, run the host-side environment refresh without removing
-deployment-local tools:
+deployment-local tools. Resolve `uv` explicitly before invoking it: a systemd
+or non-interactive SSH shell may not source the user's PATH setup. The command
+below accepts an explicit `UV_BIN`, otherwise checks the normal PATH and the
+standard user-local installation path.
 
 ```bash
 cd /absolute/remote/service/path
-uv sync --locked --inexact
+UV_BIN="${UV_BIN:-$(command -v uv || true)}"
+if [ -z "$UV_BIN" ] && [ -x "$HOME/.local/bin/uv" ]; then
+  UV_BIN="$HOME/.local/bin/uv"
+fi
+if [ -z "$UV_BIN" ]; then
+  echo "uv is not available; install it or pass UV_BIN=/absolute/path/to/uv" >&2
+  exit 1
+fi
+"$UV_BIN" sync --locked --inexact
 ```
 
 The `--inexact` flag is intentional. The router supervises the `hermes` CLI at
@@ -56,6 +67,20 @@ A router built before this lock existed releases its file locks between
 writes, so that enforcement cannot protect a mixed-version overlap: when
 upgrading from such a version, confirm the old process has exited before
 starting the new one.
+
+For a release deployment, verify the selected source before sync and the
+installed package after restart. Do not infer the running version from the
+directory contents alone.
+
+```bash
+# On the deployment source checkout, before syncing it.
+git describe --tags --exact-match HEAD
+
+# On the host, after the service restart.
+/absolute/remote/service/path/.venv/bin/python -c \
+  'import importlib.metadata; print(importlib.metadata.version("signal-hermes-router"))'
+systemctl --user is-active signal-hermes-router
+```
 
 ## Hermes Subprocess Crash Detection
 
