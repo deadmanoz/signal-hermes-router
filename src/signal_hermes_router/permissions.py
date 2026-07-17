@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+
+LOGGER = logging.getLogger(__name__)
 
 # Tool names that are considered local-terminal/fs execution primitives.
 # These are defense-in-depth rejected on mcp_only routes via StaticPermissionPolicy.
@@ -123,6 +126,10 @@ class StaticPermissionPolicy:
             or ""
         )
         if self.mcp_only and is_local_tool(str(tool_name)):
+            LOGGER.info(
+                "mcp_only policy rejected local tool call: %s",
+                tool_name,
+            )
             return False
         raw_input = tool_call.get("rawInput") or tool_call.get("raw_input") or {}
         if not isinstance(raw_input, dict):

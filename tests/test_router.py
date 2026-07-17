@@ -2718,7 +2718,9 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             )
 
             await router.handle_event(make_event(timestamp=1))
-            # The policy handed to the session should have mcp_only=True
+            # Route.__post_init__ already syncs permission_policy.mcp_only from the
+            # route flag, so the router line is a no-op for route-level policies.
+            # The synthetic job test below exercises the router upgrade path.
             self.assertTrue(profile.policies[-1][1].mcp_only)
             # Verify the policy actually rejects a local tool
             self.assertFalse(profile.policies[-1][1].allows_tool_call({"toolName": "bash"}))
