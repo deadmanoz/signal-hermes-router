@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.32](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.31...v0.1.32) (2026-07-17)
+
+
+### Features
+
+* **permissions,preflight,router:** prevent MCP-only Signal routes from invoking local terminal tools ([#72](https://github.com/deadmanoz/signal-hermes-router/issues/72)) ([15709a4](https://github.com/deadmanoz/signal-hermes-router/commit/15709a4a4669e2b560e05ca9779ac7eaddc241a8))
+
 ## [0.1.31](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.30...v0.1.31) (2026-07-17)
 
 
