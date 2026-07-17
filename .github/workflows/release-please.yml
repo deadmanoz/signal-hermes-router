@@ -37,10 +37,52 @@ jobs:
             echo "sync_release_pr=true" >> "$GITHUB_OUTPUT"
             echo "skip_github_pull_request=false" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::$BASE_BRANCH advanced before release PR synchronization; skipping stale PR mutation"
+            echo "::warning::$BASE_BRANCH advanced before release PR synchronization; skipping stale PR mutation"
             echo "sync_release_pr=false" >> "$GITHUB_OUTPUT"
             echo "skip_github_pull_request=true" >> "$GITHUB_OUTPUT"
           fi
+
+      # Keep the stale no-op path from silently becoming a release-PR writer if
+      # the action input is ever removed or renamed. Do not draft here: a stale
+      # historical run must not strand a valid current PR in draft.
+      - name: Capture stale release PR state
+        id: stale_release_pr
+        if: ${{ steps.base_gate.outputs.sync_release_pr == 'false' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_BRANCH: ${{ github.ref_name }}
+        run: |
+          release_branch="release-please--branches--$BASE_BRANCH"
+          prs="$(gh pr list \
+            --repo "$REPO" \
+            --head "$release_branch" \
+            --base "$BASE_BRANCH" \
+            --state open \
+            --json number,headRefName,baseRefName,headRefOid,updatedAt,isCrossRepository)"
+          prs="$(printf '%s' "$prs" | jq '[.[] | select(.isCrossRepository == false)]')"
+          count="$(printf '%s' "$prs" | jq 'length')"
+          if [ "$count" -gt 1 ]; then
+            echo "found multiple stale release PR candidates for $BASE_BRANCH" >&2
+            exit 1
+          fi
+          if [ "$count" -eq 0 ]; then
+            echo "has_pr=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          number="$(printf '%s' "$prs" | jq -r '.[0].number')"
+          head_ref="$(printf '%s' "$prs" | jq -r '.[0].headRefName')"
+          base_ref="$(printf '%s' "$prs" | jq -r '.[0].baseRefName')"
+          head_sha="$(printf '%s' "$prs" | jq -r '.[0].headRefOid')"
+          updated_at="$(printf '%s' "$prs" | jq -r '.[0].updatedAt')"
+          if [ "$head_ref" != "$release_branch" ] || [ "$base_ref" != "$BASE_BRANCH" ] || [ -z "$number" ] || [ "$number" = "null" ] || [ -z "$head_sha" ] || [ "$head_sha" = "null" ] || [ -z "$updated_at" ] || [ "$updated_at" = "null" ]; then
+            echo "could not capture a canonical stale release PR state" >&2
+            exit 1
+          fi
+          echo "has_pr=true" >> "$GITHUB_OUTPUT"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "updated_at=$updated_at" >> "$GITHUB_OUTPUT"
 
       # Release Please opens new PRs as drafts. Existing ready release PRs must
       # also be drafted before an update so no reviewer can snapshot an
@@ -110,6 +152,30 @@ jobs:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           skip-github-pull-request: ${{ steps.base_gate.outputs.skip_github_pull_request }}
 
+      - name: Confirm stale run did not mutate release PR
+        if: ${{ steps.release.outcome == 'success' && steps.stale_release_pr.outputs.has_pr == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          PR_NUMBER: ${{ steps.stale_release_pr.outputs.number }}
+          EXPECTED_HEAD_SHA: ${{ steps.stale_release_pr.outputs.head_sha }}
+          EXPECTED_UPDATED_AT: ${{ steps.stale_release_pr.outputs.updated_at }}
+          REPO: ${{ github.repository }}
+          BASE_BRANCH: ${{ github.ref_name }}
+        run: |
+          release_branch="release-please--branches--$BASE_BRANCH"
+          details="$(gh pr view "$PR_NUMBER" \
+            --repo "$REPO" \
+            --json headRefName,baseRefName,headRefOid,updatedAt,isCrossRepository)"
+          head_ref="$(printf '%s' "$details" | jq -r .headRefName)"
+          base_ref="$(printf '%s' "$details" | jq -r .baseRefName)"
+          head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
+          updated_at="$(printf '%s' "$details" | jq -r .updatedAt)"
+          cross_repository="$(printf '%s' "$details" | jq -r .isCrossRepository)"
+          if [ "$cross_repository" != "false" ] || [ "$head_ref" != "$release_branch" ] || [ "$base_ref" != "$BASE_BRANCH" ] || [ "$head_sha" != "$EXPECTED_HEAD_SHA" ] || [ "$updated_at" != "$EXPECTED_UPDATED_AT" ]; then
+            echo "::error::stale release run changed a release PR despite skip-github-pull-request; leaving it as-is"
+            exit 1
+          fi
+
       # Resolve the PR identity once via jq on the raw `prs` string rather than
       # `fromJSON(...)` in a step `env:`. A step `env:` expression is evaluated
       # even when the step is skipped by `if:`, so `fromJSON` of the empty `prs`
@@ -127,6 +193,16 @@ jobs:
           PENDING_AUTO_MERGE: ${{ steps.pending_pr.outputs.auto_merge_enabled }}
           BASE_BRANCH: ${{ github.ref_name }}
         run: |
+          write_output() {
+            local key="$1"
+            local value="$2"
+            local delimiter="release-pr-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}"
+            {
+              printf '%s<<%s\n' "$key" "$delimiter"
+              printf '%s\n' "$value"
+              printf '%s\n' "$delimiter"
+            } >> "$GITHUB_OUTPUT"
+          }
           if [ "$PRS_CREATED" = "true" ]; then
             number="$(printf '%s' "$PRS_JSON" | jq -r '.[0].number')"
             branch="$(printf '%s' "$PRS_JSON" | jq -r '.[0].headBranchName')"
@@ -154,11 +230,11 @@ jobs:
             echo "could not resolve release PR identity from release output" >&2
             exit 1
           fi
-          echo "has_release_pr=true" >> "$GITHUB_OUTPUT"
-          echo "number=$number" >> "$GITHUB_OUTPUT"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-          echo "expected_title=$expected_title" >> "$GITHUB_OUTPUT"
-          echo "enable_auto_merge=$enable_auto_merge" >> "$GITHUB_OUTPUT"
+          write_output "has_release_pr" "true"
+          write_output "number" "$number"
+          write_output "branch" "$branch"
+          write_output "expected_title" "$expected_title"
+          write_output "enable_auto_merge" "$enable_auto_merge"
 
       # The canonical branch is drafted before Release Please runs regardless
       # of mutable title. Validate the complete PR identity separately before
@@ -197,12 +273,17 @@ jobs:
               exit 1
               ;;
           esac
-          if ! printf '%s\n' "$expected_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          if [[ "$expected_version" == *$'\n'* ]] || ! [[ "$expected_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::release PR title does not exactly match '${release_title_prefix}X.Y.Z'; leaving it draft"
             exit 1
           fi
-          echo "expected_version=$expected_version" >> "$GITHUB_OUTPUT"
-          echo "validated_title=$title" >> "$GITHUB_OUTPUT"
+          validated_title="${release_title_prefix}${expected_version}"
+          if [ "$title" != "$validated_title" ]; then
+            echo "::error::release PR title does not exactly match '${release_title_prefix}X.Y.Z'; leaving it draft"
+            exit 1
+          fi
+          printf 'expected_version=%s\n' "$expected_version" >> "$GITHUB_OUTPUT"
+          printf 'validated_title=%s\n' "$validated_title" >> "$GITHUB_OUTPUT"
 
       # Never merge a newer base into metadata generated for this run's SHA.
       # If main advances, the queued workflow run must regenerate the release.
@@ -496,7 +577,7 @@ jobs:
               --repo "$REPO" \
               --auto \
               --squash \
-              --subject "$VALIDATED_TITLE" \
+              --subject "$VALIDATED_TITLE (#$PR_NUMBER)" \
               --delete-branch \
               --match-head-commit "$validated_sha"
           fi

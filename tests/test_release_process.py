@@ -68,6 +68,7 @@ class ReleaseProcessTests(unittest.TestCase):
         )
         self.assertIn('echo "sync_release_pr=false"', gate_run)
         self.assertIn('echo "skip_github_pull_request=true"', gate_run)
+        self.assertIn("::warning::", gate_run)
         self.assertNotIn("exit 1", gate_run)
 
         harness = f"""
@@ -113,6 +114,66 @@ gh() {{
                 output_path.read_text(encoding="utf-8"),
                 "sync_release_pr=false\nskip_github_pull_request=true\n",
             )
+
+    def test_stale_release_pr_postcondition_rejects_a_mutation(self) -> None:
+        names = [step["name"] for step in self.steps]
+        capture = self.steps_by_name["Capture stale release PR state"]
+        confirm = self.steps_by_name["Confirm stale run did not mutate release PR"]
+        confirm_run = confirm["run"]
+
+        self.assertEqual(capture["if"], "${{ steps.base_gate.outputs.sync_release_pr == 'false' }}")
+        self.assertEqual(
+            confirm["if"],
+            "${{ steps.release.outcome == 'success' && steps.stale_release_pr.outputs.has_pr == 'true' }}",
+        )
+        self.assertLess(names.index("Run Release Please"), names.index(confirm["name"]))
+        self.assertIn("skip-github-pull-request", confirm_run)
+        self.assertIn("headRefName,baseRefName,headRefOid,updatedAt,isCrossRepository", confirm_run)
+        self.assertIn('[ "$updated_at" != "$EXPECTED_UPDATED_AT" ]', confirm_run)
+
+        harness = f"""
+set -e -o pipefail
+gh() {{
+  printf '{{"headRefName":"release-please--branches--%s","baseRefName":"%s","headRefOid":"%s","updatedAt":"%s","isCrossRepository":false}}\\n' "$BASE_BRANCH" "$BASE_BRANCH" "$LIVE_HEAD_SHA" "$LIVE_UPDATED_AT"
+}}
+{confirm_run}
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "github-output"
+            env = {
+                **os.environ,
+                "BASE_BRANCH": "main",
+                "EXPECTED_HEAD_SHA": "a1" * 20,
+                "EXPECTED_UPDATED_AT": "2026-07-17T12:00:00Z",
+                "GITHUB_OUTPUT": str(output_path),
+                "PR_NUMBER": "123",
+                "REPO": "example/repo",
+            }
+            current = subprocess.run(
+                ["bash", "-c", harness],
+                check=False,
+                capture_output=True,
+                env={
+                    **env,
+                    "LIVE_HEAD_SHA": env["EXPECTED_HEAD_SHA"],
+                    "LIVE_UPDATED_AT": env["EXPECTED_UPDATED_AT"],
+                },
+                text=True,
+            )
+            self.assertEqual(current.returncode, 0, current.stderr)
+
+            changed = subprocess.run(
+                ["bash", "-c", harness],
+                check=False,
+                capture_output=True,
+                env={
+                    **env,
+                    "LIVE_HEAD_SHA": "b2" * 20,
+                    "LIVE_UPDATED_AT": "2026-07-17T12:01:00Z",
+                },
+                text=True,
+            )
+            self.assertNotEqual(changed.returncode, 0)
 
     def test_existing_pending_pr_is_drafted_before_release_please_runs(self) -> None:
         capture = self.steps_by_name["Capture pending release PR state"]
@@ -170,9 +231,10 @@ gh() {{
             '[ "$head_ref" != "$release_branch" ]',
             '[ "$base_ref" != "$BASE_BRANCH" ]',
             '"$release_title_prefix"*',
-            "grep -Eq '^[0-9]+\\.[0-9]+\\.[0-9]+$'",
-            'echo "expected_version=$expected_version" >> "$GITHUB_OUTPUT"',
-            'echo "validated_title=$title" >> "$GITHUB_OUTPUT"',
+            '[[ "$expected_version" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]',
+            'validated_title="${release_title_prefix}${expected_version}"',
+            "printf 'expected_version=%s\\n' \"$expected_version\"",
+            "printf 'validated_title=%s\\n' \"$validated_title\"",
             '[ "$title" != "$EXPECTED_RELEASE_TITLE" ]',
         ):
             self.assertIn(expected, identity_run)
@@ -180,6 +242,74 @@ gh() {{
             identity["env"]["EXPECTED_RELEASE_TITLE"],
             "${{ steps.release_pr.outputs.expected_title }}",
         )
+
+    def test_release_pr_identity_enforces_an_exact_safe_title(self) -> None:
+        identity_run = self.steps_by_name["Validate release PR identity"]["run"]
+        harness = f"""
+set -e -o pipefail
+gh() {{
+  printf '{{"headRefName":"release-please--branches--%s","baseRefName":"%s","title":' "$BASE_BRANCH" "$BASE_BRANCH"
+  printf '%s' "$PR_TITLE" | jq -Rsc .
+  printf ',"isCrossRepository":false}}\\n'
+}}
+{identity_run}
+"""
+
+        def run_identity(
+            title: str, expected_title: str | None = None
+        ) -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory() as tmp:
+                output_path = Path(tmp) / "github-output"
+                return subprocess.run(
+                    ["bash", "-c", harness],
+                    check=False,
+                    capture_output=True,
+                    env={
+                        **os.environ,
+                        "BASE_BRANCH": "main",
+                        "EXPECTED_RELEASE_TITLE": title
+                        if expected_title is None
+                        else expected_title,
+                        "GITHUB_OUTPUT": str(output_path),
+                        "PR_NUMBER": "123",
+                        "PR_TITLE": title,
+                        "REPO": "example/repo",
+                    },
+                    text=True,
+                )
+
+        valid_title = "chore(main): release 0.1.31"
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "github-output"
+            valid = subprocess.run(
+                ["bash", "-c", harness],
+                check=False,
+                capture_output=True,
+                env={
+                    **os.environ,
+                    "BASE_BRANCH": "main",
+                    "EXPECTED_RELEASE_TITLE": valid_title,
+                    "GITHUB_OUTPUT": str(output_path),
+                    "PR_NUMBER": "123",
+                    "PR_TITLE": valid_title,
+                    "REPO": "example/repo",
+                },
+                text=True,
+            )
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            self.assertEqual(
+                output_path.read_text(encoding="utf-8"),
+                "expected_version=0.1.31\nvalidated_title=chore(main): release 0.1.31\n",
+            )
+
+        for title, expected_title in (
+            ("chore(main): release 0.1.31-rc1", None),
+            ("chore(main): release 0.1.31 extra", None),
+            ("chore(main): release 0.1.31\nvalidated_title=attacker", None),
+            (valid_title, "chore(main): release 0.1.32"),
+        ):
+            result = run_identity(title, expected_title)
+            self.assertNotEqual(result.returncode, 0, result.stderr)
 
     def test_pending_pr_noop_enters_full_validation_and_recovers_draft(self) -> None:
         resolve = self.steps_by_name["Resolve release PR number"]
@@ -196,11 +326,11 @@ gh() {{
             "expected_title=\"$(printf '%s' \"$PRS_JSON\" | jq -r '.[0].title')\"", resolve_run
         )
         self.assertIn('expected_title=""', resolve_run)
-        self.assertIn('echo "expected_title=$expected_title" >> "$GITHUB_OUTPUT"', resolve_run)
+        self.assertIn('write_output "expected_title" "$expected_title"', resolve_run)
         self.assertIn('if [ "$PENDING_WAS_READY" = "true" ]', resolve_run)
         self.assertIn('enable_auto_merge="$PENDING_AUTO_MERGE"', resolve_run)
         self.assertIn('enable_auto_merge="true"', resolve_run)
-        self.assertIn('echo "has_release_pr=true"', resolve_run)
+        self.assertIn('write_output "has_release_pr" "true"', resolve_run)
 
         for name in (
             "Validate release PR identity",
@@ -509,8 +639,78 @@ gh() {{
         self.assertIn('if [ "$ENABLE_AUTO_MERGE" = "true" ]', publish_run)
         self.assertIn('--match-head-commit "$validated_sha"', publish_run)
         merge_run = publish_run[publish_run.index('gh pr merge "$PR_NUMBER"') :]
-        self.assertIn('--subject "$VALIDATED_TITLE"', merge_run)
+        self.assertIn('--subject "$VALIDATED_TITLE (#$PR_NUMBER)"', merge_run)
         self.assertNotIn("--body", merge_run)
+
+    def test_publish_revalidates_identity_before_auto_merge(self) -> None:
+        publish_run = self.steps_by_name["Publish validated release PR"]["run"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            call_log = Path(tmp) / "gh-calls.log"
+            harness = f"""
+set -e -o pipefail
+git() {{
+  printf '%s\\n' "$VALIDATED_SHA"
+}}
+gh() {{
+  printf '%s\\n' "$*" >> "$CALL_LOG"
+  if [[ "$*" == "pr merge --help" ]]; then
+    printf '%s\\n' '--match-head-commit'
+  elif [[ "$*" == *"protection/required_status_checks"* ]]; then
+    printf 'true\\n'
+  elif [[ "$*" == *"commits/$BASE_BRANCH"* ]]; then
+    printf '%s\\n' "$VALIDATED_SHA"
+  elif [[ "$*" == *"/compare/"* ]]; then
+    printf '0\\n'
+  elif [[ "$*" == *"--json headRefName,baseRefName,title,isCrossRepository,headRefOid"* ]]; then
+    printf '{{"headRefName":"release-please--branches--%s","baseRefName":"%s","title":"%s","isCrossRepository":false,"headRefOid":"%s"}}\\n' "$BASE_BRANCH" "$BASE_BRANCH" "$VALIDATED_TITLE" "$VALIDATED_SHA"
+  elif [[ "$*" == *"--json headRefOid,headRefName,baseRefName,title,isCrossRepository,mergeable"* ]]; then
+    printf '{{"headRefOid":"%s","headRefName":"release-please--branches--%s","baseRefName":"%s","title":"%s","isCrossRepository":false,"mergeable":"MERGEABLE"}}\\n' "$VALIDATED_SHA" "$BASE_BRANCH" "$BASE_BRANCH" "$VALIDATED_TITLE"
+  elif [[ "$*" == *"--json headRefOid,mergeable"* ]]; then
+    printf '{{"headRefOid":"%s","mergeable":"MERGEABLE"}}\\n' "$VALIDATED_SHA"
+  elif [[ "$*" == *"--json headRefOid --jq .headRefOid"* ]]; then
+    printf '%s\\n' "$VALIDATED_SHA"
+  fi
+}}
+{publish_run}
+"""
+            env = {
+                **os.environ,
+                "APPROVAL_TOKEN": "approval-token",
+                "BASE_BRANCH": "main",
+                "CALL_LOG": str(call_log),
+                "ENABLE_AUTO_MERGE": "true",
+                "EXPECTED_BASE_SHA": "a1" * 20,
+                "PR_NUMBER": "123",
+                "REPO": "example/repo",
+                "VALIDATED_SHA": "a1" * 20,
+                "VALIDATED_TITLE": "chore(main): release 0.1.31",
+            }
+            result = subprocess.run(
+                ["bash", "-c", harness],
+                check=False,
+                capture_output=True,
+                env=env,
+                text=True,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"{result.stdout}\n{result.stderr}\n{call_log.read_text(encoding='utf-8')}",
+            )
+            calls = call_log.read_text(encoding="utf-8")
+            final_identity = (
+                "pr view 123 --repo example/repo --json "
+                "headRefOid,headRefName,baseRefName,title,isCrossRepository,mergeable\n"
+            )
+            self.assertIn(final_identity, calls)
+            self.assertIn(
+                "pr merge 123 --repo example/repo --auto --squash "
+                "--subject chore(main): release 0.1.31 (#123) --delete-branch "
+                f"--match-head-commit {env['VALIDATED_SHA']}\n",
+                calls,
+            )
 
     def test_publish_failure_after_ready_redrafts_pr(self) -> None:
         publish_run = self.steps_by_name["Publish validated release PR"]["run"]

@@ -79,6 +79,12 @@ class ReleaseHeadValidationTests(unittest.TestCase):
             MODULE.validate_release_head(self.base, self.head, "0.1.29"),
         )
 
+    def test_rejects_non_numeric_expected_version(self) -> None:
+        self.assertIn(
+            "expected release version must use numeric X.Y.Z form",
+            MODULE.validate_release_head(self.base, self.head, "0.1.28-rc1"),
+        )
+
     def test_rejects_multiple_prepended_release_sections(self) -> None:
         extra_section = (
             "## [0.1.29](https://github.com/example/project/compare/v0.1.28...v0.1.29) "
