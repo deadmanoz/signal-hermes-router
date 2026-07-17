@@ -199,6 +199,44 @@ gh() {
         non_canonical, _ = run_step(capture_run, [malformed], {})
         self.assertNotEqual(non_canonical.returncode, 0)
 
+        verify_input = self.steps_by_name["Verify stale Release Please input"]
+        self.assertEqual(
+            verify_input["if"], "${{ steps.base_gate.outputs.sync_release_pr == 'false' }}"
+        )
+        self.assertEqual(
+            verify_input["env"]["RELEASE_PLEASE_ACTION_REF"],
+            "45996ed1f6d02564a971a2fa1b5860e934307cf7",
+        )
+        self.assertIn(
+            "repos/googleapis/release-please-action/contents/action.yml?ref=$RELEASE_PLEASE_ACTION_REF",
+            verify_input["run"],
+        )
+
+        def run_input_check(action_yaml: str) -> subprocess.CompletedProcess[str]:
+            harness = f"""
+set -e -o pipefail
+gh() {{
+  printf '%s' "$ACTION_YAML"
+}}
+{verify_input["run"]}
+"""
+            return subprocess.run(
+                ["bash", "-c", harness],
+                check=False,
+                capture_output=True,
+                env={**os.environ, "ACTION_YAML": action_yaml},
+                text=True,
+            )
+
+        supported_input = run_input_check(
+            "name: release-please-action\ninputs:\n  skip-github-pull-request:\n    default: false\nruns:\n  using: node24\n"
+        )
+        self.assertEqual(supported_input.returncode, 0, supported_input.stderr)
+        missing_input = run_input_check(
+            "name: release-please-action\ninputs:\n  skip-github-release:\n    default: false\nruns:\n  using: node24\n"
+        )
+        self.assertNotEqual(missing_input.returncode, 0, missing_input.stderr)
+
         existing, _ = run_step(
             confirm_run,
             [canonical_pr],
@@ -224,6 +262,32 @@ gh() {
             },
         )
         self.assertNotEqual(changed.returncode, 0)
+
+        drafted, _ = run_step(
+            confirm_run,
+            [{**canonical_pr, "isDraft": True}],
+            {
+                "HAD_RELEASE_PR": "true",
+                "EXPECTED_PR_NUMBER": "123",
+                "EXPECTED_HEAD_SHA": "a1" * 20,
+                "EXPECTED_IS_DRAFT": "false",
+                "EXPECTED_TITLE": "chore(main): release 0.1.31",
+            },
+        )
+        self.assertNotEqual(drafted.returncode, 0)
+
+        replaced, _ = run_step(
+            confirm_run,
+            [{**canonical_pr, "number": 124}],
+            {
+                "HAD_RELEASE_PR": "true",
+                "EXPECTED_PR_NUMBER": "123",
+                "EXPECTED_HEAD_SHA": "a1" * 20,
+                "EXPECTED_IS_DRAFT": "false",
+                "EXPECTED_TITLE": "chore(main): release 0.1.31",
+            },
+        )
+        self.assertNotEqual(replaced.returncode, 0)
 
         retitled, _ = run_step(
             confirm_run,

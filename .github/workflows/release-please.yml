@@ -44,7 +44,8 @@ jobs:
 
       # Keep the stale no-op path from silently becoming a release-PR writer if
       # the action input is ever removed or renamed. Do not draft here: a stale
-      # historical run must not strand a valid current PR in draft.
+      # historical run must not strand a valid current PR in draft. Invalid
+      # stale state fails closed before either the tag/release or PR half runs.
       - name: Capture stale release PR state
         id: stale_release_pr
         if: ${{ steps.base_gate.outputs.sync_release_pr == 'false' }}
@@ -90,6 +91,28 @@ jobs:
             printf '%s\n' "$title"
             printf '%s\n' "$title_delimiter"
           } >> "$GITHUB_OUTPUT"
+
+      # GitHub Actions only warns about unknown `with` inputs. Before a stale
+      # run reaches the action, verify that this exact pinned revision still
+      # declares the input that suppresses its PR-mutating half.
+      - name: Verify stale Release Please input
+        if: ${{ steps.base_gate.outputs.sync_release_pr == 'false' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          RELEASE_PLEASE_ACTION_REF: 45996ed1f6d02564a971a2fa1b5860e934307cf7
+        run: |
+          action_yaml="$(gh api \
+            -H 'Accept: application/vnd.github.raw' \
+            "repos/googleapis/release-please-action/contents/action.yml?ref=$RELEASE_PLEASE_ACTION_REF")"
+          if ! printf '%s\n' "$action_yaml" | awk '
+            $0 == "inputs:" { in_inputs = 1; next }
+            in_inputs && /^[^[:space:]]/ { exit }
+            in_inputs && /^  skip-github-pull-request:/ { found = 1 }
+            END { exit !found }
+          '; then
+            echo "::error::pinned Release Please action does not declare skip-github-pull-request"
+            exit 1
+          fi
 
       # Release Please opens new PRs as drafts. Existing ready release PRs must
       # also be drafted before an update so no reviewer can snapshot an
