@@ -101,10 +101,15 @@ SHUTDOWN_SUPERVISOR_FLOOR_SECONDS = 10.0
 SHUTDOWN_CLEANUP_CANCEL_GRACE_SECONDS = 1.0
 # How long a config-reload profile retire waits for in-flight turns on the
 # affected routes before closing the orphaned Hermes subprocess anyway.
-# Bounded like the shutdown drain: a wedged turn must not pin a retired
-# profile forever; closing under it fails that turn through the normal
-# broken-pipe path instead. A code constant by design, not configuration.
+# This is a FLOOR: the effective bound tracks the supervisor's prompt
+# timeout (300s by default) plus RELOAD_RETIRE_DRAIN_MARGIN_SECONDS so a
+# healthy long-running prompt is waited out; the floor only serves
+# supervisors that do not expose a timeout (test doubles). Bounded like the
+# shutdown drain: a genuinely wedged turn must not pin a retired profile
+# forever; closing under it fails that turn through the normal broken-pipe
+# path instead. Code constants by design, not configuration.
 RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS = 15.0
+RELOAD_RETIRE_DRAIN_MARGIN_SECONDS = 30.0
 # Retention sweep deletions run on the event loop (so the pre-unlink mtime
 # recheck cannot interleave with media writes) in bounded batches with a
 # yield in between; this bounds each uninterrupted loop slice. A code
@@ -189,6 +194,10 @@ class SignalHermesRouter:
         self._last_success_ms: dict[str, int] = {}
         self._last_failures: dict[str, tuple[int, FailureInfo]] = {}
         self._route_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # Serializes concurrent reload_config control calls: without it, a
+        # slower first parse could finish after a faster second one and swap
+        # its older candidate over the newer config.
+        self._reload_lock = asyncio.Lock()
         self._profile_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._inbound_rate_buckets: dict[tuple[str, float, float], TokenBucket] = {}
         self._last_busy_notice_ms: dict[str, int] = {}
@@ -1767,6 +1776,15 @@ class SignalHermesRouter:
     async def _handle_reload_config_control(
         self, payload: dict[str, Any]
     ) -> dict[str, Any]:
+        # Serialize concurrent reloads: two control clients racing parse ->
+        # swap must apply in command order, or the slower parse could swap
+        # its older candidate over the newer config.
+        async with self._reload_lock:
+            return await self._reload_config_locked(payload)
+
+    async def _reload_config_locked(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         if self._config_paths is None:
             return {
                 "status": TurnOutcomeStatus.ERROR.value,
@@ -1794,11 +1812,14 @@ class SignalHermesRouter:
             # whole process. Only the validated swap happens on the loop.
             candidate = await asyncio.to_thread(load_app_config, config_path, routes_path)
         except Exception as exc:
+            # Never log the traceback here (no exc_info): validation errors
+            # can embed raw candidate route identifiers (a duplicate-key
+            # error names signal:<group_id>) and the rejected candidate was
+            # never registered with the redactor, so it could not be masked.
             LOGGER.error(
                 "config reload rejected: parse/validation failed: %s",
                 self.redactor.redact(exc.__class__.__name__),
             )
-            LOGGER.debug("config reload rejection details", exc_info=True)
             return {
                 "status": TurnOutcomeStatus.ERROR.value,
                 "error": "config_invalid",
@@ -1901,45 +1922,68 @@ class SignalHermesRouter:
 
         A tracked background task first waits (bounded) for in-flight turns
         on every non-live route to drain, then evicts sessions cached for
-        routes that can no longer prompt and retires cached Hermes profile
-        subprocesses with no remaining active route. Eviction must NOT happen
-        synchronously here: an in-flight turn on a just-reloaded route is
-        still streaming its reply through the cached session, and releasing
-        that session mid-prompt silently truncates the reply.
+        routes that can no longer prompt (or whose session policy changed),
+        and retires cached Hermes profile subprocesses with no remaining
+        active route. Eviction must NOT happen synchronously here: an
+        in-flight turn on a just-reloaded route is still streaming its reply
+        through the cached session, and releasing that session mid-prompt
+        silently truncates the reply. The task is scheduled whenever any
+        route key ever seen is no longer active — even with nothing cached
+        yet — because a turn admitted just before the swap can still be in
+        its pre-lock awaits and will create its session/profile for a
+        no-longer-active route; only the post-drain re-validation catches it.
         """
-        del old_config  # drain scope is recomputed from live state at run time
         live_now = {
             route.key for route in new_config.routes if route.state == RouteState.ACTIVE
         }
-        live_profiles = {
-            route.profile for route in new_config.routes if route.state == RouteState.ACTIVE
+        old_by_key = {route.key: route for route in old_config.routes}
+        # Sessions for a still-active route whose session_policy changed are
+        # unreachable under the new keying; they are evicted by the reap too.
+        policy_changed_keys = {
+            route.key
+            for route in new_config.routes
+            if route.key in old_by_key
+            and old_by_key[route.key].session_policy != route.session_policy
         }
-        if (
-            all(name in live_profiles for name in self.supervisor.cached_profile_names())
-            and not self.sessions.has_sessions_outside(live_now)
-        ):
+        has_retired_keys = any(
+            key not in live_now for key in self._route_profile_tombstones
+        )
+        if not policy_changed_keys and not has_retired_keys:
             return
-        task = asyncio.ensure_future(self._reap_after_drain())
+        task = asyncio.ensure_future(self._reap_after_drain(policy_changed_keys))
         self._signal_turn_tasks.add(task)
         task.add_done_callback(self._settle_tracked_task)
 
-    async def _reap_after_drain(self) -> None:
+    def _reap_drain_seconds(self) -> float:
+        # Wait out healthy turns, not just fast ones: a normal prompt may run
+        # up to the supervisor's prompt timeout (300s by default), so the
+        # drain bound tracks it plus a margin. The constant floor covers
+        # supervisors that do not expose a timeout (test doubles).
+        prompt_timeout = getattr(self.supervisor, "prompt_timeout_seconds", None)
+        if not prompt_timeout:
+            return RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS
+        return max(
+            RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS,
+            prompt_timeout + RELOAD_RETIRE_DRAIN_MARGIN_SECONDS,
+        )
+
+    async def _reap_after_drain(self, policy_changed_keys: set[str]) -> None:
         # In-flight turns captured their Route (and its profile/session
         # bindings) before the swap. Drain the route locks of EVERY route key
         # ever seen that is not live right now — not just the keys this
         # reload touched: the evict/retire below is global, so the drain must
         # be global too, or a later reload's reap could cut down a session an
         # earlier reload's reap was still waiting out. The wait is bounded
-        # (see RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS): a wedged turn must not
-        # pin retired runtime state forever; closing under it fails that turn
-        # through the normal broken-pipe path.
+        # (see _reap_drain_seconds): a wedged turn must not pin retired
+        # runtime state forever; closing under it fails that turn through the
+        # normal broken-pipe path.
         live_now = {
             route.key for route in self.config.routes if route.state == RouteState.ACTIVE
         }
         drain_keys = sorted(
             key for key in self._route_profile_tombstones if key not in live_now
         )
-        deadline = time.monotonic() + RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS
+        deadline = time.monotonic() + self._reap_drain_seconds()
         for key in drain_keys:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1964,9 +2008,13 @@ class SignalHermesRouter:
         evicted = self.sessions.drop_sessions_not_in(
             {route.key for route in live_routes}
         )
+        # Policy-changed keys are live routes, so they are disjoint from the
+        # non-live eviction above.
+        evicted += self.sessions.drop_sessions_for_keys(policy_changed_keys)
         if evicted:
             LOGGER.info(
-                "config reload evicted %d cached session(s) for routes no longer active",
+                "config reload evicted %d cached session(s) for routes no longer "
+                "active or whose session policy changed",
                 evicted,
             )
         live_profiles = {route.profile for route in live_routes}

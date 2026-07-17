@@ -5204,6 +5204,261 @@ routes:
             self.assertEqual(harness.supervisor.retired, ["p1", "p2"])
             self.assertEqual(harness.router.sessions._sessions, {})
 
+    async def test_reload_config_serializes_concurrent_reloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: new-route
+    platform: signal
+    group_id: new-group
+    profile: new-profile
+    state: active
+""",
+                encoding="utf-8",
+            )
+            harness = make_router_harness(tmp)
+            harness.router._config_paths = (config_path, routes_path)
+
+            # A second reload cannot start its parse while one is in flight:
+            # without serialization the slower parse could swap its older
+            # candidate over the newer config.
+            await harness.router._reload_lock.acquire()
+            task = asyncio.create_task(harness.router._handle_reload_config_control({}))
+            try:
+                await asyncio.sleep(0.05)
+                self.assertFalse(task.done())
+            finally:
+                harness.router._reload_lock.release()
+            response = await task
+            self.assertEqual(response["status"], "ok")
+
+    async def test_reload_config_rejection_logging_omits_traceback_and_identifiers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            # A duplicate route key makes validation fail with a message that
+            # embeds the raw signal:<group_id> identifier.
+            routes_path.write_text(
+                """
+routes:
+  - name: dup-one
+    platform: signal
+    group_id: dup-group
+    profile: p
+    state: active
+  - name: dup-two
+    platform: signal
+    group_id: dup-group
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            harness = make_router_harness(tmp)
+            harness.router._config_paths = (config_path, routes_path)
+            with self.assertLogs("signal_hermes_router.router", level="DEBUG") as captured:
+                response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["error"], "config_invalid")
+            # The rejected candidate's identifiers were never registered with
+            # the redactor, so no log record may carry a traceback or the raw
+            # identifier at any level.
+            for record in captured.records:
+                self.assertIsNone(record.exc_info)
+                self.assertNotIn("dup-group", record.getMessage())
+
+    async def test_reload_config_reaps_late_session_from_pre_lock_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: late-route
+    platform: signal
+    group_id: group-one
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            route = harness.router.config.find_route_by_name("late-route")
+            assert route is not None
+            # A turn admitted just before the swap still holds the route lock
+            # through its pre-session awaits.
+            lock = harness.router._route_locks[route.key]
+            await lock.acquire()
+            try:
+                routes_path.write_text(
+                    """
+routes:
+  - name: late-route
+    platform: signal
+    group_id: group-one
+    profile: p
+    state: disabled
+""",
+                    encoding="utf-8",
+                )
+                response = await harness.router._handle_reload_config_control({})
+                self.assertEqual(response["status"], "ok")
+                # Nothing is cached yet, but the reap must still be scheduled:
+                # only its post-drain re-validation can catch the session the
+                # admitted turn is about to create.
+                tasks = [t for t in harness.router._signal_turn_tasks if not t.done()]
+                self.assertEqual(len(tasks), 1)
+                await asyncio.sleep(0.02)
+                # The admitted turn creates its session and profile while the
+                # reap is still waiting on the lock.
+                harness.supervisor.cached.append("p")
+                from signal_hermes_router.sessions import RoutedSession
+                harness.router.sessions._sessions["sk"] = RoutedSession(
+                    profile=harness.profile,  # type: ignore[arg-type]
+                    session_id="session-1",
+                    cwd=Path(tmp) / "work" / "sk",
+                )
+                harness.router.sessions._session_routes["sk"] = route.key
+            finally:
+                lock.release()
+
+            await asyncio.gather(*tasks)
+            self.assertEqual(harness.router.sessions._sessions, {})
+            self.assertEqual(harness.profile.released_session_ids, ["session-1"])
+            self.assertEqual(harness.supervisor.retired, ["p"])
+
+    async def test_reload_config_evicts_sessions_on_session_policy_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: policy-route
+    platform: signal
+    group_id: group-one
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            route = harness.router.config.find_route_by_name("policy-route")
+            assert route is not None
+            from signal_hermes_router.sessions import RoutedSession
+            harness.router.sessions._sessions["sk"] = RoutedSession(
+                profile=harness.profile,  # type: ignore[arg-type]
+                session_id="session-1",
+                cwd=Path(tmp) / "work" / "sk",
+            )
+            harness.router.sessions._session_routes["sk"] = route.key
+
+            # The route stays active but switches to ephemeral sessions: the
+            # persistent session cached under the old keying is unreachable.
+            routes_path.write_text(
+                """
+routes:
+  - name: policy-route
+    platform: signal
+    group_id: group-one
+    profile: p
+    state: active
+    session_policy: ephemeral
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            tasks = [t for t in harness.router._signal_turn_tasks if not t.done()]
+            self.assertEqual(len(tasks), 1)
+            await asyncio.gather(*tasks)
+            self.assertEqual(harness.router.sessions._sessions, {})
+            self.assertEqual(harness.profile.released_session_ids, ["session-1"])
+            reloaded = harness.router.config.find_route_by_name("policy-route")
+            self.assertEqual(reloaded.state, RouteState.ACTIVE)
+            self.assertEqual(reloaded.session_policy, SessionPolicy.EPHEMERAL)
+            # The route is still active: the profile is not retired.
+            self.assertEqual(harness.supervisor.retired, [])
+
+    def test_reap_drain_seconds_tracks_prompt_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = make_router_harness(tmp)
+            # Supervisors without a prompt timeout (test doubles) get the floor.
+            self.assertEqual(
+                harness.router._reap_drain_seconds(),
+                router_module.RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS,
+            )
+            # A healthy prompt may run up to the configured timeout; the reap
+            # must wait it out plus a margin rather than closing under it.
+            harness.supervisor.prompt_timeout_seconds = 300.0
+            self.assertEqual(
+                harness.router._reap_drain_seconds(),
+                300.0 + router_module.RELOAD_RETIRE_DRAIN_MARGIN_SECONDS,
+            )
+
     async def test_control_socket_refuses_non_socket_path_and_removes_stale_socket(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = Route(

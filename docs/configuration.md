@@ -138,17 +138,28 @@ inconsistent:
 - **Retired-route cleanup**: Routes that can no longer prompt after a reload
   (reloaded to `shadow`/`disabled`/`maintenance`, or removed) have their
   cached sessions evicted, and a Hermes profile left with no remaining active
-  route has its cached subprocess closed. Both happen only after in-flight
-  turns on the affected routes drain (bounded wait; a wedged turn fails
-  through the normal broken-pipe path instead of pinning retired state
-  forever), so a reload never truncates an in-progress reply. Profiles and
-  sessions for routes that stayed active are untouched.
+  route has its cached subprocess closed. Still-active routes whose
+  `session_policy` changed have their now-unreachable cached sessions evicted
+  too. All of this happens only after in-flight turns on the affected routes
+  drain — the reap is scheduled whenever any known route key leaves the
+  active set, so a turn admitted just before the swap (still creating its
+  session in its pre-lock awaits) is caught as well. The drain bound tracks
+  the supervisor's prompt timeout plus a margin, so a healthy long-running
+  prompt is always waited out; only a genuinely wedged turn fails through
+  the normal broken-pipe path. Profiles and sessions for routes that stayed
+  active (with unchanged policy) are untouched.
 - **Breaker-override coherence**: A stale circuit-breaker `MAINTENANCE`
   override is cleared when the route's configured state becomes anything
   other than `active`, so a reloaded `shadow`/`disabled` route applies
   immediately instead of sending maintenance replies. An override on a route
   that stayed `active` survives — reload never silently resets a tripped
   breaker; normal recovery clears it.
+- **Serialized application**: Concurrent `reload-config` calls apply in
+  command order — a slower candidate parse can never swap its older
+  candidate over a newer configuration.
+- **Redacted rejection logging**: A rejected candidate's route identifiers
+  were never registered with the redactor, so rejection logging reports only
+  the exception class and never emits a traceback at any log level.
 - **Orphaned rate-limit cleanup**: Rate-limit buckets for removed routes are
   pruned; active-route buckets survive the reload.
 - **Redaction continuity**: Route identifiers from both old and new

@@ -373,9 +373,23 @@ class SessionRegistry:
         Sessions for routes that stayed configured-active are kept, including
         ones currently under a breaker override — the route prompts again as
         soon as the breaker recovers."""
+        return self._drop_sessions_matching(
+            lambda route_key: route_key not in live_route_keys
+        )
+
+    def drop_sessions_for_keys(self, route_keys: set[str]) -> int:
+        """Evict cached sessions belonging to the given route keys, releasing
+        per-session state on the owning profile. Returns the number evicted.
+        Used by config reload for still-active routes whose session_policy
+        changed: their cached sessions are unreachable under the new keying."""
+        return self._drop_sessions_matching(
+            lambda route_key: route_key in route_keys
+        )
+
+    def _drop_sessions_matching(self, predicate: Callable[[str], bool]) -> int:
         evicted = 0
         for session_key, route_key in list(self._session_routes.items()):
-            if route_key in live_route_keys:
+            if not predicate(route_key):
                 continue
             session = self._sessions.pop(session_key, None)
             self._session_routes.pop(session_key, None)
