@@ -98,12 +98,15 @@ jobs:
       - name: Verify stale Release Please input
         if: ${{ steps.base_gate.outputs.sync_release_pr == 'false' }}
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_PLEASE_ACTION_REF: 45996ed1f6d02564a971a2fa1b5860e934307cf7
         run: |
-          action_yaml="$(gh api \
+          if ! action_yaml="$(gh api \
             -H 'Accept: application/vnd.github.raw' \
-            "repos/googleapis/release-please-action/contents/action.yml?ref=$RELEASE_PLEASE_ACTION_REF")"
+            "repos/googleapis/release-please-action/contents/action.yml?ref=$RELEASE_PLEASE_ACTION_REF")"; then
+            echo "::error::could not fetch the pinned Release Please action metadata"
+            exit 1
+          fi
           if ! printf '%s\n' "$action_yaml" | awk '
             $0 == "inputs:" { in_inputs = 1; next }
             in_inputs && /^[^[:space:]]/ { exit }

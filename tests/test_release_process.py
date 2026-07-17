@@ -219,16 +219,25 @@ gh() {
             .removeprefix("googleapis/release-please-action@")
             .split(maxsplit=1)[0],
         )
+        self.assertEqual(
+            verify_input["env"]["GH_TOKEN"],
+            "${{ secrets.GITHUB_TOKEN }}",
+        )
         self.assertLess(names.index(verify_input["name"]), names.index("Run Release Please"))
         self.assertIn(
             "repos/googleapis/release-please-action/contents/action.yml?ref=$RELEASE_PLEASE_ACTION_REF",
             verify_input["run"],
         )
 
-        def run_input_check(action_yaml: str) -> subprocess.CompletedProcess[str]:
+        def run_input_check(
+            action_yaml: str, *, fetch_succeeds: bool = True
+        ) -> subprocess.CompletedProcess[str]:
             harness = f"""
 set -e -o pipefail
 gh() {{
+  if [ "$FETCH_SUCCEEDS" != "true" ]; then
+    return 1
+  fi
   printf '%s' "$ACTION_YAML"
 }}
 {verify_input["run"]}
@@ -237,7 +246,11 @@ gh() {{
                 ["bash", "-c", harness],
                 check=False,
                 capture_output=True,
-                env={**os.environ, "ACTION_YAML": action_yaml},
+                env={
+                    **os.environ,
+                    "ACTION_YAML": action_yaml,
+                    "FETCH_SUCCEEDS": str(fetch_succeeds).lower(),
+                },
                 text=True,
             )
 
@@ -252,6 +265,12 @@ gh() {{
             "name: release-please-action\ninputs:\n  skip-github-release:\n    default: false\nruns:\n  using: node24\n"
         )
         self.assertNotEqual(missing_input.returncode, 0, missing_input.stderr)
+        unavailable_input = run_input_check(action_fixture, fetch_succeeds=False)
+        self.assertNotEqual(unavailable_input.returncode, 0)
+        self.assertIn(
+            "could not fetch the pinned Release Please action metadata",
+            unavailable_input.stdout,
+        )
 
         existing, _ = run_step(
             confirm_run,

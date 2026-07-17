@@ -1,5 +1,6 @@
 # Relevant snapshot of googleapis/release-please-action action.yml at
 # 45996ed1f6d02564a971a2fa1b5860e934307cf7 (v5.0.0), retrieved 2026-07-17.
+# This is parser test data: re-fetch it from the action revision when its pin changes.
 name: 'release-please-action'
 description: 'automated releases based on conventional commits'
 author: Google LLC
