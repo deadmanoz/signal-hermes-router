@@ -117,8 +117,11 @@ inconsistent:
 
 ### Safety guarantees
 
-- **Parse-before-swap**: The candidate file is fully parsed and validated
-  before any runtime state changes.
+- **Parse-before-swap, off the event loop**: The candidate file is fully
+  parsed and validated in a worker thread before any runtime state changes,
+  so a slow secret resolver (e.g. `op://`) or filesystem cannot stall Signal
+  event handling, control responses, or ACP timeouts. Only the validated
+  swap happens on the event loop.
 - **Routes-only**: Only routes, scheduled jobs, and notification definitions
   may change on reload. Router-level settings remain bound to startup values.
 - **Profile stability for existing routes**: A route key that already exists
@@ -132,9 +135,19 @@ inconsistent:
   await boundaries, so a reload during an active turn can observe a mix of old
   and new values for those fields. In practice this is safe because the
   router-level settings are rejected from changing (see Routes-only above).
-- **No session disruption**: Existing ACP sessions and the profile supervisor
-  are not restarted; new routes simply acquire sessions through the normal
-  registry path.
+- **Retired-route cleanup**: Routes that can no longer prompt after a reload
+  (reloaded to `shadow`/`disabled`/`maintenance`, or removed) have their
+  cached sessions evicted. A Hermes profile left with no remaining active
+  route has its cached subprocess closed once in-flight turns on the affected
+  routes drain (bounded wait; a wedged turn fails through the normal
+  broken-pipe path instead of pinning the profile forever). Profiles and
+  sessions for routes that stayed active are untouched.
+- **Breaker-override coherence**: A stale circuit-breaker `MAINTENANCE`
+  override is cleared when the route's configured state becomes anything
+  other than `active`, so a reloaded `shadow`/`disabled` route applies
+  immediately instead of sending maintenance replies. An override on a route
+  that stayed `active` survives — reload never silently resets a tripped
+  breaker; normal recovery clears it.
 - **Orphaned rate-limit cleanup**: Rate-limit buckets for removed routes are
   pruned; active-route buckets survive the reload.
 - **Redaction continuity**: Route identifiers from both old and new
