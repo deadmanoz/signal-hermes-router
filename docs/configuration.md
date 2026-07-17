@@ -63,6 +63,91 @@ from the router's perspective and is not created or chmodded by the router.
   when control is enabled and no explicit path is set) - local Unix socket
   used by `signal-hermes-router trigger-job` and `notify-route` to ask the
   running router to inject a configured synthetic turn.
+
+## Live configuration reload (routes only)
+
+The router can reload its `routes.yaml` without restarting the process. This is
+useful when adding new notification definitions, scheduled jobs, or changing route
+states. Router-level settings (`config.yaml`) — including signal endpoint,
+media_root, work_root, state_db, circuit breaker thresholds, control socket
+path, and retention intervals — are bound at startup and require a process
+restart to change.
+
+### Control socket command
+
+```bash
+signal-hermes-router reload-config
+```
+
+By default the router re-reads the same `routes.yaml` it was started with.
+Override with a candidate file:
+
+```bash
+signal-hermes-router reload-config --candidate-routes /path/to/new/routes.yaml
+```
+
+### Response
+
+A successful reload returns a JSON response with a monotonic generation counter:
+
+```json
+{"generation": 1, "route_count": 3, "status": "ok"}
+```
+
+An invalid candidate leaves the active configuration unchanged and returns:
+
+```json
+{"detail": "ValueError", "error": "config_invalid", "generation": 0, "status": "error"}
+```
+
+If the candidate `routes.yaml` is paired with a different `config.yaml` (i.e.
+router-level settings changed), the reload is rejected:
+
+```json
+{"error": "router_config_changed", "generation": 0, "status": "error"}
+```
+
+If an existing route key changes its Hermes `profile`, the reload is also rejected
+because session and circuit-breaker state are keyed by route key and would become
+inconsistent:
+
+```json
+{"error": "profile_changed_for_existing_route", "generation": 0, "status": "error"}
+```
+
+### Safety guarantees
+
+- **Parse-before-swap**: The candidate file is fully parsed and validated
+  before any runtime state changes.
+- **Routes-only**: Only routes, scheduled jobs, and notification definitions
+  may change on reload. Router-level settings remain bound to startup values.
+- **Profile stability for existing routes**: A route key that already exists
+  cannot change its `profile` on reload.  This prevents session cache and
+  circuit-breaker state from becoming inconsistent.  Remapping a group to a
+  different profile requires a process restart.
+- **In-flight preservation**: Turns already admitted use their original
+  `Route` objects; only new turns see the updated configuration. Note that
+  in-flight turns may still read a handful of router-level settings (e.g.
+  `media_root`, `max_attachment_bytes`) live from `self.config.router` across
+  await boundaries, so a reload during an active turn can observe a mix of old
+  and new values for those fields. In practice this is safe because the
+  router-level settings are rejected from changing (see Routes-only above).
+- **No session disruption**: Existing ACP sessions and the profile supervisor
+  are not restarted; new routes simply acquire sessions through the normal
+  registry path.
+- **Orphaned rate-limit cleanup**: Rate-limit buckets for removed routes are
+  pruned; active-route buckets survive the reload.
+- **Redaction continuity**: Route identifiers from both old and new
+  configurations remain in the redactor so no identifiers leak across reload.
+
+### Deployment sequence
+
+1. Validate the candidate `routes.yaml` locally (e.g. with a test instance or
+   by running `signal-hermes-router` in a temporary environment).
+2. Atomically replace the routes file on disk (e.g. `mv routes.yaml.new routes.yaml`).
+3. Run `signal-hermes-router reload-config`.
+4. Inspect the response `generation` to confirm the reload took effect.
+
 - `router.signal_attachment_root` (default
   `~/.local/share/signal-cli/attachments`) - read-only path used to resolve
   signal-cli events that reference an attachment by ID instead of carrying
