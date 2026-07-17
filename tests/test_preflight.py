@@ -191,9 +191,13 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         local_tools = [
             issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
         ]
-        # bash is in both the surface and the allowlist; should collapse to one issue
-        self.assertEqual(len(local_tools), 1)
-        self.assertEqual(local_tools[0]["tool"], "bash")
+        # bash is in both the surface and the allowlist; with source_kind in the dedup key
+        # they are kept as separate issues so the operator can see both remediation paths.
+        self.assertEqual(len(local_tools), 2)
+        tools = sorted([issue["tool"] for issue in local_tools])
+        kinds = sorted([issue["source_kind"] for issue in local_tools])
+        self.assertEqual(tools, ["bash", "bash"])
+        self.assertEqual(kinds, ["profile_surface", "route"])
 
     async def test_preflight_dedups_case_variant_local_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -221,10 +225,14 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         local_tools = [
             issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
         ]
-        # "Bash" in allowlist and "bash" in surface are the same tool; should collapse to one issue.
-        # The first-seen name is retained (surface scan runs before allowlist scan).
-        self.assertEqual(len(local_tools), 1)
-        self.assertEqual(local_tools[0]["tool"], "bash")
+        # "Bash" in allowlist and "bash" in surface are the same tool but different sources;
+        # with source_kind in the dedup key they are kept as separate issues.
+        self.assertEqual(len(local_tools), 2)
+        tools = sorted([issue["tool"] for issue in local_tools])
+        kinds = sorted([issue["source_kind"] for issue in local_tools])
+        # Surface retains original casing; allowlist retains its casing
+        self.assertEqual(tools, ["Bash", "bash"])
+        self.assertEqual(kinds, ["profile_surface", "route"])
 
     async def test_preflight_flags_local_tools_in_scheduled_job_on_mcp_only_route(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -262,6 +270,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(local_tools), 1)
         self.assertEqual(local_tools[0]["tool"], "bash")
         self.assertEqual(local_tools[0]["route_ref"], "route:mcp-route")
+        self.assertEqual(local_tools[0]["source_kind"], "scheduled_job")
 
     async def test_preflight_flags_local_tools_in_notification_on_mcp_only_route(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -301,6 +310,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(local_tools), 1)
         self.assertEqual(local_tools[0]["tool"], "terminal/create")
         self.assertEqual(local_tools[0]["route_ref"], "route:mcp-route")
+        self.assertEqual(local_tools[0]["source_kind"], "notification")
 
     async def test_preflight_local_tools_respects_scope_for_synthetic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -387,6 +397,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(local_tools), 1)
         self.assertEqual(local_tools[0]["route_ref"], "route:mcp-route")
         self.assertEqual(local_tools[0]["tool"], "terminal/create")
+        self.assertEqual(local_tools[0]["source_kind"], "profile_surface")
 
     async def test_preflight_reports_local_tools_for_mcp_only_route_with_empty_allowlist(
         self,
@@ -418,6 +429,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(local_tools), 1)
         self.assertEqual(local_tools[0]["tool"], "terminal/create")
+        self.assertEqual(local_tools[0]["source_kind"], "profile_surface")
 
     async def test_mcp_only_route_preflight_shows_missing_and_local_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1360,7 +1372,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         local_output = format_preflight_report(local_report)
         self.assertIn("Local tool entries: 1", local_output)
         self.assertIn("Local tools exposed:", local_output)
-        self.assertIn("route:mcp-only-route calendar terminal/create", local_output)
+        self.assertIn("route:mcp-only-route calendar profile_surface terminal/create", local_output)
 
     async def test_unavailable_probe_reports_contract_requirement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1434,6 +1446,50 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         failure = preflight_failure_from_report(report)
         self.assertIsNotNone(failure)
         self.assertEqual(failure.code, FailureCode.PREFLIGHT_FAILED)
+
+    async def test_preflight_probe_failure_with_allowlisted_local_tool_returns_permission_denied(
+        self,
+    ) -> None:
+        """local_tools_exposed is checked before probe_errors, so an allowlisted
+        local tool on an mcp_only route takes precedence over the probe failure."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(
+                    make_route(
+                        name="mcp-only-route",
+                        group_id="EXAMPLE_MCP_GROUP",
+                        profile="calendar",
+                        state=RouteState.ACTIVE,
+                        permission_policy=policy("bash"),
+                        mcp_only=True,
+                    ),
+                ),
+            )
+
+            report = await run_permission_preflight(
+                app,
+                unavailable_tool_surface_probe,
+                scope=PreflightScope(active_only=True),
+            )
+
+        self.assertEqual(report.status, "failed")
+        self.assertEqual(len(report.probe_errors), 1)
+        self.assertEqual(report.probe_errors[0].code, "probe_contract_required")
+        # Allowlist scan still runs (gated on not scope_errors), so local_tools_exposed is populated
+        self.assertEqual(len(report.local_tools_exposed), 1)
+        self.assertEqual(report.local_tools_exposed[0].tool_name, "bash")
+        self.assertEqual(report.local_tools_exposed[0].source_kind, "route")
+        # preflight_failure_from_report returns PERMISSION_DENIED because local_tools_exposed
+        # is checked before probe_errors
+        from signal_hermes_router.failures import (
+            FailureCode,
+            preflight_failure_from_report,
+        )
+
+        failure = preflight_failure_from_report(report)
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure.code, FailureCode.PERMISSION_DENIED)
 
     def test_parse_preflight_scope_validates_selector_shape(self) -> None:
         scope = parse_preflight_scope(

@@ -344,6 +344,7 @@ class LocalToolExposedIssue:
     route_ref: str
     profile: str
     tool_name: str
+    source_kind: str = "profile_surface"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -351,6 +352,7 @@ class LocalToolExposedIssue:
             "route_ref": self.route_ref,
             "profile": self.profile,
             "tool": self.tool_name,
+            "source_kind": self.source_kind,
         }
 
     def to_issue(self) -> dict[str, Any]:
@@ -599,6 +601,7 @@ async def run_permission_preflight(
                             route_ref=ref,
                             profile=route.profile,
                             tool_name=tool_name,
+                            source_kind="profile_surface",
                         )
                     )
         # Also flag local tools in the route's own allowlist — the runtime
@@ -611,6 +614,7 @@ async def run_permission_preflight(
                             route_ref=ref,
                             profile=route.profile,
                             tool_name=rule.tool_name,
+                            source_kind="route",
                         )
                     )
     # Also scan synthetic definitions (jobs/notifications) for local tools
@@ -631,6 +635,7 @@ async def run_permission_preflight(
                                 route_ref=ref,
                                 profile=route.profile,
                                 tool_name=rule.tool_name,
+                                source_kind="scheduled_job",
                             )
                         )
         for notification in config.notifications:
@@ -648,18 +653,21 @@ async def run_permission_preflight(
                                 route_ref=ref,
                                 profile=route.profile,
                                 tool_name=rule.tool_name,
+                                source_kind="notification",
                             )
                         )
     # Deduplicate (case-insensitive because is_local_tool lowercases before matching).
-    seen_local_tools: set[tuple[str, str, str]] = set()
+    seen_local_tools: set[tuple[str, str, str, str]] = set()
     deduped: list[LocalToolExposedIssue] = []
     for issue in local_tools:
-        key = (issue.route_ref, issue.profile, issue.tool_name.lower())
+        key = (issue.route_ref, issue.profile, issue.tool_name.lower(), issue.source_kind)
         if key not in seen_local_tools:
             seen_local_tools.add(key)
             deduped.append(issue)
     local_tools = deduped
-    local_tools.sort(key=lambda item: (item.profile, item.route_ref, item.tool_name.lower()))
+    local_tools.sort(
+        key=lambda item: (item.profile, item.route_ref, item.tool_name.lower(), item.source_kind)
+    )
 
     return PreflightReport(
         expected_permissions=expected,
@@ -733,7 +741,10 @@ def format_preflight_report_dict(data: dict[str, Any]) -> str:
         for issue in local_tools:
             if not isinstance(issue, dict):
                 continue
-            lines.append(f"- {issue.get('route_ref')} {issue.get('profile')} {issue.get('tool')}")
+            source = issue.get("source_kind", "profile_surface")
+            lines.append(
+                f"- {issue.get('route_ref')} {issue.get('profile')} {source} {issue.get('tool')}"
+            )
     return "\n".join(lines)
 
 
