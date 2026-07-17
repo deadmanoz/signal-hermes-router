@@ -1899,46 +1899,46 @@ class SignalHermesRouter:
         """Schedule cleanup of runtime state a reload left without an active
         route.
 
-        A single tracked background task first waits (bounded) for in-flight
-        turns on the affected routes to drain, then evicts sessions cached
-        for routes that can no longer prompt and retires cached Hermes
-        profile subprocesses with no remaining active route. Eviction must
-        NOT happen synchronously here: an in-flight turn on a just-reloaded
-        route is still streaming its reply through the cached session, and
-        releasing that session mid-prompt silently truncates the reply.
+        A tracked background task first waits (bounded) for in-flight turns
+        on every non-live route to drain, then evicts sessions cached for
+        routes that can no longer prompt and retires cached Hermes profile
+        subprocesses with no remaining active route. Eviction must NOT happen
+        synchronously here: an in-flight turn on a just-reloaded route is
+        still streaming its reply through the cached session, and releasing
+        that session mid-prompt silently truncates the reply.
         """
+        del old_config  # drain scope is recomputed from live state at run time
         live_now = {
             route.key for route in new_config.routes if route.state == RouteState.ACTIVE
         }
-        drain_keys = sorted(
-            ({route.key for route in old_config.routes} | {route.key for route in new_config.routes})
-            - live_now
-        )
         live_profiles = {
             route.profile for route in new_config.routes if route.state == RouteState.ACTIVE
         }
-        retired_profiles = [
-            name
-            for name in self.supervisor.cached_profile_names()
-            if name not in live_profiles
-        ]
-        if not retired_profiles and not self.sessions.has_sessions_outside(live_now):
+        if (
+            all(name in live_profiles for name in self.supervisor.cached_profile_names())
+            and not self.sessions.has_sessions_outside(live_now)
+        ):
             return
-        task = asyncio.ensure_future(
-            self._reap_after_drain(drain_keys, retired_profiles)
-        )
+        task = asyncio.ensure_future(self._reap_after_drain())
         self._signal_turn_tasks.add(task)
         task.add_done_callback(self._settle_tracked_task)
 
-    async def _reap_after_drain(
-        self, drain_keys: list[str], retired_profiles: list[str]
-    ) -> None:
+    async def _reap_after_drain(self) -> None:
         # In-flight turns captured their Route (and its profile/session
-        # bindings) before the swap. Wait for the route locks of every route
-        # that could still be prompting on retired state, then evict/retire.
-        # The wait is bounded (see RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS): a
-        # wedged turn must not pin retired runtime state forever; closing
-        # under it fails that turn through the normal broken-pipe path.
+        # bindings) before the swap. Drain the route locks of EVERY route key
+        # ever seen that is not live right now — not just the keys this
+        # reload touched: the evict/retire below is global, so the drain must
+        # be global too, or a later reload's reap could cut down a session an
+        # earlier reload's reap was still waiting out. The wait is bounded
+        # (see RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS): a wedged turn must not
+        # pin retired runtime state forever; closing under it fails that turn
+        # through the normal broken-pipe path.
+        live_now = {
+            route.key for route in self.config.routes if route.state == RouteState.ACTIVE
+        }
+        drain_keys = sorted(
+            key for key in self._route_profile_tombstones if key not in live_now
+        )
         deadline = time.monotonic() + RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS
         for key in drain_keys:
             remaining = deadline - time.monotonic()
@@ -1970,7 +1970,7 @@ class SignalHermesRouter:
                 evicted,
             )
         live_profiles = {route.profile for route in live_routes}
-        for profile_name in retired_profiles:
+        for profile_name in self.supervisor.cached_profile_names():
             if profile_name in live_profiles:
                 continue
             if await self.supervisor.retire_profile(profile_name):
