@@ -107,7 +107,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 group_id="EXAMPLE_ACTIVE_GROUP",
                 profile="calendar",
                 state=RouteState.ACTIVE,
-                permission_policy=policy("read_file"),
+                permission_policy=policy("todo_create"),
                 mcp_only=True,
             )
             app = AppConfig(
@@ -119,7 +119,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
 
             async def probe(profile: str) -> ToolSurface:
                 return callable_surface(
-                    profile, ["read_file", "terminal/create", "fs/read_text_file"]
+                    profile, ["todo_create", "terminal/create", "fs/read_text_file"]
                 )
 
             report = await run_permission_preflight(app, probe)
@@ -133,8 +133,8 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             sorted([issue["tool"] for issue in local_tools]),
             ["fs/read_text_file", "terminal/create"],
         )
-        # read_file is not a known local-tool pattern so it is not flagged
-        self.assertNotIn("read_file", [issue["tool"] for issue in local_tools])
+        # todo_create is not a known local-tool pattern so it is not flagged
+        self.assertNotIn("todo_create", [issue["tool"] for issue in local_tools])
 
     async def test_preflight_flags_local_tools_in_route_allowlist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -143,7 +143,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 group_id="EXAMPLE_MCP_ALLOWLIST",
                 profile="calendar",
                 state=RouteState.ACTIVE,
-                permission_policy=policy("bash", "read_file"),
+                permission_policy=policy("bash", "todo_create"),
                 mcp_only=True,
             )
             app = AppConfig(
@@ -154,7 +154,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def probe(profile: str) -> ToolSurface:
-                return callable_surface(profile, ["read_file"])
+                return callable_surface(profile, ["todo_create"])
 
             report = await run_permission_preflight(app, probe)
 
@@ -172,7 +172,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 group_id="EXAMPLE_MCP_DEDUP",
                 profile="calendar",
                 state=RouteState.ACTIVE,
-                permission_policy=policy("bash", "read_file"),
+                permission_policy=policy("bash", "todo_create"),
                 mcp_only=True,
             )
             app = AppConfig(
@@ -183,7 +183,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def probe(profile: str) -> ToolSurface:
-                return callable_surface(profile, ["read_file", "bash"])
+                return callable_surface(profile, ["todo_create", "bash"])
 
             report = await run_permission_preflight(app, probe)
 
@@ -206,7 +206,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 group_id="EXAMPLE_MCP_CASE",
                 profile="calendar",
                 state=RouteState.ACTIVE,
-                permission_policy=policy("Bash", "read_file"),
+                permission_policy=policy("Bash", "todo_create"),
                 mcp_only=True,
             )
             app = AppConfig(
@@ -217,7 +217,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def probe(profile: str) -> ToolSurface:
-                return callable_surface(profile, ["read_file", "bash"])
+                return callable_surface(profile, ["todo_create", "bash"])
 
             report = await run_permission_preflight(app, probe)
 
@@ -241,7 +241,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 group_id="EXAMPLE_MCP",
                 profile="calendar",
                 state=RouteState.ACTIVE,
-                permission_policy=policy("read_file"),
+                permission_policy=policy("todo_create"),
                 mcp_only=True,
             )
             app = AppConfig(
@@ -259,7 +259,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def probe(profile: str) -> ToolSurface:
-                return callable_surface(profile, ["read_file"])
+                return callable_surface(profile, ["todo_create"])
 
             report = await run_permission_preflight(app, probe)
 
@@ -280,7 +280,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 group_id="EXAMPLE_MCP",
                 profile="calendar",
                 state=RouteState.ACTIVE,
-                permission_policy=policy("read_file"),
+                permission_policy=policy("todo_create"),
                 mcp_only=True,
             )
             app = AppConfig(
@@ -300,7 +300,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def probe(profile: str) -> ToolSurface:
-                return callable_surface(profile, ["read_file"])
+                return callable_surface(profile, ["todo_create"])
 
             report = await run_permission_preflight(app, probe)
 
@@ -321,7 +321,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 group_id="EXAMPLE_NORMAL",
                 profile="calendar",
                 state=RouteState.ACTIVE,
-                permission_policy=policy("read_file"),
+                permission_policy=policy("todo_create"),
                 mcp_only=False,
             )
             mcp_route = make_route(
@@ -329,7 +329,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 group_id="EXAMPLE_MCP",
                 profile="calendar",
                 state=RouteState.SHADOW,
-                permission_policy=policy("read_file"),
+                permission_policy=policy("todo_create"),
                 mcp_only=True,
             )
             app = AppConfig(
@@ -347,7 +347,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def probe(profile: str) -> ToolSurface:
-                return callable_surface(profile, ["read_file"])
+                return callable_surface(profile, ["todo_create"])
 
             # active_only scope matches normal-route but excludes shadow mcp-route;
             # synthetic job on mcp-route should not be flagged
@@ -371,7 +371,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 group_id="EXAMPLE_MCP",
                 profile="calendar",
                 state=RouteState.ACTIVE,
-                permission_policy=policy("read_file"),
+                permission_policy=policy("web_search"),
                 mcp_only=True,
             )
             app = AppConfig(
@@ -395,7 +395,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def probe(profile: str) -> ToolSurface:
-                return callable_surface(profile, ["read_file"])
+                return callable_surface(profile, ["web_search"])
 
             report = await run_permission_preflight(app, probe)
 
@@ -414,7 +414,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 group_id="EXAMPLE_MCP",
                 profile="calendar",
                 state=RouteState.ACTIVE,
-                permission_policy=policy("read_file"),
+                permission_policy=policy("todo_create"),
                 mcp_only=True,
             )
             normal_route = make_route(
@@ -422,7 +422,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                 group_id="EXAMPLE_NORMAL",
                 profile="calendar",
                 state=RouteState.ACTIVE,
-                permission_policy=policy("read_file"),
+                permission_policy=policy("todo_create"),
                 mcp_only=False,
             )
             app = AppConfig(
@@ -433,7 +433,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def probe(profile: str) -> ToolSurface:
-                return callable_surface(profile, ["read_file", "terminal/create"])
+                return callable_surface(profile, ["todo_create", "terminal/create"])
 
             report = await run_permission_preflight(app, probe)
 
@@ -1267,6 +1267,38 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(report.to_dict()["issues"][0]["code"], "unmatched_route_name")
 
+    async def test_scope_error_prevents_allowlist_local_tool_scan(self) -> None:
+        """When scope_errors is set, the local-tool scan is skipped entirely so
+        findings are not derived from a scope the report has just declared
+        uncheckable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(
+                    make_route(
+                        name="mcp-route",
+                        group_id="EXAMPLE_MCP",
+                        profile="calendar",
+                        state=RouteState.ACTIVE,
+                        permission_policy=policy("bash"),
+                        mcp_only=True,
+                    ),
+                ),
+            )
+            report = await run_permission_preflight(
+                app,
+                unavailable_tool_surface_probe,
+                scope=PreflightScope(route_names=("typo-route",)),
+            )
+
+        self.assertEqual(report.status, "failed")
+        self.assertEqual(report.local_tools_exposed, ())
+        self.assertEqual(len(report.scope_errors), 1)
+        self.assertEqual(report.scope_errors[0].code, "unmatched_route_name")
+        # No local_tool_exposed issues despite the mcp_only route allowlisting bash
+        issues = report.to_dict()["issues"]
+        self.assertTrue(all(issue["code"] != "local_tool_exposed" for issue in issues))
+
     async def test_scope_reports_each_unmatched_selector(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             report = await run_permission_preflight(
@@ -1394,7 +1426,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
 
         missing_output = format_preflight_report(missing_report)
         self.assertIn("Missing tools:", missing_output)
-        self.assertIn("route:active-route calendar route read_file", missing_output)
+        self.assertIn("route:active-route calendar route web_search", missing_output)
 
         # Local tools exposed section
         with tempfile.TemporaryDirectory() as tmp:
@@ -1406,14 +1438,14 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                         group_id="EXAMPLE_MCP_GROUP",
                         profile="calendar",
                         state=RouteState.ACTIVE,
-                        permission_policy=policy("read_file"),
+                        permission_policy=policy("web_search"),
                         mcp_only=True,
                     ),
                 ),
             )
 
             async def probe(profile: str) -> ToolSurface:
-                return callable_surface(profile, ["read_file", "terminal/create"])
+                return callable_surface(profile, ["web_search", "terminal/create"])
 
             local_report = await run_permission_preflight(local_app, probe)
 
@@ -1467,7 +1499,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                         group_id="EXAMPLE_MCP_GROUP",
                         profile="calendar",
                         state=RouteState.ACTIVE,
-                        permission_policy=policy("read_file"),
+                        permission_policy=policy("web_search"),
                         mcp_only=True,
                     ),
                 ),
@@ -1483,8 +1515,8 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(report.probe_errors), 1)
         self.assertEqual(report.probe_errors[0].code, "probe_contract_required")
         self.assertEqual(report.missing_tools, ())
-        # Surface scan is skipped when probe fails, so no surface-derived local tools
-        self.assertEqual(report.local_tools_exposed, ())
+        # Allowlist scan still runs when probe fails (gated on not scope_errors),
+        # but web_search is not a local tool so local_tools_exposed remains empty.
         # preflight_failure_from_report returns PREFLIGHT_FAILED, not PERMISSION_DENIED
         from signal_hermes_router.failures import (
             FailureCode,

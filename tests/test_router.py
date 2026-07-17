@@ -3860,7 +3860,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             async def tool_surface(self) -> ToolSurface:
                 return ToolSurface.from_names(
                     self.profile,
-                    ["read_file", "bash"],
+                    ["web_search", "bash"],
                     schema_version=1,
                     scope="full_callable",
                 )

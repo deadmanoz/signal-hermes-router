@@ -10,7 +10,23 @@ LOGGER = logging.getLogger(__name__)
 
 # Tool names that are considered local-terminal/fs execution primitives.
 # These are defense-in-depth rejected on mcp_only routes via StaticPermissionPolicy.
-_LOCAL_TOOL_NAMES = frozenset({"shell", "bash", "python", "terminal", "fs"})
+_LOCAL_TOOL_NAMES = frozenset(
+    {
+        "shell",
+        "bash",
+        "python",
+        "terminal",
+        "fs",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_directory",
+        "create_directory",
+        "delete_file",
+        "move_file",
+        "copy_file",
+    }
+)
 _LOCAL_TOOL_PREFIXES = ("terminal/", "fs/")
 
 
@@ -103,7 +119,7 @@ class PermissionRule:
         return True
 
 
-@dataclass
+@dataclass(frozen=True)
 class StaticPermissionPolicy:
     rules: tuple[PermissionRule, ...] = ()
     mcp_only: bool = False

@@ -28,8 +28,8 @@ class PermissionTests(unittest.TestCase):
         self.assertFalse(policy.allows_tool_call({"toolName": "terminal/create"}))
         self.assertFalse(policy.allows_tool_call({"toolName": "fs/read_text_file"}))
         # Non-local allowed tool on MCP-only route is still allowed
-        policy = StaticPermissionPolicy.from_config([{"tool": "read_file"}], mcp_only=True)
-        self.assertTrue(policy.allows_tool_call({"toolName": "read_file"}))
+        policy = StaticPermissionPolicy.from_config([{"tool": "web_search"}], mcp_only=True)
+        self.assertTrue(policy.allows_tool_call({"toolName": "web_search"}))
         # On non-MCP-only route, local tools are governed by the allowlist only
         policy = StaticPermissionPolicy.from_config([{"tool": "terminal/create"}], mcp_only=False)
         self.assertTrue(policy.allows_tool_call({"toolName": "terminal/create"}))

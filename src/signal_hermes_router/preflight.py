@@ -584,10 +584,10 @@ async def run_permission_preflight(
     missing.sort(key=lambda item: (item.profile, item.route_ref, item.source_kind, item.tool_name))
 
     local_tools: list[LocalToolExposedIssue] = []
-    # Build an id-keyed position map so synthetic definitions can resolve
-    # route_ref and scope consistently with collect_expected_permission_tools.
-    route_positions = {
-        id(route): (index, route_ref(index, route))
+    # Build an id-keyed ref map so synthetic definitions can resolve route_ref
+    # consistently with collect_expected_permission_tools.
+    route_ref_by_id = {
+        id(route): route_ref(index, route)
         for index, route in enumerate(config.routes)
         if effective_scope.matches_route(index, route)
     }
@@ -629,12 +629,12 @@ async def run_permission_preflight(
         # on mcp_only routes, but only when the route is in scope.
         for job in config.scheduled_jobs:
             route = config.find_route_by_name(job.route_name)
-            if route is None or id(route) not in route_positions:
+            if route is None or id(route) not in route_ref_by_id:
                 continue
             if not route.mcp_only:
                 continue
             if job.permission_policy is not None:
-                _index, ref = route_positions[id(route)]
+                ref = route_ref_by_id[id(route)]
                 for rule in job.permission_policy.rules:
                     if is_local_tool(rule.tool_name):
                         local_tools.append(
@@ -648,12 +648,12 @@ async def run_permission_preflight(
                         )
         for notification in config.notifications:
             route = config.find_route_by_name(notification.route_name)
-            if route is None or id(route) not in route_positions:
+            if route is None or id(route) not in route_ref_by_id:
                 continue
             if not route.mcp_only:
                 continue
             if notification.permission_policy is not None:
-                _index, ref = route_positions[id(route)]
+                ref = route_ref_by_id[id(route)]
                 for rule in notification.permission_policy.rules:
                     if is_local_tool(rule.tool_name):
                         local_tools.append(

@@ -203,7 +203,7 @@ Create a private [profile audit checklist](profile-audit-checklist.md) record be
 
 A route may be declared `mcp_only: true` in `routes.yaml`. When set, the router:
 
-1. **Preflight:** Reports `local_tool_exposed` issues for any tool whose name matches a known local-terminal/fs pattern (`terminal/*`, `fs/*`, `shell`, `bash`, `python`, `terminal`, `fs`) when found in any of:
+1. **Preflight:** Reports `local_tool_exposed` issues for any tool whose name matches a known local-terminal/fs pattern (`terminal/*`, `fs/*`, `shell`, `bash`, `python`, `terminal`, `fs`, `read_file`, `write_file`, `edit_file`, `list_directory`, `create_directory`, `delete_file`, `move_file`, `copy_file`) when found in any of:
    - the profile's `full_callable` surface;
    - the route's own `permission_policy.rules` allowlist;
    - any `scheduled_jobs[*].permission_policy.rules` allowlist for the route;
