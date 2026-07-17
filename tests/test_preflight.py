@@ -98,6 +98,64 @@ def preflight_app(tmp: str | Path) -> AppConfig:
 
 
 class PreflightTests(unittest.IsolatedAsyncioTestCase):
+    async def test_preflight_reports_local_tools_for_mcp_only_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = preflight_app(tmp)
+            # Make the active route MCP-only
+            active = make_route(
+                name="active-route",
+                group_id="EXAMPLE_ACTIVE_GROUP",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("read_file"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=app.router,
+                routes=(active,),
+                scheduled_jobs=(),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["read_file", "terminal/create", "fs/read_text_file"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        local_tools = [issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"]
+        self.assertEqual(len(local_tools), 2)
+        self.assertEqual(sorted([issue["tool"] for issue in local_tools]), ["fs/read_text_file", "terminal/create"])
+        # read_file is allowed (in allowlist) and not flagged
+        self.assertNotIn("read_file", [issue["tool"] for issue in local_tools])
+
+    async def test_preflight_reports_local_tools_for_mcp_only_route_with_empty_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            active = make_route(
+                name="mcp-only-empty",
+                group_id="EXAMPLE_MCP_EMPTY",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy(),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(active,),
+                scheduled_jobs=(),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["terminal/create"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        local_tools = [issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"]
+        self.assertEqual(len(local_tools), 1)
+        self.assertEqual(local_tools[0]["tool"], "terminal/create")
+
     async def test_preflight_reports_missing_tools_without_private_route_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = preflight_app(tmp)
