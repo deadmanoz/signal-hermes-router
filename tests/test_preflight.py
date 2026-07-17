@@ -241,6 +241,53 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(local_tools[0]["tool"], "terminal/create")
         self.assertEqual(local_tools[0]["route_ref"], "route:mcp-route")
 
+    async def test_preflight_local_tools_respects_scope_for_synthetic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            normal_route = make_route(
+                name="normal-route",
+                group_id="EXAMPLE_NORMAL",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("read_file"),
+                mcp_only=False,
+            )
+            mcp_route = make_route(
+                name="mcp-route",
+                group_id="EXAMPLE_MCP",
+                profile="calendar",
+                state=RouteState.SHADOW,
+                permission_policy=policy("read_file"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(normal_route, mcp_route),
+                scheduled_jobs=(
+                    SyntheticRouteJob(
+                        id="daily-job",
+                        route_name="mcp-route",
+                        prompt="Run daily task",
+                        permission_policy=StaticPermissionPolicy.from_config([{"tool": "bash"}]),
+                    ),
+                ),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["read_file"])
+
+            # active_only scope matches normal-route but excludes shadow mcp-route;
+            # synthetic job on mcp-route should not be flagged
+            report = await run_permission_preflight(
+                app, probe, scope=PreflightScope(active_only=True)
+            )
+
+        self.assertEqual(report.status, "ok")
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
+        self.assertEqual(len(local_tools), 0)
+
     async def test_preflight_local_tools_per_route_not_per_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             mcp_route = make_route(
