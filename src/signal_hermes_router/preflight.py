@@ -605,7 +605,37 @@ async def run_permission_preflight(
                         tool_name=rule.tool_name,
                     )
                 )
-    # Deduplicate while preserving sort order by first occurrence.
+    # Also scan synthetic definitions (jobs/notifications) for local tools
+    # on mcp_only routes.
+    for job in config.scheduled_jobs:
+        route = config.find_route_by_name(job.route_name)
+        if route is None or not route.mcp_only:
+            continue
+        if job.permission_policy is not None:
+            for rule in job.permission_policy.rules:
+                if is_local_tool(rule.tool_name):
+                    local_tools.append(
+                        LocalToolExposedIssue(
+                            route_ref=route_ref(config.routes.index(route), route),
+                            profile=route.profile,
+                            tool_name=rule.tool_name,
+                        )
+                    )
+    for notification in config.notifications:
+        route = config.find_route_by_name(notification.route_name)
+        if route is None or not route.mcp_only:
+            continue
+        if notification.permission_policy is not None:
+            for rule in notification.permission_policy.rules:
+                if is_local_tool(rule.tool_name):
+                    local_tools.append(
+                        LocalToolExposedIssue(
+                            route_ref=route_ref(config.routes.index(route), route),
+                            profile=route.profile,
+                            tool_name=rule.tool_name,
+                        )
+                    )
+    # Deduplicate.
     seen_local_tools: set[tuple[str, str, str]] = set()
     deduped: list[LocalToolExposedIssue] = []
     for issue in local_tools:

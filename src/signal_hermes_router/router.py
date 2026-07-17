@@ -1539,11 +1539,7 @@ class SignalHermesRouter:
             outbound_attachments=outbound_attachments,
             scheduled_at_ms=scheduled_at,
             triggered_at_ms=triggered_at_ms,
-            permission_policy=(
-                (synthetic.permission_policy or route.permission_policy).with_mcp_only(True)
-                if route.mcp_only
-                else (synthetic.permission_policy or route.permission_policy)
-            ),
+            permission_policy=(synthetic.permission_policy or route.permission_policy),
         )
 
     def _synthetic_dedupe_identity(
