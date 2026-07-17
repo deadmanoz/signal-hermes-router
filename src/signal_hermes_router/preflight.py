@@ -648,11 +648,11 @@ async def run_permission_preflight(
                             tool_name=rule.tool_name,
                         )
                     )
-    # Deduplicate.
+    # Deduplicate (case-insensitive because is_local_tool lowercases before matching).
     seen_local_tools: set[tuple[str, str, str]] = set()
     deduped: list[LocalToolExposedIssue] = []
     for issue in local_tools:
-        key = (issue.route_ref, issue.profile, issue.tool_name)
+        key = (issue.route_ref, issue.profile, issue.tool_name.lower())
         if key not in seen_local_tools:
             seen_local_tools.add(key)
             deduped.append(issue)

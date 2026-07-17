@@ -165,6 +165,67 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(local_tools), 1)
         self.assertEqual(local_tools[0]["tool"], "bash")
 
+    async def test_preflight_dedups_local_tool_found_in_surface_and_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            active = make_route(
+                name="mcp-dedup",
+                group_id="EXAMPLE_MCP_DEDUP",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("bash", "read_file"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(active,),
+                scheduled_jobs=(),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["read_file", "bash"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
+        # bash is in both the surface and the allowlist; should collapse to one issue
+        self.assertEqual(len(local_tools), 1)
+        self.assertEqual(local_tools[0]["tool"], "bash")
+
+    async def test_preflight_dedups_case_variant_local_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            active = make_route(
+                name="mcp-case",
+                group_id="EXAMPLE_MCP_CASE",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("Bash", "read_file"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(active,),
+                scheduled_jobs=(),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["read_file", "bash"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
+        # "Bash" in allowlist and "bash" in surface are the same tool; should collapse to one issue.
+        # The first-seen name is retained (surface scan runs before allowlist scan).
+        self.assertEqual(len(local_tools), 1)
+        self.assertEqual(local_tools[0]["tool"], "bash")
+
     async def test_preflight_flags_local_tools_in_scheduled_job_on_mcp_only_route(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = make_route(
