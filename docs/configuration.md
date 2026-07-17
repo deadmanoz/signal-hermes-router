@@ -168,6 +168,12 @@ Required keys are listed first; optional keys carry their defaults.
 - `permissions` (optional, default `[]`) - static ACP permission allowlist
   for this route. Denylists are rejected at parse time. See [permissions](permissions.md)
   for the predicate shape.
+- `mcp_only` (optional, default `false`) - when `true`, the preflight
+  permission scan reports `local_tool_exposed` for any local terminal/fs tool
+  found either in the profile's `full_callable` surface or in the route's (and
+  its scheduled jobs' and notifications') permission allowlist. The router also
+  defense-in-depth rejects `session/request_permission` for those tools at
+  runtime. See [permissions](permissions.md#mcp-only-routes).
 - `friendly_name` (optional) - private operator-facing label. Never sent over
   ACP; only used in redacted logs.
 - `maintenance_reply` (optional) - per-route override for
