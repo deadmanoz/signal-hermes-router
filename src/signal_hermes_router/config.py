@@ -137,6 +137,7 @@ class Route:
     session_max_age_seconds: float | None = None
     max_event_age_seconds: float | None = None
     inbound_rate_limit: InboundRateLimitConfig | None = None
+    mcp_only: bool = False
 
     @property
     def key(self) -> str:
@@ -628,6 +629,7 @@ def parse_route(raw: dict[str, Any]) -> Route:
         raise ValueError(
             "session_max_turns/session_max_age_seconds require a persistent session_policy"
         )
+    mcp_only = _as_bool(raw.get("mcp_only", False))
     return Route(
         platform=platform,
         name=normalize_safe_token(route_name, "route name") if route_name is not None else None,
@@ -639,7 +641,7 @@ def parse_route(raw: dict[str, Any]) -> Route:
         sender_id=sender_id,
         sender_number=sender_number,
         route_context=route_context,
-        permission_policy=StaticPermissionPolicy.from_config(raw.get("permissions") or []),
+        permission_policy=StaticPermissionPolicy.from_config(raw.get("permissions") or [], mcp_only=mcp_only),
         friendly_name=raw.get("friendly_name"),
         maintenance_reply=raw.get("maintenance_reply"),
         failure_reply=raw.get("failure_reply"),
@@ -650,6 +652,7 @@ def parse_route(raw: dict[str, Any]) -> Route:
         session_max_age_seconds=session_max_age_seconds,
         max_event_age_seconds=max_event_age_seconds,
         inbound_rate_limit=_parse_inbound_rate_limit(raw.get("inbound_rate_limit")),
+        mcp_only=mcp_only,
     )
 
 

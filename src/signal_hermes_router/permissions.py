@@ -90,10 +90,14 @@ class PermissionRule:
 @dataclass
 class StaticPermissionPolicy:
     rules: tuple[PermissionRule, ...] = ()
+    mcp_only: bool = False
 
     @classmethod
-    def from_config(cls, values: list[dict[str, Any]] | None) -> "StaticPermissionPolicy":
-        return cls(tuple(PermissionRule.from_config(value) for value in values or []))
+    def from_config(cls, values: list[dict[str, Any]] | None, *, mcp_only: bool = False) -> "StaticPermissionPolicy":
+        return cls(
+            tuple(PermissionRule.from_config(value) for value in values or []),
+            mcp_only=mcp_only,
+        )
 
     def allows_tool_call(self, tool_call: dict[str, Any]) -> bool:
         tool_name = (
