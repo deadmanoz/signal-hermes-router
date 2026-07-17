@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from .circuit import CircuitBreaker
-from .config import AppConfig, Route, SyntheticRouteDefinition
+from .config import AppConfig, Route, SyntheticRouteDefinition, load_app_config
 from .context import build_prompt_blocks, build_synthetic_prompt_blocks
 from .dedupe import DedupeStore
 from .events import SignalEventSummary, parse_signal_event, probe_signal_route
@@ -138,6 +138,11 @@ class SignalHermesRouter:
         nonce_factory: Callable[[], str] | None = None,
     ) -> None:
         self.config = config
+        self._config_generation = 0
+        self._config_paths: tuple[Path, Path] | None = None
+        self._route_profile_tombstones: dict[str, str] = {
+            route.key: route.profile for route in config.routes
+        }
         self.redactor = Redactor()
         for route in config.routes:
             self.redactor.add(
@@ -179,7 +184,7 @@ class SignalHermesRouter:
         self._last_failures: dict[str, tuple[int, FailureInfo]] = {}
         self._route_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._profile_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-        self._inbound_rate_buckets: dict[str, TokenBucket] = {}
+        self._inbound_rate_buckets: dict[tuple[str, float, float], TokenBucket] = {}
         self._last_busy_notice_ms: dict[str, int] = {}
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self._nonce_factory = nonce_factory or (lambda: uuid.uuid4().hex)
@@ -1463,8 +1468,16 @@ class SignalHermesRouter:
             return False
         return self._clock_ms() - event.timestamp > route.max_event_age_seconds * 1000.0
 
+    @staticmethod
+    def _rate_limit_bucket_key(route: Route) -> tuple[str, float, float]:
+        limit = route.inbound_rate_limit
+        if limit is None:
+            return (route.key, 0.0, 0.0)
+        return (route.key, float(limit.max_turns), limit.window_seconds)
+
     def _reserve_inbound_rate_token(self, route: Route) -> bool:
-        bucket = self._inbound_rate_buckets.get(route.key)
+        key = self._rate_limit_bucket_key(route)
+        bucket = self._inbound_rate_buckets.get(key)
         if bucket is None:
             limit = route.inbound_rate_limit
             assert limit is not None
@@ -1472,11 +1485,12 @@ class SignalHermesRouter:
                 capacity=float(limit.max_turns),
                 refill_per_second=limit.max_turns / limit.window_seconds,
             )
-            self._inbound_rate_buckets[route.key] = bucket
+            self._inbound_rate_buckets[key] = bucket
         return bucket.try_acquire(self._clock_ms())
 
     def _refund_inbound_rate_token(self, route: Route) -> None:
-        bucket = self._inbound_rate_buckets.get(route.key)
+        key = self._rate_limit_bucket_key(route)
+        bucket = self._inbound_rate_buckets.get(key)
         if bucket is not None:
             bucket.refund()
 
@@ -1743,6 +1757,124 @@ class SignalHermesRouter:
             "routes": routes,
             "route_count": len(routes),
         }
+
+    async def _handle_reload_config_control(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self._config_paths is None:
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "error": "reload_paths_unknown",
+                "generation": self._config_generation,
+            }
+        config_path = self._config_paths[0]
+        raw_candidate_routes = payload.get("candidate_routes")
+        if raw_candidate_routes is not None and not isinstance(raw_candidate_routes, str):
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "error": "invalid_candidate_routes",
+                "generation": self._config_generation,
+            }
+        routes_path = (
+            Path(raw_candidate_routes)
+            if raw_candidate_routes
+            else self._config_paths[1]
+        )
+        try:
+            candidate = load_app_config(config_path, routes_path)
+        except Exception as exc:
+            LOGGER.error(
+                "config reload rejected: parse/validation failed: %s",
+                self.redactor.redact(exc.__class__.__name__),
+            )
+            LOGGER.debug("config reload rejection details", exc_info=True)
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "error": "config_invalid",
+                "detail": self.redactor.redact(exc.__class__.__name__),
+                "generation": self._config_generation,
+            }
+        # Reject changes to router-level settings: reload is routes-only.
+        if candidate.router != self.config.router:
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "error": "router_config_changed",
+                "generation": self._config_generation,
+            }
+        # Reject profile changes on any route key ever seen: session and
+        # circuit state are keyed by route.key and survive route removal.
+        # Adding a brand-new route key with a new profile is allowed.
+        for route in candidate.routes:
+            tombstone = self._route_profile_tombstones.get(route.key)
+            if tombstone is not None and tombstone != route.profile:
+                return {
+                    "status": TurnOutcomeStatus.ERROR.value,
+                    "error": "profile_changed_for_existing_route",
+                    "generation": self._config_generation,
+                }
+        old_config = self._do_reload_config(candidate)
+        old_counts = Counter(route.state.value for route in old_config.routes)
+        new_counts = Counter(route.state.value for route in candidate.routes)
+        LOGGER.info(
+            "config reloaded: generation=%d routes=%s -> routes=%s",
+            self._config_generation,
+            dict(old_counts),
+            dict(new_counts),
+        )
+        return {
+            "status": "ok",
+            "generation": self._config_generation,
+            "route_count": len(candidate.routes),
+        }
+
+    def _do_reload_config(self, new_config: AppConfig) -> AppConfig:
+        """Atomically replace the active route configuration.
+
+        Returns the old configuration so the caller can log deltas.
+        In-flight turns continue using their captured Route objects;
+        new turns see the updated config immediately.
+        """
+        old_config = self.config
+        self._config_generation += 1
+        self.config = new_config
+        # Additively register new route identifiers into the existing redactor
+        # so old identifiers remain redacted for in-flight turns.
+        for route in new_config.routes:
+            self.redactor.add(
+                route.key,
+                route.group_id,
+                route.sender_id,
+                route.sender_number,
+                route.profile,
+                route.friendly_name,
+            )
+        # Prune orphaned rate-limit buckets for removed routes.  Buckets are
+        # keyed by (route.key, rate_limit_hash) so old and new limits for the
+        # same route coexist safely; in-flight turns refund into the exact
+        # bucket they reserved from.  Only remove buckets for routes that no
+        # longer exist at all.
+        new_keys = {route.key for route in new_config.routes}
+        for key in list(self._inbound_rate_buckets.keys()):
+            # The bucket key is a tuple (route_key, max_turns, window_seconds)
+            route_key = key[0]
+            if route_key not in new_keys:
+                self._inbound_rate_buckets.pop(key, None)
+        # Update profile tombstones so a removed route cannot be re-added
+        # under a different profile in a later reload.
+        for route in new_config.routes:
+            self._route_profile_tombstones[route.key] = route.profile
+        # Clear breaker overrides for routes whose operator-configured state is
+        # now DISABLED, so a disabled route is not masked by a stale MAINTENANCE
+        # override from an earlier trip.
+        for route in new_config.routes:
+            if route.state == RouteState.DISABLED and self.route_state_overrides.get(route.key) == RouteState.MAINTENANCE:
+                self.route_state_overrides.pop(route.key, None)
+                self._trip_times.pop(route.key, None)
+                self._trip_times_ms.pop(route.key, None)
+        # Do NOT prune route locks: in-flight turns may hold them.
+        # Do NOT touch session registry: those are runtime state keyed by
+        # route.key and profile name.
+        return old_config
 
     def _route_health(self, index: int, route: Route) -> RouteHealth:
         return RouteHealth(
@@ -2063,6 +2195,8 @@ class SignalHermesRouter:
             return await self._handle_preflight_permissions_control(payload)
         if command == "route_status":
             return self._route_status_response(payload)
+        if command == "reload_config":
+            return await self._handle_reload_config_control(payload)
         return {"status": TurnOutcomeStatus.ERROR.value, "error": "unknown_command"}
 
     async def _handle_trigger_job_control(self, payload: dict[str, Any]) -> dict[str, Any]:

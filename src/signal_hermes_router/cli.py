@@ -163,6 +163,7 @@ async def _run(config_path: Path, routes_path: Path) -> None:
         config.router.allow_remote_signal_base_url,
     )
     router = SignalHermesRouter(config)
+    router._config_paths = (config_path, routes_path)
     loop = asyncio.get_running_loop()
     serve_task = asyncio.current_task()
     assert serve_task is not None
