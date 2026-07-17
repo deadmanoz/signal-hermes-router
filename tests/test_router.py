@@ -2703,9 +2703,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 profile="profile",
                 session_policy=SessionPolicy.PERSISTENT_ROUTE,
                 state=RouteState.ACTIVE,
-                permission_policy=StaticPermissionPolicy.from_config(
-                    [{"tool": "bash"}]
-                ),
+                permission_policy=StaticPermissionPolicy.from_config([{"tool": "bash"}]),
                 mcp_only=True,
             )
             signal = FakeSignal()
@@ -3852,6 +3850,49 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["missing_tools_count"], 1)
         self.assertEqual(response["missing_tools"][0]["tool"], "web_search")
         self.assertEqual(response["issues"][0]["code"], "missing_tool")
+        self.assertEqual(response["failure"]["code"], "permission_denied")
+        self.assertNotIn("EXAMPLE_GROUP", json.dumps(response, sort_keys=True))
+
+    async def test_control_preflight_reports_local_tools_exposed_on_mcp_only_route(self) -> None:
+        from signal_hermes_router.preflight import ToolSurface
+
+        class LocalToolProfile(FakeProfile):
+            async def tool_surface(self) -> ToolSurface:
+                return ToolSurface.from_names(
+                    self.profile,
+                    ["read_file", "bash"],
+                    schema_version=1,
+                    scope="full_callable",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="mcp-route",
+                group_id="EXAMPLE_GROUP",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                mcp_only=True,
+            )
+            app = make_synthetic_app(tmp, route)
+            router = SignalHermesRouter(
+                app,
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(LocalToolProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            response = await router._handle_control_line(
+                b'{"command":"preflight_permissions","scope":{"active_only":true}}\n'
+            )
+
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(response["probe_errors"], [])
+        self.assertEqual(response["missing_tools_count"], 0)
+        self.assertEqual(response["local_tools_exposed_count"], 1)
+        self.assertEqual(response["local_tools_exposed"][0]["tool"], "bash")
+        self.assertEqual(response["issues"][0]["code"], "local_tool_exposed")
         self.assertEqual(response["failure"]["code"], "permission_denied")
         self.assertNotIn("EXAMPLE_GROUP", json.dumps(response, sort_keys=True))
 

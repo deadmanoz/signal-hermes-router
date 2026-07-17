@@ -98,7 +98,9 @@ class ConfigTests(unittest.TestCase):
                 mcp_only=False,
                 permission_policy=policy,
             )
-        self.assertIn("mcp_only=False conflicts with permission_policy mcp_only=True", str(ctx.exception))
+        self.assertIn(
+            "mcp_only=False conflicts with permission_policy mcp_only=True", str(ctx.exception)
+        )
 
     def test_load_app_config_reads_yaml_and_router_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

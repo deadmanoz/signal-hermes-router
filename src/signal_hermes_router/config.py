@@ -147,7 +147,7 @@ class Route:
                 "Route mcp_only=False conflicts with permission_policy mcp_only=True; "
                 "set route mcp_only=True or remove mcp_only from the policy"
             )
-        if self.permission_policy.mcp_only != self.mcp_only:
+        if self.mcp_only and not self.permission_policy.mcp_only:
             object.__setattr__(
                 self,
                 "permission_policy",

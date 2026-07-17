@@ -591,8 +591,8 @@ async def run_permission_preflight(
             continue
         checked_surface = surfaces.get(route.profile)
         ref = route_ref(index, route)
-        if checked_surface is not None:
-            for tool_name in checked_surface.tool_names:
+        if checked_surface is not None and not scope_errors:
+            for tool_name in sorted(checked_surface.tool_names):
                 if is_local_tool(tool_name):
                     local_tools.append(
                         LocalToolExposedIssue(
