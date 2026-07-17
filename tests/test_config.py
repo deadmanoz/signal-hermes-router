@@ -27,6 +27,81 @@ from signal_hermes_router.models import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_route_mcp_only_parsing(self) -> None:
+        from signal_hermes_router.config import parse_route
+
+        # explicit true
+        route = parse_route(
+            {
+                "platform": "signal",
+                "group_id": "EXAMPLE",
+                "profile": "test-profile",
+                "session_policy": "persistent_route",
+                "state": "active",
+                "mcp_only": True,
+            }
+        )
+        self.assertTrue(route.mcp_only)
+        self.assertTrue(route.permission_policy.mcp_only)
+        # explicit false
+        route = parse_route(
+            {
+                "platform": "signal",
+                "group_id": "EXAMPLE",
+                "profile": "test-profile",
+                "session_policy": "persistent_route",
+                "state": "active",
+                "mcp_only": False,
+            }
+        )
+        self.assertFalse(route.mcp_only)
+        self.assertFalse(route.permission_policy.mcp_only)
+        # default
+        route = parse_route(
+            {
+                "platform": "signal",
+                "group_id": "EXAMPLE",
+                "profile": "test-profile",
+                "session_policy": "persistent_route",
+                "state": "active",
+            }
+        )
+        self.assertFalse(route.mcp_only)
+        self.assertFalse(route.permission_policy.mcp_only)
+
+    def test_route_mcp_only_syncs_to_permission_policy(self) -> None:
+        from signal_hermes_router.config import Route
+        from signal_hermes_router.permissions import StaticPermissionPolicy
+
+        # Route constructed with mcp_only=True syncs to policy even when
+        # policy is passed without the flag.
+        policy = StaticPermissionPolicy.from_config([{"tool": "read_file"}])
+        route = Route(
+            platform="signal",
+            profile="test",
+            session_policy=SessionPolicy.PERSISTENT_ROUTE,
+            state=RouteState.ACTIVE,
+            mcp_only=True,
+            permission_policy=policy,
+        )
+        self.assertTrue(route.mcp_only)
+        self.assertTrue(route.permission_policy.mcp_only)
+        # Route constructed with mcp_only=False and a policy with mcp_only=True
+        # is a programmer error — the stricter setting must not be silently dropped.
+        policy = StaticPermissionPolicy.from_config([{"tool": "read_file"}], mcp_only=True)
+        with self.assertRaises(ValueError) as ctx:
+            Route(
+                platform="signal",
+                profile="test",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                mcp_only=False,
+                permission_policy=policy,
+            )
+        self.assertIn(
+            "mcp_only=False conflicts with permission_policy mcp_only=True", str(ctx.exception)
+        )
+
     def test_load_app_config_reads_yaml_and_router_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -387,6 +462,72 @@ router:
         self.assertEqual(jobs[0].kind, SyntheticTurnKind.SCHEDULED_JOB)
         self.assertEqual(jobs[0].namespace, "scheduled:daily-agenda")
         self.assertIsNotNone(jobs[0].permission_policy)
+
+    def test_scheduled_jobs_on_mcp_only_route_inherit_mcp_only_flag(self) -> None:
+        routes = tuple(
+            parse_routes(
+                {
+                    "routes": [
+                        {
+                            "platform": "signal",
+                            "group_id": "GROUP",
+                            "profile": "profile",
+                            "name": "mcp-route",
+                            "mcp_only": True,
+                        }
+                    ]
+                }
+            )
+        )
+
+        jobs = parse_scheduled_jobs(
+            {
+                "scheduled_jobs": [
+                    {
+                        "id": "daily-agenda",
+                        "route": "mcp-route",
+                        "prompt": "Prepare the daily agenda.",
+                        "permissions": [{"tool": "read_file"}],
+                    }
+                ]
+            },
+            routes,
+        )
+
+        self.assertTrue(jobs[0].permission_policy.mcp_only)
+
+    def test_notifications_on_mcp_only_route_inherit_mcp_only_flag(self) -> None:
+        routes = tuple(
+            parse_routes(
+                {
+                    "routes": [
+                        {
+                            "platform": "signal",
+                            "group_id": "GROUP",
+                            "profile": "profile",
+                            "name": "mcp-route",
+                            "mcp_only": True,
+                        }
+                    ]
+                }
+            )
+        )
+
+        notifications = parse_notifications(
+            {
+                "notifications": [
+                    {
+                        "id": "backup-report",
+                        "route": "mcp-route",
+                        "prompt": "Summarize the notification payload.",
+                        "permissions": [{"tool": "read_file"}],
+                    }
+                ]
+            },
+            routes,
+        )
+
+        self.assertTrue(notifications[0].permission_policy.mcp_only)
 
     def test_notifications_parse_against_named_routes(self) -> None:
         routes = tuple(

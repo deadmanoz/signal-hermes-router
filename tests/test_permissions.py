@@ -20,6 +20,42 @@ REQUEST = {
 
 
 class PermissionTests(unittest.TestCase):
+    def test_mcp_only_policy_rejects_local_tools(self) -> None:
+        from signal_hermes_router.permissions import StaticPermissionPolicy
+
+        # MCP-only policy with an allowlisted local tool — the defense-in-depth backstop rejects it
+        policy = StaticPermissionPolicy.from_config([{"tool": "terminal/create"}], mcp_only=True)
+        self.assertFalse(policy.allows_tool_call({"toolName": "terminal/create"}))
+        self.assertFalse(policy.allows_tool_call({"toolName": "fs/read_text_file"}))
+        # Non-local allowed tool on MCP-only route is still allowed
+        policy = StaticPermissionPolicy.from_config([{"tool": "web_search"}], mcp_only=True)
+        self.assertTrue(policy.allows_tool_call({"toolName": "web_search"}))
+        # On non-MCP-only route, local tools are governed by the allowlist only
+        policy = StaticPermissionPolicy.from_config([{"tool": "terminal/create"}], mcp_only=False)
+        self.assertTrue(policy.allows_tool_call({"toolName": "terminal/create"}))
+
+    def test_mcp_only_policy_rejects_mixed_case_local_tools(self) -> None:
+        from signal_hermes_router.permissions import StaticPermissionPolicy
+
+        policy = StaticPermissionPolicy.from_config([{"tool": "Bash"}], mcp_only=True)
+        self.assertFalse(policy.allows_tool_call({"toolName": "Bash"}))
+        self.assertFalse(policy.allows_tool_call({"toolName": "Terminal/Create"}))
+        self.assertFalse(policy.allows_tool_call({"toolName": "FS/Read_Text_File"}))
+        self.assertFalse(policy.allows_tool_call({"toolName": "PYTHON"}))
+        # Bare local-tool names (not just prefixes)
+        self.assertFalse(policy.allows_tool_call({"toolName": "shell"}))
+        self.assertFalse(policy.allows_tool_call({"toolName": "terminal"}))
+        self.assertFalse(policy.allows_tool_call({"toolName": "fs"}))
+
+    def test_mcp_only_policy_allows_benign_mcp_tools(self) -> None:
+        from signal_hermes_router.permissions import StaticPermissionPolicy
+
+        policy = StaticPermissionPolicy.from_config(
+            [{"tool": "code_search"}, {"tool": "python_docs"}], mcp_only=True
+        )
+        self.assertTrue(policy.allows_tool_call({"toolName": "code_search"}))
+        self.assertTrue(policy.allows_tool_call({"toolName": "python_docs"}))
+
     def test_default_denies(self) -> None:
         response = StaticPermissionPolicy().acp_response(REQUEST)
         self.assertEqual(response["outcome"]["optionId"], "reject")

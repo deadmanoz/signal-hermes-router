@@ -4,7 +4,7 @@ import hashlib
 import logging
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, TypeVar
@@ -137,6 +137,22 @@ class Route:
     session_max_age_seconds: float | None = None
     max_event_age_seconds: float | None = None
     inbound_rate_limit: InboundRateLimitConfig | None = None
+    mcp_only: bool = False
+
+    def __post_init__(self) -> None:
+        # Sync the permission_policy mcp_only flag from the route-level flag
+        # so there is one source of truth. Required for frozen dataclass.
+        if self.permission_policy.mcp_only and not self.mcp_only:
+            raise ValueError(
+                "Route mcp_only=False conflicts with permission_policy mcp_only=True; "
+                "set route mcp_only=True or remove mcp_only from the policy"
+            )
+        if self.mcp_only and not self.permission_policy.mcp_only:
+            object.__setattr__(
+                self,
+                "permission_policy",
+                replace(self.permission_policy, mcp_only=self.mcp_only),
+            )
 
     @property
     def key(self) -> str:
@@ -557,6 +573,7 @@ def _parse_synthetic_definitions(
         if not prompt.strip():
             raise ValueError(f"{key}[{index}] prompt must not be empty")
         raw_permissions = value.get("permissions")
+        route = named_routes[route_name]
         definitions.append(
             factory(
                 id=synthetic_id,
@@ -564,7 +581,7 @@ def _parse_synthetic_definitions(
                 prompt=prompt,
                 description=value.get("description"),
                 permission_policy=(
-                    StaticPermissionPolicy.from_config(raw_permissions)
+                    StaticPermissionPolicy.from_config(raw_permissions, mcp_only=route.mcp_only)
                     if raw_permissions is not None
                     else None
                 ),
@@ -628,6 +645,7 @@ def parse_route(raw: dict[str, Any]) -> Route:
         raise ValueError(
             "session_max_turns/session_max_age_seconds require a persistent session_policy"
         )
+    mcp_only = _as_bool(raw.get("mcp_only", False))
     return Route(
         platform=platform,
         name=normalize_safe_token(route_name, "route name") if route_name is not None else None,
@@ -650,6 +668,7 @@ def parse_route(raw: dict[str, Any]) -> Route:
         session_max_age_seconds=session_max_age_seconds,
         max_event_age_seconds=max_event_age_seconds,
         inbound_rate_limit=_parse_inbound_rate_limit(raw.get("inbound_rate_limit")),
+        mcp_only=mcp_only,
     )
 
 

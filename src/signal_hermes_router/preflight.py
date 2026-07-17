@@ -8,7 +8,7 @@ from typing import Any
 
 from .config import AppConfig, Route
 from .models import RouteState
-from .permissions import StaticPermissionPolicy
+from .permissions import StaticPermissionPolicy, is_local_tool
 
 
 ProbeCallable = Callable[[str], Awaitable["ToolSurface"]]
@@ -340,17 +340,48 @@ class PreflightScopeError:
 
 
 @dataclass(frozen=True)
+class LocalToolExposedIssue:
+    route_ref: str
+    profile: str
+    tool_name: str
+    source_kind: str = "profile_surface"
+    source_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "route_ref": self.route_ref,
+            "profile": self.profile,
+            "tool": self.tool_name,
+            "source_kind": self.source_kind,
+        }
+        if self.source_id is not None:
+            value["source_id"] = self.source_id
+        return value
+
+    def to_issue(self) -> dict[str, Any]:
+        value = self.to_dict()
+        value["code"] = "local_tool_exposed"
+        return value
+
+
+@dataclass(frozen=True)
 class PreflightReport:
     expected_permissions: tuple[ExpectedPermissionTool, ...]
     missing_tools: tuple[ExpectedPermissionTool, ...]
     probe_errors: tuple[PreflightProbeError, ...]
     scope_errors: tuple[PreflightScopeError, ...]
+    local_tools_exposed: tuple[LocalToolExposedIssue, ...]
     checked_profiles: tuple[str, ...]
     scope: PreflightScope
 
     @property
     def ok(self) -> bool:
-        return not self.missing_tools and not self.probe_errors and not self.scope_errors
+        return (
+            not self.missing_tools
+            and not self.probe_errors
+            and not self.scope_errors
+            and not self.local_tools_exposed
+        )
 
     @property
     def status(self) -> str:
@@ -360,6 +391,7 @@ class PreflightReport:
         issues = [tool.to_issue() for tool in self.missing_tools]
         issues.extend(error.to_issue() for error in self.probe_errors)
         issues.extend(error.to_issue() for error in self.scope_errors)
+        issues.extend(issue.to_issue() for issue in self.local_tools_exposed)
         return {
             "status": self.status,
             "scope": self.scope.to_dict(),
@@ -372,6 +404,8 @@ class PreflightReport:
             "missing_tools": [tool.to_dict() for tool in self.missing_tools],
             "probe_errors": [error.to_dict() for error in self.probe_errors],
             "scope_errors": [error.to_dict() for error in self.scope_errors],
+            "local_tools_exposed_count": len(self.local_tools_exposed),
+            "local_tools_exposed": [issue.to_dict() for issue in self.local_tools_exposed],
         }
 
 
@@ -509,7 +543,12 @@ async def run_permission_preflight(
                 error="preflight scope did not match any route",
             )
         )
-    profiles = tuple(sorted({tool.profile for tool in expected}))
+    mcp_only_profiles = {
+        route.profile
+        for index, route in enumerate(config.routes)
+        if effective_scope.matches_route(index, route) and route.mcp_only
+    }
+    profiles = tuple(sorted({tool.profile for tool in expected} | mcp_only_profiles))
     surfaces: dict[str, ToolSurface] = {}
     probe_errors: list[PreflightProbeError] = []
     profiles_to_probe = () if scope_errors else profiles
@@ -543,11 +582,114 @@ async def run_permission_preflight(
         if checked_surface is not None and tool.tool_name not in checked_surface.tool_names:
             missing.append(tool)
     missing.sort(key=lambda item: (item.profile, item.route_ref, item.source_kind, item.tool_name))
+
+    local_tools: list[LocalToolExposedIssue] = []
+    # Build an id-keyed ref map so synthetic definitions can resolve route_ref
+    # consistently with collect_expected_permission_tools.
+    route_ref_by_id = {
+        id(route): route_ref(index, route)
+        for index, route in enumerate(config.routes)
+        if effective_scope.matches_route(index, route)
+    }
+    # Skip the entire local-tool scan when the scope is unvalidatable so the
+    # report does not emit findings derived from a scope it has just declared
+    # uncheckable.
+    if not scope_errors:
+        for index, route in enumerate(config.routes):
+            if not effective_scope.matches_route(index, route):
+                continue
+            if not route.mcp_only:
+                continue
+            checked_surface = surfaces.get(route.profile)
+            ref = route_ref(index, route)
+            if checked_surface is not None:
+                for tool_name in sorted(checked_surface.tool_names):
+                    if is_local_tool(tool_name):
+                        local_tools.append(
+                            LocalToolExposedIssue(
+                                route_ref=ref,
+                                profile=route.profile,
+                                tool_name=tool_name,
+                                source_kind="profile_surface",
+                            )
+                        )
+            # Also flag local tools in the route's own allowlist — the runtime
+            # backstop rejects these, so preflight should surface the config mistake.
+            for rule in route.permission_policy.rules:
+                if is_local_tool(rule.tool_name):
+                    local_tools.append(
+                        LocalToolExposedIssue(
+                            route_ref=ref,
+                            profile=route.profile,
+                            tool_name=rule.tool_name,
+                            source_kind="route",
+                        )
+                    )
+        # Also scan synthetic definitions (jobs/notifications) for local tools
+        # on mcp_only routes, but only when the route is in scope.
+        for job in config.scheduled_jobs:
+            route = config.find_route_by_name(job.route_name)
+            if route is None or id(route) not in route_ref_by_id:
+                continue
+            if not route.mcp_only:
+                continue
+            if job.permission_policy is not None:
+                ref = route_ref_by_id[id(route)]
+                for rule in job.permission_policy.rules:
+                    if is_local_tool(rule.tool_name):
+                        local_tools.append(
+                            LocalToolExposedIssue(
+                                route_ref=ref,
+                                profile=route.profile,
+                                tool_name=rule.tool_name,
+                                source_kind="scheduled_job",
+                                source_id=job.id,
+                            )
+                        )
+        for notification in config.notifications:
+            route = config.find_route_by_name(notification.route_name)
+            if route is None or id(route) not in route_ref_by_id:
+                continue
+            if not route.mcp_only:
+                continue
+            if notification.permission_policy is not None:
+                ref = route_ref_by_id[id(route)]
+                for rule in notification.permission_policy.rules:
+                    if is_local_tool(rule.tool_name):
+                        local_tools.append(
+                            LocalToolExposedIssue(
+                                route_ref=ref,
+                                profile=route.profile,
+                                tool_name=rule.tool_name,
+                                source_kind="notification",
+                                source_id=notification.id,
+                            )
+                        )
+    # Deduplicate within each source so distinct same-source tools are preserved.
+    seen_local_tools: set[tuple[str, str, str, str, str | None]] = set()
+    deduped: list[LocalToolExposedIssue] = []
+    for issue in local_tools:
+        key = (issue.route_ref, issue.profile, issue.tool_name, issue.source_kind, issue.source_id)
+        if key not in seen_local_tools:
+            seen_local_tools.add(key)
+            deduped.append(issue)
+    local_tools = deduped
+    local_tools.sort(
+        key=lambda item: (
+            item.profile,
+            item.route_ref,
+            item.tool_name,
+            item.source_kind,
+            item.source_id or "",
+        )
+    )
+
     return PreflightReport(
         expected_permissions=expected,
         missing_tools=tuple(missing),
         probe_errors=tuple(probe_errors),
         scope_errors=tuple(scope_errors),
+        local_tools_exposed=tuple(local_tools),
         checked_profiles=profiles,
         scope=effective_scope,
     )
@@ -580,6 +722,7 @@ def format_preflight_report_dict(data: dict[str, Any]) -> str:
         "Configured permission tool entries: "
         f"{data.get('expected_permissions_count', len(data.get('expected_permissions') or []))}",
         f"Missing tool entries: {data.get('missing_tools_count', len(data.get('missing_tools') or []))}",
+        f"Local tool entries: {data.get('local_tools_exposed_count', len(data.get('local_tools_exposed') or []))}",
     ]
     probe_errors = data.get("probe_errors") or []
     if probe_errors:
@@ -606,6 +749,18 @@ def format_preflight_report_dict(data: dict[str, Any]) -> str:
                 source = f"{source}:{tool['source_id']}"
             lines.append(
                 f"- {tool.get('route_ref')} {tool.get('profile')} {source} {tool.get('tool')}"
+            )
+    local_tools = data.get("local_tools_exposed") or []
+    if local_tools:
+        lines.append("Local tools exposed:")
+        for issue in local_tools:
+            if not isinstance(issue, dict):
+                continue
+            source = issue.get("source_kind", "profile_surface")
+            if issue.get("source_id") is not None:
+                source = f"{source}:{issue['source_id']}"
+            lines.append(
+                f"- {issue.get('route_ref')} {issue.get('profile')} {source} {issue.get('tool')}"
             )
     return "\n".join(lines)
 

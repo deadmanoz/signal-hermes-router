@@ -68,6 +68,7 @@ def make_route(
     session_max_age_seconds: float | None = None,
     max_event_age_seconds: float | None = None,
     inbound_rate_limit: InboundRateLimitConfig | None = None,
+    mcp_only: bool = False,
 ) -> Route:
     return Route(
         platform=platform,
@@ -89,6 +90,7 @@ def make_route(
         session_max_age_seconds=session_max_age_seconds,
         max_event_age_seconds=max_event_age_seconds,
         inbound_rate_limit=inbound_rate_limit,
+        mcp_only=mcp_only,
     )
 
 

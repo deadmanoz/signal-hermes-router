@@ -1,9 +1,50 @@
 from __future__ import annotations
 
+import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+
+LOGGER = logging.getLogger(__name__)
+
+# Tool names that are considered local-terminal/fs execution primitives.
+# These are defense-in-depth rejected on mcp_only routes via StaticPermissionPolicy.
+_LOCAL_TOOL_NAMES = frozenset(
+    {
+        "shell",
+        "bash",
+        "sh",
+        "zsh",
+        "python",
+        "exec",
+        "execute",
+        "run",
+        "run_command",
+        "run_shell_command",
+        "subprocess",
+        "code_interpreter",
+        "terminal",
+        "fs",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_directory",
+        "create_directory",
+        "delete_file",
+        "move_file",
+        "copy_file",
+    }
+)
+_LOCAL_TOOL_PREFIXES = ("terminal/", "fs/")
+
+
+def is_local_tool(tool_name: str) -> bool:
+    """Return True if tool_name matches a known local-terminal/fs pattern."""
+    lower = tool_name.lower()
+    if lower in _LOCAL_TOOL_NAMES:
+        return True
+    return lower.startswith(_LOCAL_TOOL_PREFIXES)
 
 
 @dataclass(frozen=True)
@@ -87,13 +128,19 @@ class PermissionRule:
         return True
 
 
-@dataclass
+@dataclass(frozen=True)
 class StaticPermissionPolicy:
     rules: tuple[PermissionRule, ...] = ()
+    mcp_only: bool = False
 
     @classmethod
-    def from_config(cls, values: list[dict[str, Any]] | None) -> "StaticPermissionPolicy":
-        return cls(tuple(PermissionRule.from_config(value) for value in values or []))
+    def from_config(
+        cls, values: list[dict[str, Any]] | None, *, mcp_only: bool = False
+    ) -> "StaticPermissionPolicy":
+        return cls(
+            tuple(PermissionRule.from_config(value) for value in values or []),
+            mcp_only=mcp_only,
+        )
 
     def allows_tool_call(self, tool_call: dict[str, Any]) -> bool:
         tool_name = (
@@ -103,6 +150,13 @@ class StaticPermissionPolicy:
             or tool_call.get("title")
             or ""
         )
+        if self.mcp_only and is_local_tool(str(tool_name)):
+            safe_name = str(tool_name).replace("\n", "\\n").replace("\r", "\\r")[:80]
+            LOGGER.info(
+                "mcp_only policy rejected local tool call: %s",
+                safe_name,
+            )
+            return False
         raw_input = tool_call.get("rawInput") or tool_call.get("raw_input") or {}
         if not isinstance(raw_input, dict):
             raw_input = {"value": raw_input}
@@ -120,6 +174,12 @@ class StaticPermissionPolicy:
     @staticmethod
     def _reject_option(request: dict[str, Any]) -> str | None:
         return _first_option_id(request, ("reject_once", "reject_always"))
+
+    def with_mcp_only(self, mcp_only: bool) -> "StaticPermissionPolicy":
+        """Return a copy with mcp_only set, for enforcement-point override."""
+        if self.mcp_only == mcp_only:
+            return self
+        return replace(self, mcp_only=mcp_only)
 
     def acp_response(self, request: dict[str, Any]) -> dict[str, Any]:
         option_id = self.select_option(request)

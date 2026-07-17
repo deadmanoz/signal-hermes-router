@@ -246,6 +246,16 @@ def preflight_failure_from_report(
             detail="configured permission tool is missing from profile tool surface",
             redactor=redactor,
         )
+    local_tools_exposed = getattr(report, "local_tools_exposed", ())
+    if local_tools_exposed:
+        # Checked before probe/scope errors so that a config-level local-tool
+        # exposure (which does not depend on a successful probe) is classified
+        # as a permission problem, not a transient preflight problem.
+        return failure_info(
+            FailureCode.PERMISSION_DENIED,
+            detail="local terminal tools are exposed on an mcp_only route",
+            redactor=redactor,
+        )
     probe_errors = getattr(report, "probe_errors", ())
     scope_errors = getattr(report, "scope_errors", ())
     if probe_errors or scope_errors:

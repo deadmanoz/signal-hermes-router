@@ -98,6 +98,417 @@ def preflight_app(tmp: str | Path) -> AppConfig:
 
 
 class PreflightTests(unittest.IsolatedAsyncioTestCase):
+    async def test_preflight_reports_local_tools_for_mcp_only_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = preflight_app(tmp)
+            # Make the active route MCP-only
+            active = make_route(
+                name="active-route",
+                group_id="EXAMPLE_ACTIVE_GROUP",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("todo_create"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=app.router,
+                routes=(active,),
+                scheduled_jobs=(),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(
+                    profile, ["todo_create", "terminal/create", "fs/read_text_file"]
+                )
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
+        self.assertEqual(len(local_tools), 2)
+        self.assertEqual(
+            sorted([issue["tool"] for issue in local_tools]),
+            ["fs/read_text_file", "terminal/create"],
+        )
+        # todo_create is not a known local-tool pattern so it is not flagged
+        self.assertNotIn("todo_create", [issue["tool"] for issue in local_tools])
+
+    async def test_preflight_flags_local_tools_in_route_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            active = make_route(
+                name="mcp-only-allowlist",
+                group_id="EXAMPLE_MCP_ALLOWLIST",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("bash", "todo_create"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(active,),
+                scheduled_jobs=(),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["todo_create"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
+        self.assertEqual(len(local_tools), 1)
+        self.assertEqual(local_tools[0]["tool"], "bash")
+
+    async def test_preflight_dedups_local_tool_found_in_surface_and_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            active = make_route(
+                name="mcp-dedup",
+                group_id="EXAMPLE_MCP_DEDUP",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("bash", "todo_create"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(active,),
+                scheduled_jobs=(),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["todo_create", "bash"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
+        # bash is in both the surface and the allowlist; with source_kind in the dedup key
+        # they are kept as separate issues so the operator can see both remediation paths.
+        self.assertEqual(len(local_tools), 2)
+        tools = sorted([issue["tool"] for issue in local_tools])
+        kinds = sorted([issue["source_kind"] for issue in local_tools])
+        self.assertEqual(tools, ["bash", "bash"])
+        self.assertEqual(kinds, ["profile_surface", "route"])
+
+    async def test_preflight_dedups_case_variant_local_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            active = make_route(
+                name="mcp-case",
+                group_id="EXAMPLE_MCP_CASE",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("Bash", "todo_create"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(active,),
+                scheduled_jobs=(),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["todo_create", "bash"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
+        # "Bash" in allowlist and "bash" in surface are the same tool but different sources;
+        # with source_kind in the dedup key they are kept as separate issues.
+        self.assertEqual(len(local_tools), 2)
+        tools = sorted([issue["tool"] for issue in local_tools])
+        kinds = sorted([issue["source_kind"] for issue in local_tools])
+        # Surface retains original casing; allowlist retains its casing
+        self.assertEqual(tools, ["Bash", "bash"])
+        self.assertEqual(kinds, ["profile_surface", "route"])
+
+    async def test_preflight_flags_local_tools_in_scheduled_job_on_mcp_only_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = make_route(
+                name="mcp-route",
+                group_id="EXAMPLE_MCP",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("todo_create"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(route,),
+                scheduled_jobs=(
+                    SyntheticRouteJob(
+                        id="daily-job",
+                        route_name="mcp-route",
+                        prompt="Run daily task",
+                        permission_policy=StaticPermissionPolicy.from_config([{"tool": "bash"}]),
+                    ),
+                ),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["todo_create"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
+        self.assertEqual(len(local_tools), 1)
+        self.assertEqual(local_tools[0]["tool"], "bash")
+        self.assertEqual(local_tools[0]["route_ref"], "route:mcp-route")
+        self.assertEqual(local_tools[0]["source_kind"], "scheduled_job")
+        self.assertEqual(local_tools[0]["source_id"], "daily-job")
+
+    async def test_preflight_flags_local_tools_in_notification_on_mcp_only_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = make_route(
+                name="mcp-route",
+                group_id="EXAMPLE_MCP",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("todo_create"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(route,),
+                scheduled_jobs=(),
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="alert",
+                        route_name="mcp-route",
+                        prompt="Alert",
+                        permission_policy=StaticPermissionPolicy.from_config(
+                            [{"tool": "terminal/create"}]
+                        ),
+                    ),
+                ),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["todo_create"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
+        self.assertEqual(len(local_tools), 1)
+        self.assertEqual(local_tools[0]["tool"], "terminal/create")
+        self.assertEqual(local_tools[0]["route_ref"], "route:mcp-route")
+        self.assertEqual(local_tools[0]["source_kind"], "notification")
+        self.assertEqual(local_tools[0]["source_id"], "alert")
+
+    async def test_preflight_local_tools_respects_scope_for_synthetic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            normal_route = make_route(
+                name="normal-route",
+                group_id="EXAMPLE_NORMAL",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("todo_create"),
+                mcp_only=False,
+            )
+            mcp_route = make_route(
+                name="mcp-route",
+                group_id="EXAMPLE_MCP",
+                profile="calendar",
+                state=RouteState.SHADOW,
+                permission_policy=policy("todo_create"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(normal_route, mcp_route),
+                scheduled_jobs=(
+                    SyntheticRouteJob(
+                        id="daily-job",
+                        route_name="mcp-route",
+                        prompt="Run daily task",
+                        permission_policy=StaticPermissionPolicy.from_config([{"tool": "bash"}]),
+                    ),
+                ),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["todo_create"])
+
+            # active_only scope matches normal-route but excludes shadow mcp-route;
+            # synthetic job on mcp-route should not be flagged
+            report = await run_permission_preflight(
+                app, probe, scope=PreflightScope(active_only=True)
+            )
+
+        self.assertEqual(report.status, "ok")
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
+        self.assertEqual(len(local_tools), 0)
+
+    async def test_preflight_distinguishes_two_jobs_with_same_local_tool(self) -> None:
+        """Two different scheduled jobs on the same mcp_only route that each
+        allowlist the same local tool should produce separate issues so the
+        operator knows both jobs need fixing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            route = make_route(
+                name="mcp-route",
+                group_id="EXAMPLE_MCP",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("web_search"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(route,),
+                scheduled_jobs=(
+                    SyntheticRouteJob(
+                        id="morning-job",
+                        route_name="mcp-route",
+                        prompt="Morning task",
+                        permission_policy=StaticPermissionPolicy.from_config([{"tool": "bash"}]),
+                    ),
+                    SyntheticRouteJob(
+                        id="evening-job",
+                        route_name="mcp-route",
+                        prompt="Evening task",
+                        permission_policy=StaticPermissionPolicy.from_config([{"tool": "bash"}]),
+                    ),
+                ),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["web_search"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
+        self.assertEqual(len(local_tools), 2)
+        ids = sorted([issue["source_id"] for issue in local_tools])
+        self.assertEqual(ids, ["evening-job", "morning-job"])
+
+    async def test_preflight_local_tools_per_route_not_per_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mcp_route = make_route(
+                name="mcp-route",
+                group_id="EXAMPLE_MCP",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("todo_create"),
+                mcp_only=True,
+            )
+            normal_route = make_route(
+                name="normal-route",
+                group_id="EXAMPLE_NORMAL",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("todo_create"),
+                mcp_only=False,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(mcp_route, normal_route),
+                scheduled_jobs=(),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["todo_create", "terminal/create"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
+        # Only the mcp_only route is flagged; normal_route is not
+        self.assertEqual(len(local_tools), 1)
+        self.assertEqual(local_tools[0]["route_ref"], "route:mcp-route")
+        self.assertEqual(local_tools[0]["tool"], "terminal/create")
+        self.assertEqual(local_tools[0]["source_kind"], "profile_surface")
+
+    async def test_preflight_reports_local_tools_for_mcp_only_route_with_empty_allowlist(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            active = make_route(
+                name="mcp-only-empty",
+                group_id="EXAMPLE_MCP_EMPTY",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy(),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(active,),
+                scheduled_jobs=(),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["terminal/create"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
+        self.assertEqual(len(local_tools), 1)
+        self.assertEqual(local_tools[0]["tool"], "terminal/create")
+        self.assertEqual(local_tools[0]["source_kind"], "profile_surface")
+
+    async def test_mcp_only_route_preflight_shows_missing_and_local_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            active = make_route(
+                name="mcp-only-route",
+                group_id="EXAMPLE_MCP_GROUP",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("calendar_search"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(active,),
+                scheduled_jobs=(),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["calendar_search", "terminal/create", "bash"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        issues = report.to_dict()["issues"]
+        missing = [i for i in issues if i["code"] == "missing_tool"]
+        local_tools = [i for i in issues if i["code"] == "local_tool_exposed"]
+        self.assertEqual(len(missing), 0)  # calendar_search is present
+        self.assertEqual(len(local_tools), 2)
+        self.assertEqual(sorted([i["tool"] for i in local_tools]), ["bash", "terminal/create"])
+
     async def test_preflight_reports_missing_tools_without_private_route_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = preflight_app(tmp)
@@ -856,6 +1267,38 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(report.to_dict()["issues"][0]["code"], "unmatched_route_name")
 
+    async def test_scope_error_prevents_allowlist_local_tool_scan(self) -> None:
+        """When scope_errors is set, the local-tool scan is skipped entirely so
+        findings are not derived from a scope the report has just declared
+        uncheckable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(
+                    make_route(
+                        name="mcp-route",
+                        group_id="EXAMPLE_MCP",
+                        profile="calendar",
+                        state=RouteState.ACTIVE,
+                        permission_policy=policy("bash"),
+                        mcp_only=True,
+                    ),
+                ),
+            )
+            report = await run_permission_preflight(
+                app,
+                unavailable_tool_surface_probe,
+                scope=PreflightScope(route_names=("typo-route",)),
+            )
+
+        self.assertEqual(report.status, "failed")
+        self.assertEqual(report.local_tools_exposed, ())
+        self.assertEqual(len(report.scope_errors), 1)
+        self.assertEqual(report.scope_errors[0].code, "unmatched_route_name")
+        # No local_tool_exposed issues despite the mcp_only route allowlisting bash
+        issues = report.to_dict()["issues"]
+        self.assertTrue(all(issue["code"] != "local_tool_exposed" for issue in issues))
+
     async def test_scope_reports_each_unmatched_selector(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             report = await run_permission_preflight(
@@ -983,7 +1426,33 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
 
         missing_output = format_preflight_report(missing_report)
         self.assertIn("Missing tools:", missing_output)
-        self.assertIn("route:active-route calendar route read_file", missing_output)
+        self.assertIn("route:active-route calendar route web_search", missing_output)
+
+        # Local tools exposed section
+        with tempfile.TemporaryDirectory() as tmp:
+            local_app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(
+                    make_route(
+                        name="mcp-only-route",
+                        group_id="EXAMPLE_MCP_GROUP",
+                        profile="calendar",
+                        state=RouteState.ACTIVE,
+                        permission_policy=policy("web_search"),
+                        mcp_only=True,
+                    ),
+                ),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["web_search", "terminal/create"])
+
+            local_report = await run_permission_preflight(local_app, probe)
+
+        local_output = format_preflight_report(local_report)
+        self.assertIn("Local tool entries: 1", local_output)
+        self.assertIn("Local tools exposed:", local_output)
+        self.assertIn("route:mcp-only-route calendar profile_surface terminal/create", local_output)
 
     async def test_unavailable_probe_reports_contract_requirement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1017,6 +1486,90 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(report.missing_tools, ())
         self.assertEqual(report.scope_errors, ())
+
+    async def test_preflight_probe_failure_on_mcp_only_route_reports_preflight_failed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(
+                    make_route(
+                        name="mcp-only-route",
+                        group_id="EXAMPLE_MCP_GROUP",
+                        profile="calendar",
+                        state=RouteState.ACTIVE,
+                        permission_policy=policy("web_search"),
+                        mcp_only=True,
+                    ),
+                ),
+            )
+
+            report = await run_permission_preflight(
+                app,
+                unavailable_tool_surface_probe,
+                scope=PreflightScope(active_only=True),
+            )
+
+        self.assertEqual(report.status, "failed")
+        self.assertEqual(len(report.probe_errors), 1)
+        self.assertEqual(report.probe_errors[0].code, "probe_contract_required")
+        self.assertEqual(report.missing_tools, ())
+        # Allowlist scan still runs when probe fails (gated on not scope_errors),
+        # but web_search is not a local tool so local_tools_exposed remains empty.
+        # preflight_failure_from_report returns PREFLIGHT_FAILED, not PERMISSION_DENIED
+        from signal_hermes_router.failures import (
+            FailureCode,
+            preflight_failure_from_report,
+        )
+
+        failure = preflight_failure_from_report(report)
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure.code, FailureCode.PREFLIGHT_FAILED)
+
+    async def test_preflight_probe_failure_with_allowlisted_local_tool_returns_permission_denied(
+        self,
+    ) -> None:
+        """local_tools_exposed is checked before probe_errors, so an allowlisted
+        local tool on an mcp_only route takes precedence over the probe failure."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(
+                    make_route(
+                        name="mcp-only-route",
+                        group_id="EXAMPLE_MCP_GROUP",
+                        profile="calendar",
+                        state=RouteState.ACTIVE,
+                        permission_policy=policy("bash"),
+                        mcp_only=True,
+                    ),
+                ),
+            )
+
+            report = await run_permission_preflight(
+                app,
+                unavailable_tool_surface_probe,
+                scope=PreflightScope(active_only=True),
+            )
+
+        self.assertEqual(report.status, "failed")
+        self.assertEqual(len(report.probe_errors), 1)
+        self.assertEqual(report.probe_errors[0].code, "probe_contract_required")
+        # Allowlist scan still runs (gated on not scope_errors), so local_tools_exposed is populated
+        self.assertEqual(len(report.local_tools_exposed), 1)
+        self.assertEqual(report.local_tools_exposed[0].tool_name, "bash")
+        self.assertEqual(report.local_tools_exposed[0].source_kind, "route")
+        # preflight_failure_from_report returns PERMISSION_DENIED because local_tools_exposed
+        # is checked before probe_errors
+        from signal_hermes_router.failures import (
+            FailureCode,
+            preflight_failure_from_report,
+        )
+
+        failure = preflight_failure_from_report(report)
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure.code, FailureCode.PERMISSION_DENIED)
 
     def test_parse_preflight_scope_validates_selector_shape(self) -> None:
         scope = parse_preflight_scope(

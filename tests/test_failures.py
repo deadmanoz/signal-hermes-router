@@ -362,19 +362,32 @@ class FailureClassificationTests(unittest.TestCase):
 
     def test_preflight_report_failure_classification(self) -> None:
         permission = preflight_failure_from_report(
-            SimpleNamespace(missing_tools=(object(),), probe_errors=(), scope_errors=())
+            SimpleNamespace(
+                missing_tools=(object(),), probe_errors=(), scope_errors=(), local_tools_exposed=()
+            )
         )
         preflight = preflight_failure_from_report(
-            SimpleNamespace(missing_tools=(), probe_errors=(object(),), scope_errors=())
+            SimpleNamespace(
+                missing_tools=(), probe_errors=(object(),), scope_errors=(), local_tools_exposed=()
+            )
+        )
+        local_tools = preflight_failure_from_report(
+            SimpleNamespace(
+                missing_tools=(), probe_errors=(), scope_errors=(), local_tools_exposed=(object(),)
+            )
         )
         ok = preflight_failure_from_report(
-            SimpleNamespace(missing_tools=(), probe_errors=(), scope_errors=())
+            SimpleNamespace(
+                missing_tools=(), probe_errors=(), scope_errors=(), local_tools_exposed=()
+            )
         )
 
         self.assertIsNotNone(permission)
         self.assertEqual(permission.code, FailureCode.PERMISSION_DENIED)
         self.assertIsNotNone(preflight)
         self.assertEqual(preflight.code, FailureCode.PREFLIGHT_FAILED)
+        self.assertIsNotNone(local_tools)
+        self.assertEqual(local_tools.code, FailureCode.PERMISSION_DENIED)
         self.assertIsNone(ok)
 
     def test_failure_info_serializes_fixed_public_message(self) -> None:

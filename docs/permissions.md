@@ -198,3 +198,17 @@ successful validation.
 ## Pre-activation requirement
 
 Create a private [profile audit checklist](profile-audit-checklist.md) record before activating or changing profile skills, Hermes version, or allowlists. Inspect the `hermes-acp` toolset for the exact tools exposed by the pinned Hermes version before activation.
+
+## MCP-only routes
+
+A route may be declared `mcp_only: true` in `routes.yaml`. When set, the router:
+
+1. **Preflight:** Reports `local_tool_exposed` issues for any tool whose name matches a known local-terminal/fs pattern (`terminal/*`, `fs/*`, `shell`, `bash`, `sh`, `zsh`, `python`, `exec`, `execute`, `run`, `run_command`, `run_shell_command`, `subprocess`, `code_interpreter`, `terminal`, `fs`, `read_file`, `write_file`, `edit_file`, `list_directory`, `create_directory`, `delete_file`, `move_file`, `copy_file`) when found in any of:
+   - the profile's `full_callable` surface;
+   - the route's own `permission_policy.rules` allowlist;
+   - any `scheduled_jobs[*].permission_policy.rules` allowlist for the route;
+   - any `notifications[*].permission_policy.rules` allowlist for the route.
+   This is a wiring signal, not a capability policy — it tells the operator the profile surface (or an allowlist) contains tools that look like local execution primitives. The pattern set is intentionally conservative and will not catch every possible local-tool name; a clean report is not evidence of absence. Conversely, bare-name entries (`python`, `fs`, `terminal`) may flag legitimately remote MCP tools that happen to share those names. In that case the remedy is to rename the tool in the profile or, if the tool is genuinely local, to remove `mcp_only` from the route.
+2. **Runtime defense-in-depth:** Rejects `session/request_permission` for any tool call matching those patterns, regardless of whether the tool name appears in the route's allowlist. This is a config-mistake guard (an operator who explicitly allowlisted a local tool on an `mcp_only` route still gets a reject), not a containment boundary. It only covers tools the agent routes through the permission prompt; deny-by-default already handles non-allowlisted tools.
+
+`mcp_only` does not change the ACP client capability advertisement (`terminal: False`, `fs: False`). It is an additional deployment-side gate that surfaces profile-local tool exposure. Profile safety remains owned by the Hermes profile config and the pre-activation audit checklist; the router's `mcp_only` flag is a wiring validation, not a replacement for profile-side tool curation.

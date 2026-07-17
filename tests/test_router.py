@@ -2694,6 +2694,70 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
+    async def test_mcp_only_route_enforces_runtime_local_tool_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="mcp-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                permission_policy=StaticPermissionPolicy.from_config([{"tool": "bash"}]),
+                mcp_only=True,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, routes=(route,)),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            await router.handle_event(make_event(timestamp=1))
+            # Route.__post_init__ already syncs permission_policy.mcp_only from the
+            # route flag, so the router line is a no-op for route-level policies.
+            # The synthetic job test below exercises the router upgrade path.
+            self.assertTrue(profile.policies[-1][1].mcp_only)
+            # Verify the policy actually rejects a local tool
+            self.assertFalse(profile.policies[-1][1].allows_tool_call({"toolName": "bash"}))
+
+    async def test_synthetic_job_on_mcp_only_route_enforces_local_tool_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="mcp-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                permission_policy=StaticPermissionPolicy.from_config(
+                    [{"tool": "read_file"}], mcp_only=True
+                ),
+                mcp_only=True,
+            )
+            job = SyntheticRouteJob(
+                id="daily-job",
+                route_name="mcp-route",
+                prompt="Run daily task",
+                permission_policy=StaticPermissionPolicy.from_config([{"tool": "bash"}]),
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(tmp, route, job),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            await router.handle_synthetic_job("daily-job", scheduled_at=1)
+            # The job policy (policies[0]) should have been upgraded to mcp_only=True
+            self.assertTrue(profile.policies[0][1].mcp_only)
+            # Verify the job policy actually rejects a local tool
+            self.assertFalse(profile.policies[0][1].allows_tool_call({"toolName": "bash"}))
+
     async def test_synthetic_failure_recovery_resets_replacement_session_policy(self) -> None:
         class RestartingSupervisor(FakeSupervisor):
             def __init__(self, initial: FakeProfile, replacement: FakeProfile) -> None:
@@ -3786,6 +3850,49 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["missing_tools_count"], 1)
         self.assertEqual(response["missing_tools"][0]["tool"], "web_search")
         self.assertEqual(response["issues"][0]["code"], "missing_tool")
+        self.assertEqual(response["failure"]["code"], "permission_denied")
+        self.assertNotIn("EXAMPLE_GROUP", json.dumps(response, sort_keys=True))
+
+    async def test_control_preflight_reports_local_tools_exposed_on_mcp_only_route(self) -> None:
+        from signal_hermes_router.preflight import ToolSurface
+
+        class LocalToolProfile(FakeProfile):
+            async def tool_surface(self) -> ToolSurface:
+                return ToolSurface.from_names(
+                    self.profile,
+                    ["web_search", "bash"],
+                    schema_version=1,
+                    scope="full_callable",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="mcp-route",
+                group_id="EXAMPLE_GROUP",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                mcp_only=True,
+            )
+            app = make_synthetic_app(tmp, route)
+            router = SignalHermesRouter(
+                app,
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(LocalToolProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            response = await router._handle_control_line(
+                b'{"command":"preflight_permissions","scope":{"active_only":true}}\n'
+            )
+
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(response["probe_errors"], [])
+        self.assertEqual(response["missing_tools_count"], 0)
+        self.assertEqual(response["local_tools_exposed_count"], 1)
+        self.assertEqual(response["local_tools_exposed"][0]["tool"], "bash")
+        self.assertEqual(response["issues"][0]["code"], "local_tool_exposed")
         self.assertEqual(response["failure"]["code"], "permission_denied")
         self.assertNotIn("EXAMPLE_GROUP", json.dumps(response, sort_keys=True))
 
