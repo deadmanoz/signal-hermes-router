@@ -34,6 +34,15 @@ class PermissionTests(unittest.TestCase):
         policy = StaticPermissionPolicy.from_config([{"tool": "terminal/create"}], mcp_only=False)
         self.assertTrue(policy.allows_tool_call({"toolName": "terminal/create"}))
 
+    def test_mcp_only_policy_rejects_mixed_case_local_tools(self) -> None:
+        from signal_hermes_router.permissions import StaticPermissionPolicy
+
+        policy = StaticPermissionPolicy.from_config([{"tool": "Bash"}], mcp_only=True)
+        self.assertFalse(policy.allows_tool_call({"toolName": "Bash"}))
+        self.assertFalse(policy.allows_tool_call({"toolName": "Terminal/Create"}))
+        self.assertFalse(policy.allows_tool_call({"toolName": "FS/Read_Text_File"}))
+        self.assertFalse(policy.allows_tool_call({"toolName": "PYTHON"}))
+
     def test_mcp_only_policy_allows_benign_mcp_tools(self) -> None:
         from signal_hermes_router.permissions import StaticPermissionPolicy
 

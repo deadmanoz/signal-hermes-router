@@ -2694,6 +2694,35 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
 
+    async def test_mcp_only_route_enforces_runtime_local_tool_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="mcp-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                permission_policy=StaticPermissionPolicy.from_config(
+                    [{"tool": "bash"}], mcp_only=True
+                ),
+                mcp_only=True,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, routes=(route,)),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            await router.handle_event(make_event(timestamp=1))
+            # The policy handed to the session should have mcp_only=True
+            self.assertTrue(profile.policies[-1][1].mcp_only)
+            # Verify the policy actually rejects a local tool
+            self.assertFalse(profile.policies[-1][1].allows_tool_call({"toolName": "bash"}))
+
     async def test_synthetic_failure_recovery_resets_replacement_session_policy(self) -> None:
         class RestartingSupervisor(FakeSupervisor):
             def __init__(self, initial: FakeProfile, replacement: FakeProfile) -> None:
