@@ -136,10 +136,7 @@ def validate_release_head(
                     errors.append(
                         "CHANGELOG.md release heading does not match the version transition"
                     )
-                elif (
-                    len(re.findall(r"^## \[\d+\.\d+\.\d+\]\(", new_section, flags=re.MULTILINE))
-                    != 1
-                ):
+                elif len(re.findall(r"^## ", new_section, flags=re.MULTILINE)) != 1:
                     errors.append("CHANGELOG.md must prepend exactly one release section")
     except (KeyError, TypeError, ValueError, json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
         errors.append(str(exc))

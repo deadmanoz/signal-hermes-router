@@ -59,7 +59,7 @@ jobs:
             --head "$release_branch" \
             --base "$BASE_BRANCH" \
             --state open \
-            --json number,headRefName,baseRefName,headRefOid,isDraft,isCrossRepository)"
+            --json number,headRefName,baseRefName,headRefOid,isDraft,title,isCrossRepository)"
           prs="$(printf '%s' "$prs" | jq '[.[] | select(.isCrossRepository == false)]')"
           count="$(printf '%s' "$prs" | jq 'length')"
           if [ "$count" -gt 1 ]; then
@@ -75,14 +75,21 @@ jobs:
           base_ref="$(printf '%s' "$prs" | jq -r '.[0].baseRefName')"
           head_sha="$(printf '%s' "$prs" | jq -r '.[0].headRefOid')"
           is_draft="$(printf '%s' "$prs" | jq -r '.[0].isDraft')"
-          if [ "$head_ref" != "$release_branch" ] || [ "$base_ref" != "$BASE_BRANCH" ] || [ -z "$number" ] || [ "$number" = "null" ] || [ -z "$head_sha" ] || [ "$head_sha" = "null" ] || { [ "$is_draft" != "true" ] && [ "$is_draft" != "false" ]; }; then
+          title="$(printf '%s' "$prs" | jq -r '.[0].title')"
+          if [ "$head_ref" != "$release_branch" ] || [ "$base_ref" != "$BASE_BRANCH" ] || [ -z "$number" ] || [ "$number" = "null" ] || [ -z "$head_sha" ] || [ "$head_sha" = "null" ] || [ -z "$title" ] || [ "$title" = "null" ] || { [ "$is_draft" != "true" ] && [ "$is_draft" != "false" ]; }; then
             echo "could not capture a canonical stale release PR state" >&2
             exit 1
           fi
+          title_delimiter="stale-release-pr-${RANDOM}-${RANDOM}-${RANDOM}-${RANDOM}"
           echo "has_pr=true" >> "$GITHUB_OUTPUT"
           echo "number=$number" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "is_draft=$is_draft" >> "$GITHUB_OUTPUT"
+          {
+            printf 'title<<%s\n' "$title_delimiter"
+            printf '%s\n' "$title"
+            printf '%s\n' "$title_delimiter"
+          } >> "$GITHUB_OUTPUT"
 
       # Release Please opens new PRs as drafts. Existing ready release PRs must
       # also be drafted before an update so no reviewer can snapshot an
@@ -157,8 +164,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           HAD_RELEASE_PR: ${{ steps.stale_release_pr.outputs.has_pr }}
+          EXPECTED_PR_NUMBER: ${{ steps.stale_release_pr.outputs.number }}
           EXPECTED_HEAD_SHA: ${{ steps.stale_release_pr.outputs.head_sha }}
           EXPECTED_IS_DRAFT: ${{ steps.stale_release_pr.outputs.is_draft }}
+          EXPECTED_TITLE: ${{ steps.stale_release_pr.outputs.title }}
           REPO: ${{ github.repository }}
           BASE_BRANCH: ${{ github.ref_name }}
         run: |
@@ -168,7 +177,7 @@ jobs:
             --head "$release_branch" \
             --base "$BASE_BRANCH" \
             --state open \
-            --json number,headRefName,baseRefName,headRefOid,isDraft,isCrossRepository)"
+            --json number,headRefName,baseRefName,headRefOid,isDraft,title,isCrossRepository)"
           prs="$(printf '%s' "$prs" | jq '[.[] | select(.isCrossRepository == false)]')"
           count="$(printf '%s' "$prs" | jq 'length')"
           if [ "$HAD_RELEASE_PR" = "false" ]; then
@@ -182,11 +191,13 @@ jobs:
             echo "::error::stale release run could not preserve a unique canonical release PR; leaving it as-is"
             exit 1
           fi
+          number="$(printf '%s' "$prs" | jq -r '.[0].number')"
           head_ref="$(printf '%s' "$prs" | jq -r '.[0].headRefName')"
           base_ref="$(printf '%s' "$prs" | jq -r '.[0].baseRefName')"
           head_sha="$(printf '%s' "$prs" | jq -r '.[0].headRefOid')"
           is_draft="$(printf '%s' "$prs" | jq -r '.[0].isDraft')"
-          if [ "$head_ref" != "$release_branch" ] || [ "$base_ref" != "$BASE_BRANCH" ] || { [ "$is_draft" != "true" ] && [ "$is_draft" != "false" ]; } || [ "$head_sha" != "$EXPECTED_HEAD_SHA" ] || [ "$is_draft" != "$EXPECTED_IS_DRAFT" ]; then
+          title="$(printf '%s' "$prs" | jq -r '.[0].title')"
+          if [ "$number" != "$EXPECTED_PR_NUMBER" ] || [ "$head_ref" != "$release_branch" ] || [ "$base_ref" != "$BASE_BRANCH" ] || { [ "$is_draft" != "true" ] && [ "$is_draft" != "false" ]; } || [ "$head_sha" != "$EXPECTED_HEAD_SHA" ] || [ "$is_draft" != "$EXPECTED_IS_DRAFT" ] || [ "$title" != "$EXPECTED_TITLE" ]; then
             echo "::error::stale release run changed a release PR despite skip-github-pull-request; leaving it as-is"
             exit 1
           fi

@@ -129,8 +129,12 @@ gh() {{
         )
         self.assertLess(names.index("Run Release Please"), names.index(confirm["name"]))
         self.assertIn("skip-github-pull-request", confirm_run)
-        self.assertIn("headRefName,baseRefName,headRefOid,isDraft,isCrossRepository", capture_run)
-        self.assertIn("headRefName,baseRefName,headRefOid,isDraft,isCrossRepository", confirm_run)
+        self.assertIn(
+            "headRefName,baseRefName,headRefOid,isDraft,title,isCrossRepository", capture_run
+        )
+        self.assertIn(
+            "headRefName,baseRefName,headRefOid,isDraft,title,isCrossRepository", confirm_run
+        )
         self.assertIn('if [ "$HAD_RELEASE_PR" = "false" ]', confirm_run)
         self.assertIn("stale release run created a release PR", confirm_run)
         self.assertIn('[ "$is_draft" != "$EXPECTED_IS_DRAFT" ]', confirm_run)
@@ -170,14 +174,18 @@ gh() {
             "baseRefName": "main",
             "headRefOid": "a1" * 20,
             "isDraft": False,
+            "title": "chore(main): release 0.1.31",
             "isCrossRepository": False,
         }
         current, captured = run_step(capture_run, [canonical_pr], {})
         self.assertEqual(current.returncode, 0, current.stderr)
-        self.assertEqual(
-            captured,
-            "has_pr=true\nnumber=123\nhead_sha=" + ("a1" * 20) + "\nis_draft=false\n",
+        self.assertTrue(
+            captured.startswith(
+                "has_pr=true\nnumber=123\nhead_sha=" + ("a1" * 20) + "\nis_draft=false\n"
+            )
         )
+        self.assertIn("title<<stale-release-pr-", captured)
+        self.assertIn("\nchore(main): release 0.1.31\n", captured)
 
         cross_repository = {**canonical_pr, "isCrossRepository": True}
         cross_only, cross_output = run_step(capture_run, [cross_repository], {})
@@ -196,8 +204,10 @@ gh() {
             [canonical_pr],
             {
                 "HAD_RELEASE_PR": "true",
+                "EXPECTED_PR_NUMBER": "123",
                 "EXPECTED_HEAD_SHA": "a1" * 20,
                 "EXPECTED_IS_DRAFT": "false",
+                "EXPECTED_TITLE": "chore(main): release 0.1.31",
             },
         )
         self.assertEqual(existing.returncode, 0, existing.stderr)
@@ -207,23 +217,50 @@ gh() {
             [{**canonical_pr, "headRefOid": "b2" * 20}],
             {
                 "HAD_RELEASE_PR": "true",
+                "EXPECTED_PR_NUMBER": "123",
                 "EXPECTED_HEAD_SHA": "a1" * 20,
                 "EXPECTED_IS_DRAFT": "false",
+                "EXPECTED_TITLE": "chore(main): release 0.1.31",
             },
         )
         self.assertNotEqual(changed.returncode, 0)
 
+        retitled, _ = run_step(
+            confirm_run,
+            [{**canonical_pr, "title": "chore(main): release 0.1.32"}],
+            {
+                "HAD_RELEASE_PR": "true",
+                "EXPECTED_PR_NUMBER": "123",
+                "EXPECTED_HEAD_SHA": "a1" * 20,
+                "EXPECTED_IS_DRAFT": "false",
+                "EXPECTED_TITLE": "chore(main): release 0.1.31",
+            },
+        )
+        self.assertNotEqual(retitled.returncode, 0)
+
         absent, _ = run_step(
             confirm_run,
             [],
-            {"HAD_RELEASE_PR": "false", "EXPECTED_HEAD_SHA": "", "EXPECTED_IS_DRAFT": ""},
+            {
+                "HAD_RELEASE_PR": "false",
+                "EXPECTED_PR_NUMBER": "",
+                "EXPECTED_HEAD_SHA": "",
+                "EXPECTED_IS_DRAFT": "",
+                "EXPECTED_TITLE": "",
+            },
         )
         self.assertEqual(absent.returncode, 0, absent.stderr)
 
         created, _ = run_step(
             confirm_run,
             [canonical_pr],
-            {"HAD_RELEASE_PR": "false", "EXPECTED_HEAD_SHA": "", "EXPECTED_IS_DRAFT": ""},
+            {
+                "HAD_RELEASE_PR": "false",
+                "EXPECTED_PR_NUMBER": "",
+                "EXPECTED_HEAD_SHA": "",
+                "EXPECTED_IS_DRAFT": "",
+                "EXPECTED_TITLE": "",
+            },
         )
         self.assertNotEqual(created.returncode, 0)
 
@@ -780,7 +817,9 @@ gh() {{
     printf '%s\\n' '--match-head-commit'
   elif [[ "$*" == *"protection/required_status_checks"* ]]; then
     printf 'true\\n'
-  elif [[ "$*" == *"compare/$BASE_BRANCH"* ]]; then
+  elif [[ "$*" == *"commits/$BASE_BRANCH"* ]]; then
+    printf '%s\\n' "$VALIDATED_SHA"
+  elif [[ "$*" == *"/compare/"* ]]; then
     printf '0\\n'
   elif [[ "$*" == *"--json headRefName,baseRefName,title,isCrossRepository,headRefOid"* ]]; then
     printf '{{"headRefName":"release-please--branches--%s","baseRefName":"%s","title":"%s","isCrossRepository":false,"headRefOid":"%s"}}\\n' "$BASE_BRANCH" "$BASE_BRANCH" "$VALIDATED_TITLE" "$VALIDATED_SHA"
@@ -800,6 +839,7 @@ gh() {{
                 "BASE_BRANCH": "main",
                 "CALL_LOG": str(call_log),
                 "ENABLE_AUTO_MERGE": "true",
+                "EXPECTED_BASE_SHA": "a1" * 20,
                 "PR_NUMBER": "123",
                 "REPO": "example/repo",
                 "VALIDATED_SHA": "a1" * 20,
@@ -817,6 +857,11 @@ gh() {{
             self.assertNotEqual(result.returncode, 0)
             calls = call_log.read_text(encoding="utf-8")
             self.assertIn("pr ready 123 --repo example/repo\n", calls)
+            self.assertIn(
+                "pr review 123 --repo example/repo --approve "
+                "--body Automated approval for validated release PR.\n",
+                calls,
+            )
             self.assertIn("pr ready 123 --repo example/repo --undo\n", calls)
             self.assertLess(
                 calls.index("pr ready 123 --repo example/repo\n"),
