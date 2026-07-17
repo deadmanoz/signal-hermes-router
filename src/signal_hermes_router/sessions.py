@@ -357,6 +357,15 @@ class SessionRegistry:
             cached_sessions=len(keys),
         )
 
+    def has_sessions_outside(self, live_route_keys: set[str]) -> bool:
+        """True when any cached session belongs to a route outside the given
+        live set — a cheap probe so reload cleanup can skip scheduling a
+        drain task when there is nothing to evict."""
+        return any(
+            route_key not in live_route_keys
+            for route_key in self._session_routes.values()
+        )
+
     def drop_sessions_not_in(self, live_route_keys: set[str]) -> int:
         """Evict cached sessions whose route can no longer prompt (a live
         config reload made the route non-active or removed it), releasing

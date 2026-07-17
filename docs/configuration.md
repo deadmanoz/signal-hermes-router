@@ -137,10 +137,11 @@ inconsistent:
   router-level settings are rejected from changing (see Routes-only above).
 - **Retired-route cleanup**: Routes that can no longer prompt after a reload
   (reloaded to `shadow`/`disabled`/`maintenance`, or removed) have their
-  cached sessions evicted. A Hermes profile left with no remaining active
-  route has its cached subprocess closed once in-flight turns on the affected
-  routes drain (bounded wait; a wedged turn fails through the normal
-  broken-pipe path instead of pinning the profile forever). Profiles and
+  cached sessions evicted, and a Hermes profile left with no remaining active
+  route has its cached subprocess closed. Both happen only after in-flight
+  turns on the affected routes drain (bounded wait; a wedged turn fails
+  through the normal broken-pipe path instead of pinning retired state
+  forever), so a reload never truncates an in-progress reply. Profiles and
   sessions for routes that stayed active are untouched.
 - **Breaker-override coherence**: A stale circuit-breaker `MAINTENANCE`
   override is cleared when the route's configured state becomes anything

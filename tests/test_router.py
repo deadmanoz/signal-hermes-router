@@ -4766,13 +4766,13 @@ routes:
             )
             response = await harness.router._handle_reload_config_control({})
             self.assertEqual(response["status"], "ok")
-            # The cached session is evicted synchronously during the reap.
-            self.assertEqual(harness.router.sessions._sessions, {})
-            self.assertEqual(harness.profile.released_session_ids, ["session-1"])
-            # The profile subprocess is retired by the tracked drain task.
+            # Eviction and retirement are deferred to a tracked drain task so
+            # an in-flight turn never loses its in-progress reply.
             tasks = [t for t in harness.router._signal_turn_tasks if not t.done()]
             self.assertEqual(len(tasks), 1)
             await asyncio.gather(*tasks)
+            self.assertEqual(harness.router.sessions._sessions, {})
+            self.assertEqual(harness.profile.released_session_ids, ["session-1"])
             self.assertEqual(harness.supervisor.retired, ["p"])
             self.assertEqual(harness.supervisor.cached, [])
 
@@ -4839,11 +4839,11 @@ routes:
             )
             response = await harness.router._handle_reload_config_control({})
             self.assertEqual(response["status"], "ok")
-            self.assertEqual(harness.router.sessions._sessions, {})
-            self.assertEqual(harness.profile.released_session_ids, ["session-1"])
             tasks = [t for t in harness.router._signal_turn_tasks if not t.done()]
             self.assertEqual(len(tasks), 1)
             await asyncio.gather(*tasks)
+            self.assertEqual(harness.router.sessions._sessions, {})
+            self.assertEqual(harness.profile.released_session_ids, ["session-1"])
             self.assertEqual(harness.supervisor.retired, ["p1"])
             self.assertEqual(harness.supervisor.cached, ["p2"])
 
@@ -4922,15 +4922,97 @@ routes:
             )
             response = await harness.router._handle_reload_config_control({})
             self.assertEqual(response["status"], "ok")
-            # Only the disabled route's session is evicted.
+            # A drain task runs for the disabled route's session...
+            tasks = [t for t in harness.router._signal_turn_tasks if not t.done()]
+            self.assertEqual(len(tasks), 1)
+            await asyncio.gather(*tasks)
+            # ...evicting only that session; the active route's session is kept.
             self.assertEqual(list(harness.router.sessions._sessions), ["sk2"])
             self.assertEqual(harness.profile.released_session_ids, ["session-1"])
-            # The profile still has an active route: no retire is scheduled.
-            self.assertEqual(
-                [t for t in harness.router._signal_turn_tasks if not t.done()], []
-            )
+            # The profile still has an active route: it is not retired.
             self.assertEqual(harness.supervisor.retired, [])
             self.assertEqual(harness.supervisor.cached, ["p"])
+
+    async def test_reload_config_defers_eviction_until_in_flight_turn_drains(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: busy-route
+    platform: signal
+    group_id: group
+    profile: profile
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+            harness.profile.prompt_delay = 0.2
+            harness.supervisor.cached.append("profile")
+
+            turn_task = asyncio.create_task(
+                harness.router.handle_event(make_event(timestamp=1))
+            )
+            try:
+                for _ in range(100):
+                    if harness.profile.prompts:
+                        break
+                    await asyncio.sleep(0.001)
+                self.assertTrue(harness.profile.prompts)
+
+                # Reload the busy route to disabled while its turn is mid-prompt.
+                routes_path.write_text(
+                    """
+routes:
+  - name: busy-route
+    platform: signal
+    group_id: group
+    profile: profile
+    state: disabled
+""",
+                    encoding="utf-8",
+                )
+                response = await harness.router._handle_reload_config_control({})
+                self.assertEqual(response["status"], "ok")
+
+                # The reap must not evict the in-flight session or retire the
+                # profile while the turn is still prompting: releasing the
+                # session mid-prompt would silently truncate the reply.
+                await asyncio.sleep(0.05)
+                self.assertEqual(harness.profile.released_session_ids, [])
+                self.assertEqual(harness.supervisor.retired, [])
+            finally:
+                await turn_task
+
+            # The in-flight turn completed normally with its reply delivered.
+            self.assertEqual(harness.signal.sends, [("group", "reply")])
+            # Only after the turn drained is the session evicted and the
+            # profile (no remaining active routes) retired. The reap task may
+            # already have finished during the turn await above.
+            tasks = [t for t in harness.router._signal_turn_tasks if not t.done()]
+            if tasks:
+                await asyncio.gather(*tasks)
+            self.assertEqual(harness.profile.released_session_ids, ["session-1"])
+            self.assertEqual(harness.supervisor.retired, ["profile"])
+            self.assertEqual(harness.router.sessions._sessions, {})
 
     async def test_control_socket_refuses_non_socket_path_and_removes_stale_socket(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
