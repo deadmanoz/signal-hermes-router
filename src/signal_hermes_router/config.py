@@ -576,7 +576,7 @@ def _parse_synthetic_definitions(
                 prompt=prompt,
                 description=value.get("description"),
                 permission_policy=(
-                    StaticPermissionPolicy.from_config(raw_permissions)
+                    StaticPermissionPolicy.from_config(raw_permissions, mcp_only=route.mcp_only)
                     if raw_permissions is not None
                     else None
                 ),

@@ -15,8 +15,6 @@ ProbeCallable = Callable[[str], Awaitable["ToolSurface"]]
 SUPPORTED_TOOL_SURFACE_SCHEMA_VERSION = 1
 FULL_CALLABLE_TOOL_SURFACE_SCOPE = "full_callable"
 _MISSING = object()
-
-
 # Catalog-carrying keys other than `tools` that the metadata path recognizes.
 # They are never part of the dedicated _tool_surface/list contract, so their
 # presence there makes producer intent ambiguous and the router fails closed

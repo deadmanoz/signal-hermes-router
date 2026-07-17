@@ -86,7 +86,8 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertTrue(route.mcp_only)
         self.assertTrue(route.permission_policy.mcp_only)
-        # Route constructed with mcp_only=False does not override a True policy.
+        # Route constructed with mcp_only=False overrides a True policy
+        # because the route-level flag is the single source of truth.
         policy = StaticPermissionPolicy.from_config([{"tool": "read_file"}], mcp_only=True)
         route = Route(
             platform="signal",
@@ -459,6 +460,72 @@ router:
         self.assertEqual(jobs[0].kind, SyntheticTurnKind.SCHEDULED_JOB)
         self.assertEqual(jobs[0].namespace, "scheduled:daily-agenda")
         self.assertIsNotNone(jobs[0].permission_policy)
+
+    def test_scheduled_jobs_on_mcp_only_route_inherit_mcp_only_flag(self) -> None:
+        routes = tuple(
+            parse_routes(
+                {
+                    "routes": [
+                        {
+                            "platform": "signal",
+                            "group_id": "GROUP",
+                            "profile": "profile",
+                            "name": "mcp-route",
+                            "mcp_only": True,
+                        }
+                    ]
+                }
+            )
+        )
+
+        jobs = parse_scheduled_jobs(
+            {
+                "scheduled_jobs": [
+                    {
+                        "id": "daily-agenda",
+                        "route": "mcp-route",
+                        "prompt": "Prepare the daily agenda.",
+                        "permissions": [{"tool": "read_file"}],
+                    }
+                ]
+            },
+            routes,
+        )
+
+        self.assertTrue(jobs[0].permission_policy.mcp_only)
+
+    def test_notifications_on_mcp_only_route_inherit_mcp_only_flag(self) -> None:
+        routes = tuple(
+            parse_routes(
+                {
+                    "routes": [
+                        {
+                            "platform": "signal",
+                            "group_id": "GROUP",
+                            "profile": "profile",
+                            "name": "mcp-route",
+                            "mcp_only": True,
+                        }
+                    ]
+                }
+            )
+        )
+
+        notifications = parse_notifications(
+            {
+                "notifications": [
+                    {
+                        "id": "backup-report",
+                        "route": "mcp-route",
+                        "prompt": "Summarize the notification payload.",
+                        "permissions": [{"tool": "read_file"}],
+                    }
+                ]
+            },
+            routes,
+        )
+
+        self.assertTrue(notifications[0].permission_policy.mcp_only)
 
     def test_notifications_parse_against_named_routes(self) -> None:
         routes = tuple(

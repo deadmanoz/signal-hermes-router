@@ -1099,10 +1099,9 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
             )
+
             async def probe(profile: str) -> ToolSurface:
-                return callable_surface(
-                    profile, ["read_file", "terminal/create"]
-                )
+                return callable_surface(profile, ["read_file", "terminal/create"])
 
             local_report = await run_permission_preflight(local_app, probe)
 
