@@ -4570,7 +4570,7 @@ routes:
 routes:
   - name: breaker-route
     platform: signal
-    group_id: g1
+    group_id: group-one
     profile: p
     state: active
 """,
@@ -4595,7 +4595,7 @@ routes:
 routes:
   - name: breaker-route
     platform: signal
-    group_id: g1
+    group_id: group-one
     profile: p
     state: shadow
 """,
@@ -4632,7 +4632,7 @@ routes:
 routes:
   - name: breaker-route
     platform: signal
-    group_id: g1
+    group_id: group-one
     profile: p
     state: active
 """,
@@ -4729,7 +4729,7 @@ routes:
 routes:
   - name: retire-route
     platform: signal
-    group_id: g1
+    group_id: group-one
     profile: p
     state: active
 """,
@@ -4758,7 +4758,7 @@ routes:
 routes:
   - name: retire-route
     platform: signal
-    group_id: g1
+    group_id: group-one
     profile: p
     state: disabled
 """,
@@ -4798,12 +4798,12 @@ routes:
 routes:
   - name: removed-route
     platform: signal
-    group_id: g1
+    group_id: group-one
     profile: p1
     state: active
   - name: kept-route
     platform: signal
-    group_id: g2
+    group_id: group-two
     profile: p2
     state: active
 """,
@@ -4831,7 +4831,7 @@ routes:
 routes:
   - name: kept-route
     platform: signal
-    group_id: g2
+    group_id: group-two
     profile: p2
     state: active
 """,
@@ -4869,12 +4869,12 @@ routes:
 routes:
   - name: r1
     platform: signal
-    group_id: g1
+    group_id: group-one
     profile: p
     state: active
   - name: r2
     platform: signal
-    group_id: g2
+    group_id: group-two
     profile: p
     state: active
 """,
@@ -4909,12 +4909,12 @@ routes:
 routes:
   - name: r1
     platform: signal
-    group_id: g1
+    group_id: group-one
     profile: p
     state: disabled
   - name: r2
     platform: signal
-    group_id: g2
+    group_id: group-two
     profile: p
     state: active
 """,
@@ -5036,7 +5036,7 @@ routes:
 routes:
   - name: flip-route
     platform: signal
-    group_id: g1
+    group_id: group-one
     profile: profile
     state: active
 """,
@@ -5068,7 +5068,7 @@ routes:
 routes:
   - name: flip-route
     platform: signal
-    group_id: g1
+    group_id: group-one
     profile: profile
     state: disabled
 """,
@@ -5085,7 +5085,7 @@ routes:
 routes:
   - name: flip-route
     platform: signal
-    group_id: g1
+    group_id: group-one
     profile: profile
     state: active
 """,
@@ -5128,12 +5128,12 @@ routes:
 routes:
   - name: r1
     platform: signal
-    group_id: g1
+    group_id: group-one
     profile: p1
     state: active
   - name: r2
     platform: signal
-    group_id: g2
+    group_id: group-two
     profile: p2
     state: active
 """,
@@ -5148,7 +5148,7 @@ routes:
 
             # A turn on r2 is mid-prompt and holds r2's route lock.
             turn_task = asyncio.create_task(
-                harness.router.handle_event(make_event(group_id="g2", timestamp=1))
+                harness.router.handle_event(make_event(group_id="group-two", timestamp=1))
             )
             try:
                 for _ in range(100):
@@ -5163,7 +5163,7 @@ routes:
 routes:
   - name: r1
     platform: signal
-    group_id: g1
+    group_id: group-one
     profile: p1
     state: active
 """,
@@ -5180,7 +5180,7 @@ routes:
 routes:
   - name: r1
     platform: signal
-    group_id: g1
+    group_id: group-one
     profile: p1
     state: disabled
 """,
@@ -5196,7 +5196,7 @@ routes:
                 await turn_task
 
             # r2's turn completed and delivered its reply despite two reloads.
-            self.assertEqual(harness.signal.sends, [("g2", "reply")])
+            self.assertEqual(harness.signal.sends, [("group-two", "reply")])
             tasks = [t for t in harness.router._signal_turn_tasks if not t.done()]
             if tasks:
                 await asyncio.gather(*tasks)
