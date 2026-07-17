@@ -4135,6 +4135,419 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response["synthetic_id"], "daily-agenda")
             self.assertEqual(response["synthetic_kind"], "scheduled_job")
 
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["error"], "router_error")
+            self.assertEqual(response["failure"]["code"], "router_error")
+            self.assertEqual(response["job_id"], "daily-agenda")
+            self.assertEqual(response["synthetic_id"], "daily-agenda")
+            self.assertEqual(response["synthetic_kind"], "scheduled_job")
+
+    async def test_reload_config_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: new-route
+    platform: signal
+    group_id: new-group
+    profile: new-profile
+    state: active
+""",
+                encoding="utf-8",
+            )
+            harness = make_router_harness(tmp)
+            harness.router._config_paths = (config_path, routes_path)
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            self.assertEqual(response["generation"], 1)
+            self.assertEqual(response["route_count"], 1)
+            self.assertEqual(harness.router.config.find_route_by_name("new-route").group_id, "new-group")
+
+    async def test_reload_config_rejects_invalid_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            routes_path.write_text("not: [valid yaml\n", encoding="utf-8")
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            harness = make_router_harness(tmp)
+            harness.router._config_paths = (config_path, routes_path)
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["error"], "config_invalid")
+            self.assertEqual(response["generation"], 0)
+
+    async def test_reload_config_rejects_validation_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            routes_path.write_text(
+                """
+routes:
+  - name: dup
+    platform: signal
+    group_id: g1
+    profile: p
+    state: active
+  - name: dup
+    platform: signal
+    group_id: g2
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            harness = make_router_harness(tmp)
+            harness.router._config_paths = (config_path, routes_path)
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["error"], "config_invalid")
+            self.assertEqual(response["generation"], 0)
+
+    async def test_reload_config_rejects_router_config_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n"
+                "  max_reply_chars: 9999\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: r
+    platform: signal
+    group_id: g
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            harness = make_router_harness(tmp)
+            harness.router._config_paths = (config_path, routes_path)
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["error"], "router_config_changed")
+            self.assertEqual(response["generation"], 0)
+
+    async def test_reload_config_fails_when_paths_unknown(self) -> None:
+        harness = make_router_harness(tempfile.mkdtemp())
+        response = await harness.router._handle_reload_config_control({})
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["error"], "reload_paths_unknown")
+        self.assertEqual(response["generation"], 0)
+
+    async def test_reload_config_rejects_invalid_candidate_routes_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            harness = make_router_harness(tmp)
+            harness.router._config_paths = (Path(tmp) / "config.yaml", Path(tmp) / "routes.yaml")
+            response = await harness.router._handle_reload_config_control(
+                {"candidate_routes": ["not", "a", "string"]}
+            )
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["error"], "invalid_candidate_routes")
+            self.assertEqual(response["generation"], 0)
+
+    async def test_reload_config_rejects_profile_change_for_existing_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: existing-route
+    platform: signal
+    group_id: g1
+    profile: old-profile
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+            # Now reload with same route key but different profile
+            routes_path.write_text(
+                """
+routes:
+  - name: existing-route
+    platform: signal
+    group_id: g1
+    profile: new-profile
+    state: active
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["error"], "profile_changed_for_existing_route")
+            self.assertEqual(response["generation"], 0)
+            # Active config unchanged
+            self.assertEqual(
+                harness.router.config.find_route_by_name("existing-route").profile,
+                "old-profile",
+            )
+
+    async def test_reload_config_rebuilds_rate_limit_bucket(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: rl-route
+    platform: signal
+    group_id: g1
+    profile: p
+    state: active
+    inbound_rate_limit:
+      max_turns: 5
+      window_seconds: 10
+""",
+                encoding="utf-8",
+            )
+            # Build harness from the config file so rl-route is live
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+            # Prime the bucket with the old limit
+            old_route = harness.router.config.find_route_by_name("rl-route")
+            assert old_route is not None
+            harness.router._reserve_inbound_rate_token(old_route)
+            old_key = harness.router._rate_limit_bucket_key(old_route)
+            old_bucket = harness.router._inbound_rate_buckets[old_key]
+
+            # Reload with a new limit on the same route key
+            routes_path.write_text(
+                """
+routes:
+  - name: rl-route
+    platform: signal
+    group_id: g1
+    profile: p
+    state: active
+    inbound_rate_limit:
+      max_turns: 1
+      window_seconds: 1
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+
+            # The new bucket should have the new parameters
+            new_route = harness.router.config.find_route_by_name("rl-route")
+            assert new_route is not None
+            # Reserve first to lazily create the new bucket, then inspect
+            self.assertTrue(harness.router._reserve_inbound_rate_token(new_route))
+            new_key = harness.router._rate_limit_bucket_key(new_route)
+            new_bucket = harness.router._inbound_rate_buckets[new_key]
+            self.assertIsNot(new_bucket, old_bucket)
+            # Verify behaviorally: new bucket allows 1 token then rejects
+            self.assertFalse(harness.router._reserve_inbound_rate_token(new_route))
+            # Old bucket is still present for in-flight turns
+            self.assertIn(old_key, harness.router._inbound_rate_buckets)
+
+    async def test_reload_config_rejects_readded_route_with_different_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: removable-route
+    platform: signal
+    group_id: g1
+    profile: original-profile
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            # Reload 1: remove the route entirely
+            routes_path.write_text("routes: []\n", encoding="utf-8")
+            response1 = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response1["status"], "ok")
+            self.assertEqual(len(harness.router.config.routes), 0)
+
+            # Reload 2: re-add the same route key with a different profile
+            routes_path.write_text(
+                """
+routes:
+  - name: removable-route
+    platform: signal
+    group_id: g1
+    profile: different-profile
+    state: active
+""",
+                encoding="utf-8",
+            )
+            response2 = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response2["status"], "error")
+            self.assertEqual(response2["error"], "profile_changed_for_existing_route")
+            self.assertEqual(response2["generation"], response1["generation"])
+            # Active config unchanged after rejected reload
+            self.assertEqual(len(harness.router.config.routes), 0)
+
+    async def test_reload_config_disabled_clears_breaker_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: breaker-route
+    platform: signal
+    group_id: g1
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            # Trip the breaker manually
+            route = harness.router.config.find_route_by_name("breaker-route")
+            assert route is not None
+            for _ in range(3):
+                harness.router.circuit.record_failure(route.key)
+            harness.router.route_state_overrides[route.key] = RouteState.MAINTENANCE
+            harness.router._trip_times[route.key] = time.monotonic()
+            harness.router._trip_times_ms[route.key] = harness.router._clock_ms()
+            self.assertEqual(
+                harness.router.route_state_overrides.get(route.key),
+                RouteState.MAINTENANCE,
+            )
+
+            # Reload the same route as disabled
+            routes_path.write_text(
+                """
+routes:
+  - name: breaker-route
+    platform: signal
+    group_id: g1
+    profile: p
+    state: disabled
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            # The breaker override should be cleared
+            self.assertIsNone(harness.router.route_state_overrides.get(route.key))
+            # A subsequent turn should see DISABLED, not MAINTENANCE
+            self.assertEqual(harness.router.config.find_route_by_name("breaker-route").state, RouteState.DISABLED)
+
     async def test_control_socket_refuses_non_socket_path_and_removes_stale_socket(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = Route(
