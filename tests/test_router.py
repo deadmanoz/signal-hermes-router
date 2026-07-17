@@ -4548,6 +4548,390 @@ routes:
             # A subsequent turn should see DISABLED, not MAINTENANCE
             self.assertEqual(harness.router.config.find_route_by_name("breaker-route").state, RouteState.DISABLED)
 
+    async def test_reload_config_shadow_clears_breaker_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: breaker-route
+    platform: signal
+    group_id: g1
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            route = harness.router.config.find_route_by_name("breaker-route")
+            assert route is not None
+            for _ in range(3):
+                harness.router.circuit.record_failure(route.key)
+            harness.router.route_state_overrides[route.key] = RouteState.MAINTENANCE
+            harness.router._trip_times[route.key] = time.monotonic()
+            harness.router._trip_times_ms[route.key] = harness.router._clock_ms()
+
+            # Reload the same route as shadow
+            routes_path.write_text(
+                """
+routes:
+  - name: breaker-route
+    platform: signal
+    group_id: g1
+    profile: p
+    state: shadow
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            # The stale MAINTENANCE override must not mask the reloaded shadow
+            # state (new turns would otherwise send maintenance replies).
+            self.assertIsNone(harness.router.route_state_overrides.get(route.key))
+            self.assertNotIn(route.key, harness.router._trip_times)
+            self.assertNotIn(route.key, harness.router._trip_times_ms)
+            self.assertEqual(harness.router.config.find_route_by_name("breaker-route").state, RouteState.SHADOW)
+
+    async def test_reload_config_active_route_keeps_breaker_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: breaker-route
+    platform: signal
+    group_id: g1
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            route = harness.router.config.find_route_by_name("breaker-route")
+            assert route is not None
+            for _ in range(3):
+                harness.router.circuit.record_failure(route.key)
+            harness.router.route_state_overrides[route.key] = RouteState.MAINTENANCE
+            harness.router._trip_times[route.key] = time.monotonic()
+            harness.router._trip_times_ms[route.key] = harness.router._clock_ms()
+
+            # Reload with the route still active: a reload must not silently
+            # reset a tripped breaker.
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            self.assertEqual(
+                harness.router.route_state_overrides.get(route.key),
+                RouteState.MAINTENANCE,
+            )
+            self.assertIn(route.key, harness.router._trip_times)
+
+    async def test_reload_config_parses_candidate_off_the_event_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: new-route
+    platform: signal
+    group_id: new-group
+    profile: new-profile
+    state: active
+""",
+                encoding="utf-8",
+            )
+            harness = make_router_harness(tmp)
+            harness.router._config_paths = (config_path, routes_path)
+
+            from signal_hermes_router.config import load_app_config as real_load
+            parse_threads: list[int] = []
+
+            def recording_load(*args: Any, **kwargs: Any) -> Any:
+                parse_threads.append(threading.get_ident())
+                return real_load(*args, **kwargs)
+
+            with patch.object(router_module, "load_app_config", recording_load):
+                response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            # The blocking parse (secret resolvers, filesystem) must run in a
+            # worker thread, not on the event loop's thread.
+            self.assertEqual(len(parse_threads), 1)
+            self.assertNotEqual(parse_threads[0], threading.get_ident())
+
+    async def test_reload_config_retires_profile_and_sessions_with_no_active_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: retire-route
+    platform: signal
+    group_id: g1
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            route = harness.router.config.find_route_by_name("retire-route")
+            assert route is not None
+            # Simulate a cached profile subprocess and a cached persistent session.
+            harness.supervisor.cached.append("p")
+            from signal_hermes_router.sessions import RoutedSession
+            harness.router.sessions._sessions["sk"] = RoutedSession(
+                profile=harness.profile,  # type: ignore[arg-type]
+                session_id="session-1",
+                cwd=Path(tmp) / "work" / "sk",
+            )
+            harness.router.sessions._session_routes["sk"] = route.key
+
+            # Reload with the route disabled: no active route remains for p.
+            routes_path.write_text(
+                """
+routes:
+  - name: retire-route
+    platform: signal
+    group_id: g1
+    profile: p
+    state: disabled
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            # The cached session is evicted synchronously during the reap.
+            self.assertEqual(harness.router.sessions._sessions, {})
+            self.assertEqual(harness.profile.released_session_ids, ["session-1"])
+            # The profile subprocess is retired by the tracked drain task.
+            tasks = [t for t in harness.router._signal_turn_tasks if not t.done()]
+            self.assertEqual(len(tasks), 1)
+            await asyncio.gather(*tasks)
+            self.assertEqual(harness.supervisor.retired, ["p"])
+            self.assertEqual(harness.supervisor.cached, [])
+
+    async def test_reload_config_retires_profile_for_removed_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: removed-route
+    platform: signal
+    group_id: g1
+    profile: p1
+    state: active
+  - name: kept-route
+    platform: signal
+    group_id: g2
+    profile: p2
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            removed = harness.router.config.find_route_by_name("removed-route")
+            assert removed is not None
+            harness.supervisor.cached.extend(["p1", "p2"])
+            from signal_hermes_router.sessions import RoutedSession
+            harness.router.sessions._sessions["sk"] = RoutedSession(
+                profile=harness.profile,  # type: ignore[arg-type]
+                session_id="session-1",
+                cwd=Path(tmp) / "work" / "sk",
+            )
+            harness.router.sessions._session_routes["sk"] = removed.key
+
+            # Reload with removed-route gone entirely.
+            routes_path.write_text(
+                """
+routes:
+  - name: kept-route
+    platform: signal
+    group_id: g2
+    profile: p2
+    state: active
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            self.assertEqual(harness.router.sessions._sessions, {})
+            self.assertEqual(harness.profile.released_session_ids, ["session-1"])
+            tasks = [t for t in harness.router._signal_turn_tasks if not t.done()]
+            self.assertEqual(len(tasks), 1)
+            await asyncio.gather(*tasks)
+            self.assertEqual(harness.supervisor.retired, ["p1"])
+            self.assertEqual(harness.supervisor.cached, ["p2"])
+
+    async def test_reload_config_keeps_profile_with_remaining_active_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: g1
+    profile: p
+    state: active
+  - name: r2
+    platform: signal
+    group_id: g2
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            r1 = harness.router.config.find_route_by_name("r1")
+            r2 = harness.router.config.find_route_by_name("r2")
+            assert r1 is not None and r2 is not None
+            harness.supervisor.cached.append("p")
+            from signal_hermes_router.sessions import RoutedSession
+            harness.router.sessions._sessions["sk1"] = RoutedSession(
+                profile=harness.profile,  # type: ignore[arg-type]
+                session_id="session-1",
+                cwd=Path(tmp) / "work" / "sk1",
+            )
+            harness.router.sessions._session_routes["sk1"] = r1.key
+            harness.router.sessions._sessions["sk2"] = RoutedSession(
+                profile=harness.profile,  # type: ignore[arg-type]
+                session_id="session-2",
+                cwd=Path(tmp) / "work" / "sk2",
+            )
+            harness.router.sessions._session_routes["sk2"] = r2.key
+
+            # Reload with r1 disabled but r2 still active on the same profile.
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: g1
+    profile: p
+    state: disabled
+  - name: r2
+    platform: signal
+    group_id: g2
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            # Only the disabled route's session is evicted.
+            self.assertEqual(list(harness.router.sessions._sessions), ["sk2"])
+            self.assertEqual(harness.profile.released_session_ids, ["session-1"])
+            # The profile still has an active route: no retire is scheduled.
+            self.assertEqual(
+                [t for t in harness.router._signal_turn_tasks if not t.done()], []
+            )
+            self.assertEqual(harness.supervisor.retired, [])
+            self.assertEqual(harness.supervisor.cached, ["p"])
+
     async def test_control_socket_refuses_non_socket_path_and_removes_stale_socket(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = Route(

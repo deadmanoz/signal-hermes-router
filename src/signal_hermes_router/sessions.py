@@ -203,6 +203,21 @@ class ProfileSupervisor:
         # the immediately-following replace_after_restart -> get_profile
         # call that re-spawns a fresh subprocess.
 
+    def cached_profile_names(self) -> list[str]:
+        """Names of profiles with a cached subprocess entry, live or dead."""
+        return list(self._profiles)
+
+    async def retire_profile(self, profile_name: str) -> bool:
+        """Close and evict the cached subprocess for a profile that no route
+        can use anymore (a live config reload left it with no active routes).
+        Returns True when a cached entry was retired. Unlike restart_profile
+        there is no successor acquisition, so the profile simply goes away."""
+        existing = self._profiles.pop(profile_name, None)
+        if existing is None:
+            return False
+        await existing.close()
+        return True
+
     async def close(self) -> None:
         profiles = list(self._profiles.values())
         self._profiles.clear()
@@ -341,6 +356,24 @@ class SessionRegistry:
             cached=bool(keys),
             cached_sessions=len(keys),
         )
+
+    def drop_sessions_not_in(self, live_route_keys: set[str]) -> int:
+        """Evict cached sessions whose route can no longer prompt (a live
+        config reload made the route non-active or removed it), releasing
+        per-session state on the owning profile. Returns the number evicted.
+        Sessions for routes that stayed configured-active are kept, including
+        ones currently under a breaker override — the route prompts again as
+        soon as the breaker recovers."""
+        evicted = 0
+        for session_key, route_key in list(self._session_routes.items()):
+            if route_key in live_route_keys:
+                continue
+            session = self._sessions.pop(session_key, None)
+            self._session_routes.pop(session_key, None)
+            if session is not None:
+                session.profile.release_session(session.session_id)
+                evicted += 1
+        return evicted
 
     async def _resume_or_recreate(
         self,

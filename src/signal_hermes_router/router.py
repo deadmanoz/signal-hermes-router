@@ -99,6 +99,12 @@ SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 15.0
 SHUTDOWN_SETTLE_TIMEOUT_SECONDS = 5.0
 SHUTDOWN_SUPERVISOR_FLOOR_SECONDS = 10.0
 SHUTDOWN_CLEANUP_CANCEL_GRACE_SECONDS = 1.0
+# How long a config-reload profile retire waits for in-flight turns on the
+# affected routes before closing the orphaned Hermes subprocess anyway.
+# Bounded like the shutdown drain: a wedged turn must not pin a retired
+# profile forever; closing under it fails that turn through the normal
+# broken-pipe path instead. A code constant by design, not configuration.
+RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS = 15.0
 # Retention sweep deletions run on the event loop (so the pre-unlink mtime
 # recheck cannot interleave with media writes) in bounded batches with a
 # yield in between; this bounds each uninterrupted loop slice. A code
@@ -1781,7 +1787,12 @@ class SignalHermesRouter:
             else self._config_paths[1]
         )
         try:
-            candidate = load_app_config(config_path, routes_path)
+            # Parse the candidate in a worker thread: secret resolvers
+            # (op:// shells out via subprocess.run) and the filesystem are
+            # blocking, and a slow parse on the event loop would stall Signal
+            # event handling, control responses, and ACP timeouts for the
+            # whole process. Only the validated swap happens on the loop.
+            candidate = await asyncio.to_thread(load_app_config, config_path, routes_path)
         except Exception as exc:
             LOGGER.error(
                 "config reload rejected: parse/validation failed: %s",
@@ -1813,6 +1824,7 @@ class SignalHermesRouter:
                     "generation": self._config_generation,
                 }
         old_config = self._do_reload_config(candidate)
+        self._reap_retired_runtime_state(old_config, candidate)
         old_counts = Counter(route.state.value for route in old_config.routes)
         new_counts = Counter(route.state.value for route in candidate.routes)
         LOGGER.info(
@@ -1863,18 +1875,97 @@ class SignalHermesRouter:
         # under a different profile in a later reload.
         for route in new_config.routes:
             self._route_profile_tombstones[route.key] = route.profile
-        # Clear breaker overrides for routes whose operator-configured state is
-        # now DISABLED, so a disabled route is not masked by a stale MAINTENANCE
-        # override from an earlier trip.
+        # Clear breaker overrides for routes whose operator-configured state
+        # is now anything other than ACTIVE: a stale MAINTENANCE override must
+        # not mask a reloaded SHADOW/DISABLED/MAINTENANCE route, or new turns
+        # would keep sending maintenance replies instead of applying the
+        # reloaded state. An override on a still-ACTIVE route survives: a
+        # reload must not silently reset a tripped breaker — recovery clears
+        # it via _maybe_clear_breaker_override.
         for route in new_config.routes:
-            if route.state == RouteState.DISABLED and self.route_state_overrides.get(route.key) == RouteState.MAINTENANCE:
+            if route.state != RouteState.ACTIVE and self.route_state_overrides.get(route.key) == RouteState.MAINTENANCE:
                 self.route_state_overrides.pop(route.key, None)
                 self._trip_times.pop(route.key, None)
                 self._trip_times_ms.pop(route.key, None)
         # Do NOT prune route locks: in-flight turns may hold them.
-        # Do NOT touch session registry: those are runtime state keyed by
-        # route.key and profile name.
+        # Session registry entries and cached profile subprocesses for routes
+        # that can no longer prompt are reaped by the caller's
+        # _reap_retired_runtime_state after the swap.
         return old_config
+
+    def _reap_retired_runtime_state(
+        self, old_config: AppConfig, new_config: AppConfig
+    ) -> None:
+        """Drop runtime state that a reload left without an active route.
+
+        Sessions cached for routes that can no longer prompt (reloaded to
+        shadow/disabled/maintenance, or removed entirely) are evicted so
+        their per-session profile state is released. Cached Hermes profile
+        subprocesses with no remaining active route are retired by tracked
+        background tasks that first wait (bounded) for in-flight turns to
+        drain, so a retired profile neither wedges a mid-prompt turn nor
+        lingers until process shutdown.
+        """
+        live_routes = [
+            route for route in new_config.routes if route.state == RouteState.ACTIVE
+        ]
+        live_route_keys = {route.key for route in live_routes}
+        evicted = self.sessions.drop_sessions_not_in(live_route_keys)
+        if evicted:
+            LOGGER.info(
+                "config reload evicted %d cached session(s) for routes no longer active",
+                evicted,
+            )
+        live_profiles = {route.profile for route in live_routes}
+        for profile_name in self.supervisor.cached_profile_names():
+            if profile_name in live_profiles:
+                continue
+            task = asyncio.ensure_future(
+                self._retire_profile_after_drain(profile_name, old_config, new_config)
+            )
+            self._signal_turn_tasks.add(task)
+            task.add_done_callback(self._settle_tracked_task)
+
+    async def _retire_profile_after_drain(
+        self, profile_name: str, old_config: AppConfig, new_config: AppConfig
+    ) -> None:
+        # In-flight turns captured their Route (and its profile binding)
+        # before the swap. Wait for the route locks of every route that could
+        # still be prompting this profile — routes bound to it that are no
+        # longer active — then close the cached subprocess. The wait is
+        # bounded (see RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS): a wedged turn
+        # must not pin a retired profile forever.
+        still_active = {
+            route.key
+            for route in new_config.routes
+            if route.profile == profile_name and route.state == RouteState.ACTIVE
+        }
+        drain_keys = [
+            route.key
+            for route in old_config.routes
+            if route.profile == profile_name and route.key not in still_active
+        ]
+        deadline = time.monotonic() + RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS
+        for key in drain_keys:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            lock = self._route_locks[key]
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=remaining)
+            except TimeoutError:
+                LOGGER.warning(
+                    "config reload profile retire timed out waiting for in-flight "
+                    "turn on route %s; closing profile anyway",
+                    self.redactor.ref("route", key),
+                )
+                break
+            lock.release()
+        if await self.supervisor.retire_profile(profile_name):
+            LOGGER.info(
+                "config reload retired Hermes profile %s: no remaining active routes",
+                self.redactor.ref("profile", profile_name),
+            )
 
     def _route_health(self, index: int, route: Route) -> RouteHealth:
         return RouteHealth(
