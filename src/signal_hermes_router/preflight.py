@@ -345,18 +345,23 @@ class LocalToolExposedIssue:
     profile: str
     tool_name: str
     source_kind: str = "profile_surface"
+    source_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "code": "local_tool_exposed",
+        value: dict[str, Any] = {
             "route_ref": self.route_ref,
             "profile": self.profile,
             "tool": self.tool_name,
             "source_kind": self.source_kind,
         }
+        if self.source_id is not None:
+            value["source_id"] = self.source_id
+        return value
 
     def to_issue(self) -> dict[str, Any]:
-        return self.to_dict()
+        value = self.to_dict()
+        value["code"] = "local_tool_exposed"
+        return value
 
 
 @dataclass(frozen=True)
@@ -586,27 +591,30 @@ async def run_permission_preflight(
         for index, route in enumerate(config.routes)
         if effective_scope.matches_route(index, route)
     }
-    for index, route in enumerate(config.routes):
-        if not effective_scope.matches_route(index, route):
-            continue
-        if not route.mcp_only:
-            continue
-        checked_surface = surfaces.get(route.profile)
-        ref = route_ref(index, route)
-        if checked_surface is not None:
-            for tool_name in sorted(checked_surface.tool_names):
-                if is_local_tool(tool_name):
-                    local_tools.append(
-                        LocalToolExposedIssue(
-                            route_ref=ref,
-                            profile=route.profile,
-                            tool_name=tool_name,
-                            source_kind="profile_surface",
+    # Skip the entire local-tool scan when the scope is unvalidatable so the
+    # report does not emit findings derived from a scope it has just declared
+    # uncheckable.
+    if not scope_errors:
+        for index, route in enumerate(config.routes):
+            if not effective_scope.matches_route(index, route):
+                continue
+            if not route.mcp_only:
+                continue
+            checked_surface = surfaces.get(route.profile)
+            ref = route_ref(index, route)
+            if checked_surface is not None:
+                for tool_name in sorted(checked_surface.tool_names):
+                    if is_local_tool(tool_name):
+                        local_tools.append(
+                            LocalToolExposedIssue(
+                                route_ref=ref,
+                                profile=route.profile,
+                                tool_name=tool_name,
+                                source_kind="profile_surface",
+                            )
                         )
-                    )
-        # Also flag local tools in the route's own allowlist — the runtime
-        # backstop rejects these, so preflight should surface the config mistake.
-        if not scope_errors:
+            # Also flag local tools in the route's own allowlist — the runtime
+            # backstop rejects these, so preflight should surface the config mistake.
             for rule in route.permission_policy.rules:
                 if is_local_tool(rule.tool_name):
                     local_tools.append(
@@ -617,9 +625,8 @@ async def run_permission_preflight(
                             source_kind="route",
                         )
                     )
-    # Also scan synthetic definitions (jobs/notifications) for local tools
-    # on mcp_only routes, but only when the route is in scope.
-    if not scope_errors:
+        # Also scan synthetic definitions (jobs/notifications) for local tools
+        # on mcp_only routes, but only when the route is in scope.
         for job in config.scheduled_jobs:
             route = config.find_route_by_name(job.route_name)
             if route is None or id(route) not in route_positions:
@@ -636,6 +643,7 @@ async def run_permission_preflight(
                                 profile=route.profile,
                                 tool_name=rule.tool_name,
                                 source_kind="scheduled_job",
+                                source_id=job.id,
                             )
                         )
         for notification in config.notifications:
@@ -654,19 +662,26 @@ async def run_permission_preflight(
                                 profile=route.profile,
                                 tool_name=rule.tool_name,
                                 source_kind="notification",
+                                source_id=notification.id,
                             )
                         )
-    # Deduplicate (case-insensitive because is_local_tool lowercases before matching).
-    seen_local_tools: set[tuple[str, str, str, str]] = set()
+    # Deduplicate within each source so distinct same-source tools are preserved.
+    seen_local_tools: set[tuple[str, str, str, str, str | None]] = set()
     deduped: list[LocalToolExposedIssue] = []
     for issue in local_tools:
-        key = (issue.route_ref, issue.profile, issue.tool_name.lower(), issue.source_kind)
+        key = (issue.route_ref, issue.profile, issue.tool_name, issue.source_kind, issue.source_id)
         if key not in seen_local_tools:
             seen_local_tools.add(key)
             deduped.append(issue)
     local_tools = deduped
     local_tools.sort(
-        key=lambda item: (item.profile, item.route_ref, item.tool_name.lower(), item.source_kind)
+        key=lambda item: (
+            item.profile,
+            item.route_ref,
+            item.tool_name,
+            item.source_kind,
+            item.source_id or "",
+        )
     )
 
     return PreflightReport(
@@ -742,6 +757,8 @@ def format_preflight_report_dict(data: dict[str, Any]) -> str:
             if not isinstance(issue, dict):
                 continue
             source = issue.get("source_kind", "profile_surface")
+            if issue.get("source_id") is not None:
+                source = f"{source}:{issue['source_id']}"
             lines.append(
                 f"- {issue.get('route_ref')} {issue.get('profile')} {source} {issue.get('tool')}"
             )

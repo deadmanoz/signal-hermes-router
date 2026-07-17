@@ -271,6 +271,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(local_tools[0]["tool"], "bash")
         self.assertEqual(local_tools[0]["route_ref"], "route:mcp-route")
         self.assertEqual(local_tools[0]["source_kind"], "scheduled_job")
+        self.assertEqual(local_tools[0]["source_id"], "daily-job")
 
     async def test_preflight_flags_local_tools_in_notification_on_mcp_only_route(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -311,6 +312,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(local_tools[0]["tool"], "terminal/create")
         self.assertEqual(local_tools[0]["route_ref"], "route:mcp-route")
         self.assertEqual(local_tools[0]["source_kind"], "notification")
+        self.assertEqual(local_tools[0]["source_id"], "alert")
 
     async def test_preflight_local_tools_respects_scope_for_synthetic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -358,6 +360,52 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
         ]
         self.assertEqual(len(local_tools), 0)
+
+    async def test_preflight_distinguishes_two_jobs_with_same_local_tool(self) -> None:
+        """Two different scheduled jobs on the same mcp_only route that each
+        allowlist the same local tool should produce separate issues so the
+        operator knows both jobs need fixing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            route = make_route(
+                name="mcp-route",
+                group_id="EXAMPLE_MCP",
+                profile="calendar",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("read_file"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(route,),
+                scheduled_jobs=(
+                    SyntheticRouteJob(
+                        id="morning-job",
+                        route_name="mcp-route",
+                        prompt="Morning task",
+                        permission_policy=StaticPermissionPolicy.from_config([{"tool": "bash"}]),
+                    ),
+                    SyntheticRouteJob(
+                        id="evening-job",
+                        route_name="mcp-route",
+                        prompt="Evening task",
+                        permission_policy=StaticPermissionPolicy.from_config([{"tool": "bash"}]),
+                    ),
+                ),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["read_file"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
+        self.assertEqual(len(local_tools), 2)
+        ids = sorted([issue["source_id"] for issue in local_tools])
+        self.assertEqual(ids, ["evening-job", "morning-job"])
 
     async def test_preflight_local_tools_per_route_not_per_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
