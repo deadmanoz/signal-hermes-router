@@ -1395,6 +1395,46 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report.missing_tools, ())
         self.assertEqual(report.scope_errors, ())
 
+    async def test_preflight_probe_failure_on_mcp_only_route_reports_preflight_failed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(
+                    make_route(
+                        name="mcp-only-route",
+                        group_id="EXAMPLE_MCP_GROUP",
+                        profile="calendar",
+                        state=RouteState.ACTIVE,
+                        permission_policy=policy("read_file"),
+                        mcp_only=True,
+                    ),
+                ),
+            )
+
+            report = await run_permission_preflight(
+                app,
+                unavailable_tool_surface_probe,
+                scope=PreflightScope(active_only=True),
+            )
+
+        self.assertEqual(report.status, "failed")
+        self.assertEqual(len(report.probe_errors), 1)
+        self.assertEqual(report.probe_errors[0].code, "probe_contract_required")
+        self.assertEqual(report.missing_tools, ())
+        # Surface scan is skipped when probe fails, so no surface-derived local tools
+        self.assertEqual(report.local_tools_exposed, ())
+        # preflight_failure_from_report returns PREFLIGHT_FAILED, not PERMISSION_DENIED
+        from signal_hermes_router.failures import (
+            FailureCode,
+            preflight_failure_from_report,
+        )
+
+        failure = preflight_failure_from_report(report)
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure.code, FailureCode.PREFLIGHT_FAILED)
+
     def test_parse_preflight_scope_validates_selector_shape(self) -> None:
         scope = parse_preflight_scope(
             {

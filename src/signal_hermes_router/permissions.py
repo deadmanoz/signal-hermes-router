@@ -126,9 +126,10 @@ class StaticPermissionPolicy:
             or ""
         )
         if self.mcp_only and is_local_tool(str(tool_name)):
+            safe_name = str(tool_name).replace("\n", "\\n").replace("\r", "\\r")[:80]
             LOGGER.info(
                 "mcp_only policy rejected local tool call: %s",
-                tool_name,
+                safe_name,
             )
             return False
         raw_input = tool_call.get("rawInput") or tool_call.get("raw_input") or {}

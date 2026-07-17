@@ -591,7 +591,7 @@ async def run_permission_preflight(
             continue
         checked_surface = surfaces.get(route.profile)
         ref = route_ref(index, route)
-        if checked_surface is not None and not scope_errors:
+        if checked_surface is not None:
             for tool_name in sorted(checked_surface.tool_names):
                 if is_local_tool(tool_name):
                     local_tools.append(
@@ -603,51 +603,53 @@ async def run_permission_preflight(
                     )
         # Also flag local tools in the route's own allowlist — the runtime
         # backstop rejects these, so preflight should surface the config mistake.
-        for rule in route.permission_policy.rules:
-            if is_local_tool(rule.tool_name):
-                local_tools.append(
-                    LocalToolExposedIssue(
-                        route_ref=ref,
-                        profile=route.profile,
-                        tool_name=rule.tool_name,
+        if not scope_errors:
+            for rule in route.permission_policy.rules:
+                if is_local_tool(rule.tool_name):
+                    local_tools.append(
+                        LocalToolExposedIssue(
+                            route_ref=ref,
+                            profile=route.profile,
+                            tool_name=rule.tool_name,
+                        )
                     )
-                )
     # Also scan synthetic definitions (jobs/notifications) for local tools
     # on mcp_only routes, but only when the route is in scope.
-    for job in config.scheduled_jobs:
-        route = config.find_route_by_name(job.route_name)
-        if route is None or id(route) not in route_positions:
-            continue
-        if not route.mcp_only:
-            continue
-        if job.permission_policy is not None:
-            _index, ref = route_positions[id(route)]
-            for rule in job.permission_policy.rules:
-                if is_local_tool(rule.tool_name):
-                    local_tools.append(
-                        LocalToolExposedIssue(
-                            route_ref=ref,
-                            profile=route.profile,
-                            tool_name=rule.tool_name,
+    if not scope_errors:
+        for job in config.scheduled_jobs:
+            route = config.find_route_by_name(job.route_name)
+            if route is None or id(route) not in route_positions:
+                continue
+            if not route.mcp_only:
+                continue
+            if job.permission_policy is not None:
+                _index, ref = route_positions[id(route)]
+                for rule in job.permission_policy.rules:
+                    if is_local_tool(rule.tool_name):
+                        local_tools.append(
+                            LocalToolExposedIssue(
+                                route_ref=ref,
+                                profile=route.profile,
+                                tool_name=rule.tool_name,
+                            )
                         )
-                    )
-    for notification in config.notifications:
-        route = config.find_route_by_name(notification.route_name)
-        if route is None or id(route) not in route_positions:
-            continue
-        if not route.mcp_only:
-            continue
-        if notification.permission_policy is not None:
-            _index, ref = route_positions[id(route)]
-            for rule in notification.permission_policy.rules:
-                if is_local_tool(rule.tool_name):
-                    local_tools.append(
-                        LocalToolExposedIssue(
-                            route_ref=ref,
-                            profile=route.profile,
-                            tool_name=rule.tool_name,
+        for notification in config.notifications:
+            route = config.find_route_by_name(notification.route_name)
+            if route is None or id(route) not in route_positions:
+                continue
+            if not route.mcp_only:
+                continue
+            if notification.permission_policy is not None:
+                _index, ref = route_positions[id(route)]
+                for rule in notification.permission_policy.rules:
+                    if is_local_tool(rule.tool_name):
+                        local_tools.append(
+                            LocalToolExposedIssue(
+                                route_ref=ref,
+                                profile=route.profile,
+                                tool_name=rule.tool_name,
+                            )
                         )
-                    )
     # Deduplicate (case-insensitive because is_local_tool lowercases before matching).
     seen_local_tools: set[tuple[str, str, str]] = set()
     deduped: list[LocalToolExposedIssue] = []
