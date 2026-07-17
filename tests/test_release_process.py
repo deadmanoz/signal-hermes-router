@@ -127,6 +127,7 @@ gh() {{
             confirm["if"],
             "${{ always() && steps.base_gate.outputs.sync_release_pr == 'false' && steps.stale_release_pr.outcome == 'success' }}",
         )
+        self.assertLess(names.index(capture["name"]), names.index("Run Release Please"))
         self.assertLess(names.index("Run Release Please"), names.index(confirm["name"]))
         self.assertIn("skip-github-pull-request", confirm_run)
         self.assertIn(
@@ -200,13 +201,17 @@ gh() {
         self.assertNotEqual(non_canonical.returncode, 0)
 
         verify_input = self.steps_by_name["Verify stale Release Please input"]
+        release_action = self.steps_by_name["Run Release Please"]
         self.assertEqual(
             verify_input["if"], "${{ steps.base_gate.outputs.sync_release_pr == 'false' }}"
         )
         self.assertEqual(
             verify_input["env"]["RELEASE_PLEASE_ACTION_REF"],
-            "45996ed1f6d02564a971a2fa1b5860e934307cf7",
+            release_action["uses"]
+            .removeprefix("googleapis/release-please-action@")
+            .split(maxsplit=1)[0],
         )
+        self.assertLess(names.index(verify_input["name"]), names.index("Run Release Please"))
         self.assertIn(
             "repos/googleapis/release-please-action/contents/action.yml?ref=$RELEASE_PLEASE_ACTION_REF",
             verify_input["run"],
