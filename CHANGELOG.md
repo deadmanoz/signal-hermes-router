@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.31](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.30...v0.1.31) (2026-07-17)
+
+
+### Bug Fixes
+
+* **release:** close publication trust gaps ([#70](https://github.com/deadmanoz/signal-hermes-router/issues/70)) ([95704e9](https://github.com/deadmanoz/signal-hermes-router/commit/95704e91323b7263e21b8b38c8f138aba61dcf6f))
+
 ## [0.1.30](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.29...v0.1.30) (2026-07-15)
 
 
