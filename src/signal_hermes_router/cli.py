@@ -100,6 +100,21 @@ def main(argv: list[str] | None = None) -> None:
         help="local control socket round-trip timeout in seconds",
     )
     status.add_argument("--control-socket", type=Path)
+    reload_cfg = subparsers.add_parser(
+        "reload-config", help="atomically reload router routes configuration from disk"
+    )
+    reload_cfg.add_argument(
+        "--candidate-routes",
+        type=Path,
+        help="override routes.yaml path (defaults to router startup path)",
+    )
+    reload_cfg.add_argument(
+        "--client-timeout",
+        type=float,
+        default=DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+        help="local control socket round-trip timeout in seconds",
+    )
+    reload_cfg.add_argument("--control-socket", type=Path)
     args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
     exit_code = asyncio.run(_main_async(args))
@@ -119,6 +134,8 @@ async def _main_async(args: argparse.Namespace) -> int:
         return await _preflight_permissions(args)
     if args.command == "route-status":
         return await _route_status(args)
+    if args.command == "reload-config":
+        return await _reload_config(args)
     raise ValueError(f"unknown command {args.command!r}")
 
 
@@ -331,6 +348,25 @@ async def _route_status(args: argparse.Namespace) -> int:
     return 0 if response.get("status") == "ok" else 1
 
 
+async def _reload_config(args: argparse.Namespace) -> int:
+    try:
+        socket_path = (
+            args.control_socket or load_router_config(args.config).control_socket_path
+        ).expanduser()
+        client_timeout = _resolve_client_timeout(args)
+        response = await reload_config_via_control_socket(
+            socket_path,
+            candidate_routes=args.candidate_routes,
+            client_timeout=client_timeout,
+        )
+    except Exception as exc:
+        logging.error("reload-config failed: %s", exc.__class__.__name__)
+        logging.debug("reload-config failure details", exc_info=True)
+        return 1
+    print(json.dumps(response, sort_keys=True))
+    return 0 if response.get("status") == "ok" else 1
+
+
 def _preflight_scope_from_args(args: argparse.Namespace) -> PreflightScope:
     return parse_preflight_scope(
         {
@@ -454,6 +490,18 @@ async def route_status_via_control_socket(
         request["route_indexes"] = list(route_indexes)
     if profiles:
         request["profiles"] = list(profiles)
+    return await _control_round_trip(socket_path, request, client_timeout=client_timeout)
+
+
+async def reload_config_via_control_socket(
+    socket_path: Path,
+    *,
+    candidate_routes: Path | None = None,
+    client_timeout: float | None = DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {"command": "reload_config"}
+    if candidate_routes is not None:
+        request["candidate_routes"] = str(candidate_routes)
     return await _control_round_trip(socket_path, request, client_timeout=client_timeout)
 
 

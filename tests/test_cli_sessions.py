@@ -32,6 +32,15 @@ from tests.support import make_event, make_route
 
 
 class CliTests(unittest.IsolatedAsyncioTestCase):
+    def test_main_reload_config_parses_top_level_config_and_routes(self) -> None:
+        with patch.object(cli_module.asyncio, "run") as run:
+            cli_module.main(["--config", "cfg.yaml", "--routes", "r.yaml", "reload-config"])
+
+        args = run.call_args.args[0].cr_frame.f_locals["args"]
+        self.assertEqual(args.config, Path("cfg.yaml"))
+        self.assertEqual(args.routes, Path("r.yaml"))
+        self.assertIsNone(args.candidate_routes)
+
     def test_main_parses_paths_log_level_and_runs_async_entrypoint(self) -> None:
         with (
             patch.object(cli_module.logging, "basicConfig") as basic_config,
