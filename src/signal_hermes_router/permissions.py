@@ -106,7 +106,9 @@ class StaticPermissionPolicy:
     mcp_only: bool = False
 
     @classmethod
-    def from_config(cls, values: list[dict[str, Any]] | None, *, mcp_only: bool = False) -> "StaticPermissionPolicy":
+    def from_config(
+        cls, values: list[dict[str, Any]] | None, *, mcp_only: bool = False
+    ) -> "StaticPermissionPolicy":
         return cls(
             tuple(PermissionRule.from_config(value) for value in values or []),
             mcp_only=mcp_only,

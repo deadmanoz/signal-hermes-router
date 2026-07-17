@@ -29,35 +29,75 @@ from signal_hermes_router.models import (
 class ConfigTests(unittest.TestCase):
     def test_route_mcp_only_parsing(self) -> None:
         from signal_hermes_router.config import parse_route
+
         # explicit true
-        route = parse_route({
-            "platform": "signal",
-            "group_id": "EXAMPLE",
-            "profile": "test-profile",
-            "session_policy": "persistent_route",
-            "state": "active",
-            "mcp_only": True,
-        })
+        route = parse_route(
+            {
+                "platform": "signal",
+                "group_id": "EXAMPLE",
+                "profile": "test-profile",
+                "session_policy": "persistent_route",
+                "state": "active",
+                "mcp_only": True,
+            }
+        )
         self.assertTrue(route.mcp_only)
+        self.assertTrue(route.permission_policy.mcp_only)
         # explicit false
-        route = parse_route({
-            "platform": "signal",
-            "group_id": "EXAMPLE",
-            "profile": "test-profile",
-            "session_policy": "persistent_route",
-            "state": "active",
-            "mcp_only": False,
-        })
+        route = parse_route(
+            {
+                "platform": "signal",
+                "group_id": "EXAMPLE",
+                "profile": "test-profile",
+                "session_policy": "persistent_route",
+                "state": "active",
+                "mcp_only": False,
+            }
+        )
         self.assertFalse(route.mcp_only)
+        self.assertFalse(route.permission_policy.mcp_only)
         # default
-        route = parse_route({
-            "platform": "signal",
-            "group_id": "EXAMPLE",
-            "profile": "test-profile",
-            "session_policy": "persistent_route",
-            "state": "active",
-        })
+        route = parse_route(
+            {
+                "platform": "signal",
+                "group_id": "EXAMPLE",
+                "profile": "test-profile",
+                "session_policy": "persistent_route",
+                "state": "active",
+            }
+        )
         self.assertFalse(route.mcp_only)
+        self.assertFalse(route.permission_policy.mcp_only)
+
+    def test_route_mcp_only_syncs_to_permission_policy(self) -> None:
+        from signal_hermes_router.config import Route
+        from signal_hermes_router.permissions import StaticPermissionPolicy
+
+        # Route constructed with mcp_only=True syncs to policy even when
+        # policy is passed without the flag.
+        policy = StaticPermissionPolicy.from_config([{"tool": "read_file"}])
+        route = Route(
+            platform="signal",
+            profile="test",
+            session_policy=SessionPolicy.PERSISTENT_ROUTE,
+            state=RouteState.ACTIVE,
+            mcp_only=True,
+            permission_policy=policy,
+        )
+        self.assertTrue(route.mcp_only)
+        self.assertTrue(route.permission_policy.mcp_only)
+        # Route constructed with mcp_only=False does not override a True policy.
+        policy = StaticPermissionPolicy.from_config([{"tool": "read_file"}], mcp_only=True)
+        route = Route(
+            platform="signal",
+            profile="test",
+            session_policy=SessionPolicy.PERSISTENT_ROUTE,
+            state=RouteState.ACTIVE,
+            mcp_only=False,
+            permission_policy=policy,
+        )
+        self.assertFalse(route.mcp_only)
+        self.assertFalse(route.permission_policy.mcp_only)
 
     def test_load_app_config_reads_yaml_and_router_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

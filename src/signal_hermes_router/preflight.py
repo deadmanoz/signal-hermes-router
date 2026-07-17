@@ -8,19 +8,13 @@ from typing import Any
 
 from .config import AppConfig, Route
 from .models import RouteState
-from .permissions import StaticPermissionPolicy
+from .permissions import StaticPermissionPolicy, is_local_tool
 
 
 ProbeCallable = Callable[[str], Awaitable["ToolSurface"]]
 SUPPORTED_TOOL_SURFACE_SCHEMA_VERSION = 1
 FULL_CALLABLE_TOOL_SURFACE_SCOPE = "full_callable"
 _MISSING = object()
-# Tool names that are considered local-terminal/fs execution primitives.
-# These are reported as wiring signals when found on an mcp_only route's
-# full_callable tool surface. The list is intentionally conservative:
-# only generic execution primitives and explicit namespace prefixes.
-_LOCAL_TOOL_NAMES = frozenset({"shell", "bash", "python"})
-_LOCAL_TOOL_PREFIXES = ("terminal/", "fs/")
 
 
 # Catalog-carrying keys other than `tools` that the metadata path recognizes.
@@ -28,14 +22,6 @@ _LOCAL_TOOL_PREFIXES = ("terminal/", "fs/")
 # presence there makes producer intent ambiguous and the router fails closed
 # rather than silently trusting `tools` (or picking one when `tools` is absent).
 _TOOL_SURFACE_ALIAS_CATALOG_KEYS = ("toolSurface", "tool_surface", "tool_names")
-
-
-def _is_local_tool(tool_name: str) -> bool:
-    """Return True if tool_name matches a known local-terminal/fs pattern."""
-    lower = tool_name.lower()
-    if lower in _LOCAL_TOOL_NAMES:
-        return True
-    return lower.startswith(_LOCAL_TOOL_PREFIXES)
 
 
 def _validate_probe_error_fields(code: str, error: str | None) -> None:
@@ -552,11 +538,12 @@ async def run_permission_preflight(
                 error="preflight scope did not match any route",
             )
         )
-    mcp_only_profiles = tuple(sorted({
-        route.profile for index, route in enumerate(config.routes)
+    mcp_only_profiles = {
+        route.profile
+        for index, route in enumerate(config.routes)
         if effective_scope.matches_route(index, route) and route.mcp_only
-    }))
-    profiles = tuple(sorted({tool.profile for tool in expected} | set(mcp_only_profiles)))
+    }
+    profiles = tuple(sorted({tool.profile for tool in expected} | mcp_only_profiles))
     surfaces: dict[str, ToolSurface] = {}
     probe_errors: list[PreflightProbeError] = []
     profiles_to_probe = () if scope_errors else profiles
@@ -602,12 +589,14 @@ async def run_permission_preflight(
             continue
         ref = route_ref(index, route)
         for tool_name in checked_surface.tool_names:
-            if _is_local_tool(tool_name):
-                local_tools.append(LocalToolExposedIssue(
-                    route_ref=ref,
-                    profile=route.profile,
-                    tool_name=tool_name,
-                ))
+            if is_local_tool(tool_name):
+                local_tools.append(
+                    LocalToolExposedIssue(
+                        route_ref=ref,
+                        profile=route.profile,
+                        tool_name=tool_name,
+                    )
+                )
     local_tools.sort(key=lambda item: (item.profile, item.route_ref, item.tool_name))
 
     return PreflightReport(
@@ -648,6 +637,7 @@ def format_preflight_report_dict(data: dict[str, Any]) -> str:
         "Configured permission tool entries: "
         f"{data.get('expected_permissions_count', len(data.get('expected_permissions') or []))}",
         f"Missing tool entries: {data.get('missing_tools_count', len(data.get('missing_tools') or []))}",
+        f"Local tool entries: {data.get('local_tools_exposed_count', len(data.get('local_tools_exposed') or []))}",
     ]
     probe_errors = data.get("probe_errors") or []
     if probe_errors:
@@ -681,9 +671,7 @@ def format_preflight_report_dict(data: dict[str, Any]) -> str:
         for issue in local_tools:
             if not isinstance(issue, dict):
                 continue
-            lines.append(
-                f"- {issue.get('route_ref')} {issue.get('profile')} {issue.get('tool')}"
-            )
+            lines.append(f"- {issue.get('route_ref')} {issue.get('profile')} {issue.get('tool')}")
     return "\n".join(lines)
 
 

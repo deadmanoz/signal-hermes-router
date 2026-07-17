@@ -22,6 +22,7 @@ REQUEST = {
 class PermissionTests(unittest.TestCase):
     def test_mcp_only_policy_rejects_local_tools(self) -> None:
         from signal_hermes_router.permissions import StaticPermissionPolicy
+
         # MCP-only policy with an allowlisted local tool — the defense-in-depth backstop rejects it
         policy = StaticPermissionPolicy.from_config([{"tool": "terminal/create"}], mcp_only=True)
         self.assertFalse(policy.allows_tool_call({"toolName": "terminal/create"}))
@@ -35,7 +36,10 @@ class PermissionTests(unittest.TestCase):
 
     def test_mcp_only_policy_allows_benign_mcp_tools(self) -> None:
         from signal_hermes_router.permissions import StaticPermissionPolicy
-        policy = StaticPermissionPolicy.from_config([{"tool": "code_search"}, {"tool": "python_docs"}], mcp_only=True)
+
+        policy = StaticPermissionPolicy.from_config(
+            [{"tool": "code_search"}, {"tool": "python_docs"}], mcp_only=True
+        )
         self.assertTrue(policy.allows_tool_call({"toolName": "code_search"}))
         self.assertTrue(policy.allows_tool_call({"toolName": "python_docs"}))
 

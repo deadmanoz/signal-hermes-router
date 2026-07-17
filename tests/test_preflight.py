@@ -118,18 +118,27 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def probe(profile: str) -> ToolSurface:
-                return callable_surface(profile, ["read_file", "terminal/create", "fs/read_text_file"])
+                return callable_surface(
+                    profile, ["read_file", "terminal/create", "fs/read_text_file"]
+                )
 
             report = await run_permission_preflight(app, probe)
 
         self.assertEqual(report.status, "failed")
-        local_tools = [issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"]
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
         self.assertEqual(len(local_tools), 2)
-        self.assertEqual(sorted([issue["tool"] for issue in local_tools]), ["fs/read_text_file", "terminal/create"])
+        self.assertEqual(
+            sorted([issue["tool"] for issue in local_tools]),
+            ["fs/read_text_file", "terminal/create"],
+        )
         # read_file is allowed (in allowlist) and not flagged
         self.assertNotIn("read_file", [issue["tool"] for issue in local_tools])
 
-    async def test_preflight_reports_local_tools_for_mcp_only_route_with_empty_allowlist(self) -> None:
+    async def test_preflight_reports_local_tools_for_mcp_only_route_with_empty_allowlist(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             active = make_route(
                 name="mcp-only-empty",
@@ -152,7 +161,9 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             report = await run_permission_preflight(app, probe)
 
         self.assertEqual(report.status, "failed")
-        local_tools = [issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"]
+        local_tools = [
+            issue for issue in report.to_dict()["issues"] if issue["code"] == "local_tool_exposed"
+        ]
         self.assertEqual(len(local_tools), 1)
         self.assertEqual(local_tools[0]["tool"], "terminal/create")
 
@@ -1072,6 +1083,33 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         missing_output = format_preflight_report(missing_report)
         self.assertIn("Missing tools:", missing_output)
         self.assertIn("route:active-route calendar route read_file", missing_output)
+
+        # Local tools exposed section
+        with tempfile.TemporaryDirectory() as tmp:
+            local_app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(
+                    make_route(
+                        name="mcp-only-route",
+                        group_id="EXAMPLE_MCP_GROUP",
+                        profile="calendar",
+                        state=RouteState.ACTIVE,
+                        permission_policy=policy("read_file"),
+                        mcp_only=True,
+                    ),
+                ),
+            )
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(
+                    profile, ["read_file", "terminal/create"]
+                )
+
+            local_report = await run_permission_preflight(local_app, probe)
+
+        local_output = format_preflight_report(local_report)
+        self.assertIn("Local tool entries: 1", local_output)
+        self.assertIn("Local tools exposed:", local_output)
+        self.assertIn("route:mcp-only-route calendar terminal/create", local_output)
 
     async def test_unavailable_probe_reports_contract_requirement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

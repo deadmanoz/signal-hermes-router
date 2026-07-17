@@ -4,7 +4,7 @@ import hashlib
 import logging
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, TypeVar
@@ -138,6 +138,16 @@ class Route:
     max_event_age_seconds: float | None = None
     inbound_rate_limit: InboundRateLimitConfig | None = None
     mcp_only: bool = False
+
+    def __post_init__(self) -> None:
+        # Sync the permission_policy mcp_only flag from the route-level flag
+        # so there is one source of truth. Required for frozen dataclass.
+        if self.permission_policy.mcp_only != self.mcp_only:
+            object.__setattr__(
+                self,
+                "permission_policy",
+                replace(self.permission_policy, mcp_only=self.mcp_only),
+            )
 
     @property
     def key(self) -> str:
@@ -566,7 +576,7 @@ def _parse_synthetic_definitions(
                 prompt=prompt,
                 description=value.get("description"),
                 permission_policy=(
-                    StaticPermissionPolicy.from_config(raw_permissions, mcp_only=route.mcp_only)
+                    StaticPermissionPolicy.from_config(raw_permissions)
                     if raw_permissions is not None
                     else None
                 ),
@@ -642,7 +652,7 @@ def parse_route(raw: dict[str, Any]) -> Route:
         sender_id=sender_id,
         sender_number=sender_number,
         route_context=route_context,
-        permission_policy=StaticPermissionPolicy.from_config(raw.get("permissions") or [], mcp_only=mcp_only),
+        permission_policy=StaticPermissionPolicy.from_config(raw.get("permissions") or []),
         friendly_name=raw.get("friendly_name"),
         maintenance_reply=raw.get("maintenance_reply"),
         failure_reply=raw.get("failure_reply"),
