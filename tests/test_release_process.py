@@ -26,12 +26,17 @@ class ReleaseProcessTests(unittest.TestCase):
 
     def test_release_please_generates_draft_pr_and_updates_uv_lock(self) -> None:
         package = self.config["packages"]["."]
+        release = self.steps_by_name["Run Release Please"]
 
         self.assertEqual(
             self.workflow["jobs"]["release-please"]["defaults"]["run"]["shell"],
             "bash",
         )
         self.assertIs(self.config["draft-pull-request"], True)
+        self.assertEqual(
+            release["with"]["skip-github-pull-request"],
+            "${{ steps.base_gate.outputs.skip_github_pull_request }}",
+        )
         self.assertEqual(
             package["extra-files"],
             [
@@ -42,6 +47,72 @@ class ReleaseProcessTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_stale_historical_run_skips_release_pr_synchronization(self) -> None:
+        names = [step["name"] for step in self.steps]
+        gate = self.steps_by_name["Require current release base"]
+        gate_run = gate["run"]
+
+        self.assertEqual(gate["id"], "base_gate")
+        self.assertLess(
+            names.index("Require current release base"),
+            names.index("Capture pending release PR state"),
+        )
+        self.assertLess(
+            names.index("Capture pending release PR state"),
+            names.index("Run Release Please"),
+        )
+        self.assertEqual(
+            self.steps_by_name["Capture pending release PR state"]["if"],
+            "${{ steps.base_gate.outputs.sync_release_pr == 'true' }}",
+        )
+        self.assertIn('echo "sync_release_pr=false"', gate_run)
+        self.assertIn('echo "skip_github_pull_request=true"', gate_run)
+        self.assertNotIn("exit 1", gate_run)
+
+        harness = f"""
+set -e -o pipefail
+gh() {{
+  printf '%s\\n' "$LIVE_BASE_SHA"
+}}
+{gate_run}
+"""
+        expected_base_sha = "a1" * 20
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "github-output"
+            common_env = {
+                **os.environ,
+                "BASE_BRANCH": "main",
+                "EXPECTED_BASE_SHA": expected_base_sha,
+                "GITHUB_OUTPUT": str(output_path),
+                "REPO": "example/repo",
+            }
+            current = subprocess.run(
+                ["bash", "-c", harness],
+                check=False,
+                capture_output=True,
+                env={**common_env, "LIVE_BASE_SHA": expected_base_sha},
+                text=True,
+            )
+            self.assertEqual(current.returncode, 0, current.stderr)
+            self.assertEqual(
+                output_path.read_text(encoding="utf-8"),
+                "sync_release_pr=true\nskip_github_pull_request=false\n",
+            )
+
+            output_path.unlink()
+            stale = subprocess.run(
+                ["bash", "-c", harness],
+                check=False,
+                capture_output=True,
+                env={**common_env, "LIVE_BASE_SHA": "b2" * 20},
+                text=True,
+            )
+            self.assertEqual(stale.returncode, 0, stale.stderr)
+            self.assertEqual(
+                output_path.read_text(encoding="utf-8"),
+                "sync_release_pr=false\nskip_github_pull_request=true\n",
+            )
 
     def test_existing_pending_pr_is_drafted_before_release_please_runs(self) -> None:
         capture = self.steps_by_name["Capture pending release PR state"]
@@ -90,6 +161,7 @@ class ReleaseProcessTests(unittest.TestCase):
             names.index("Require stable release base"),
         )
         self.assertIn("steps.release_pr.outputs.has_release_pr == 'true'", identity["if"])
+        self.assertEqual(identity["id"], "release_pr_identity")
         for expected in (
             'release_branch="release-please--branches--$BASE_BRANCH"',
             'release_title_prefix="chore($BASE_BRANCH): release "',
@@ -98,17 +170,33 @@ class ReleaseProcessTests(unittest.TestCase):
             '[ "$head_ref" != "$release_branch" ]',
             '[ "$base_ref" != "$BASE_BRANCH" ]',
             '"$release_title_prefix"*',
+            "grep -Eq '^[0-9]+\\.[0-9]+\\.[0-9]+$'",
+            'echo "expected_version=$expected_version" >> "$GITHUB_OUTPUT"',
+            'echo "validated_title=$title" >> "$GITHUB_OUTPUT"',
+            '[ "$title" != "$EXPECTED_RELEASE_TITLE" ]',
         ):
             self.assertIn(expected, identity_run)
+        self.assertEqual(
+            identity["env"]["EXPECTED_RELEASE_TITLE"],
+            "${{ steps.release_pr.outputs.expected_title }}",
+        )
 
     def test_pending_pr_noop_enters_full_validation_and_recovers_draft(self) -> None:
         resolve = self.steps_by_name["Resolve release PR number"]
         resolve_run = resolve["run"]
 
-        self.assertEqual(resolve["if"], "${{ steps.release.outcome == 'success' }}")
+        self.assertEqual(
+            resolve["if"],
+            "${{ steps.release.outcome == 'success' && steps.base_gate.outputs.sync_release_pr == 'true' }}",
+        )
         self.assertIn('elif [ -n "$PENDING_PR_NUMBER" ]', resolve_run)
         self.assertIn('number="$PENDING_PR_NUMBER"', resolve_run)
         self.assertIn('branch="release-please--branches--$BASE_BRANCH"', resolve_run)
+        self.assertIn(
+            "expected_title=\"$(printf '%s' \"$PRS_JSON\" | jq -r '.[0].title')\"", resolve_run
+        )
+        self.assertIn('expected_title=""', resolve_run)
+        self.assertIn('echo "expected_title=$expected_title" >> "$GITHUB_OUTPUT"', resolve_run)
         self.assertIn('if [ "$PENDING_WAS_READY" = "true" ]', resolve_run)
         self.assertIn('enable_auto_merge="$PENDING_AUTO_MERGE"', resolve_run)
         self.assertIn('enable_auto_merge="true"', resolve_run)
@@ -330,11 +418,18 @@ gh() {{
         self.assertEqual(
             validation_run.splitlines(),
             [
-                '"$(uv python find 3.12)" scripts/check-release-head.py --base-sha "${{ github.sha }}"',
+                '"$(uv python find 3.12)" scripts/check-release-head.py --base-sha "${{ github.sha }}" --expected-version "$EXPECTED_VERSION"',
                 "uv lock --check",
                 '"$(uv python find 3.12)" scripts/check-public-boundary.py',
                 "git diff --exit-code -- CHANGELOG.md .release-please-manifest.json pyproject.toml uv.lock",
             ],
+        )
+        self.assertEqual(
+            self.steps_by_name["Validate generated release head"]["env"]["EXPECTED_VERSION"],
+            "${{ steps.release_pr_identity.outputs.expected_version }}",
+        )
+        self.assertNotIn(
+            "${{ steps.release_pr_identity.outputs.expected_version }}", validation_run
         )
         self.assertNotIn("uv run", validation_run)
         self.assertLess(
@@ -381,6 +476,10 @@ gh() {{
         self.assertIn("compare/$EXPECTED_BASE_SHA...$live_head_sha", publish_run)
         self.assertIn('commits/$BASE_BRANCH" --jq .sha', publish_run)
         self.assertEqual(publish["env"]["EXPECTED_BASE_SHA"], "${{ github.sha }}")
+        self.assertEqual(
+            publish["env"]["VALIDATED_TITLE"],
+            "${{ steps.release_pr_identity.outputs.validated_title }}",
+        )
         self.assertIn("protection/required_status_checks", publish_run)
         self.assertIn("Administration read permission", publish_run)
         self.assertIn('if [ "$strict" != "true" ]', publish_run)
@@ -399,9 +498,19 @@ gh() {{
         self.assertIn(
             "base/head changed or became unmergeable during ready transition", publish_run
         )
-        self.assertIn("base/head changed or became unmergeable before auto-merge", publish_run)
+        self.assertIn(
+            "identity, base, or head changed or became unmergeable before auto-merge", publish_run
+        )
+        self.assertIn("headRefName,baseRefName,title,isCrossRepository,headRefOid", publish_run)
+        self.assertIn(
+            "headRefOid,headRefName,baseRefName,title,isCrossRepository,mergeable", publish_run
+        )
+        self.assertIn('"$title" != "$VALIDATED_TITLE"', publish_run)
         self.assertIn('if [ "$ENABLE_AUTO_MERGE" = "true" ]', publish_run)
         self.assertIn('--match-head-commit "$validated_sha"', publish_run)
+        merge_run = publish_run[publish_run.index('gh pr merge "$PR_NUMBER"') :]
+        self.assertIn('--subject "$VALIDATED_TITLE"', merge_run)
+        self.assertNotIn("--body", merge_run)
 
     def test_publish_failure_after_ready_redrafts_pr(self) -> None:
         publish_run = self.steps_by_name["Publish validated release PR"]["run"]
@@ -421,6 +530,8 @@ gh() {{
     printf 'true\\n'
   elif [[ "$*" == *"compare/$BASE_BRANCH"* ]]; then
     printf '0\\n'
+  elif [[ "$*" == *"--json headRefName,baseRefName,title,isCrossRepository,headRefOid"* ]]; then
+    printf '{{"headRefName":"release-please--branches--%s","baseRefName":"%s","title":"%s","isCrossRepository":false,"headRefOid":"%s"}}\\n' "$BASE_BRANCH" "$BASE_BRANCH" "$VALIDATED_TITLE" "$VALIDATED_SHA"
   elif [[ "$*" == *"--json headRefOid,mergeable"* ]]; then
     printf '{{"headRefOid":"%s","mergeable":"MERGEABLE"}}\\n' "$VALIDATED_SHA"
   elif [[ "$*" == *"--json headRefOid --jq .headRefOid"* ]]; then
@@ -440,6 +551,7 @@ gh() {{
                 "PR_NUMBER": "123",
                 "REPO": "example/repo",
                 "VALIDATED_SHA": "a1" * 20,
+                "VALIDATED_TITLE": "chore(main): release 0.1.31",
             }
 
             result = subprocess.run(

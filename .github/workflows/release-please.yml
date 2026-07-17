@@ -20,11 +20,34 @@ jobs:
       run:
         shell: bash
     steps:
+      # A queued historical run may observe a newer main and an already-current
+      # release PR. Do not draft or update that PR: let the current queued run
+      # synchronize it. Release Please may still create a tag/release for a
+      # merged release PR, so only skip its pull-request half.
+      - name: Require current release base
+        id: base_gate
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_BRANCH: ${{ github.ref_name }}
+          EXPECTED_BASE_SHA: ${{ github.sha }}
+        run: |
+          live_base_sha="$(gh api "repos/$REPO/commits/$BASE_BRANCH" --jq .sha)"
+          if [ "$live_base_sha" = "$EXPECTED_BASE_SHA" ]; then
+            echo "sync_release_pr=true" >> "$GITHUB_OUTPUT"
+            echo "skip_github_pull_request=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$BASE_BRANCH advanced before release PR synchronization; skipping stale PR mutation"
+            echo "sync_release_pr=false" >> "$GITHUB_OUTPUT"
+            echo "skip_github_pull_request=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # Release Please opens new PRs as drafts. Existing ready release PRs must
       # also be drafted before an update so no reviewer can snapshot an
       # unvalidated head. Preserve enough state to restore a successful no-op.
       - name: Capture pending release PR state
         id: pending_pr
+        if: ${{ steps.base_gate.outputs.sync_release_pr == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           REPO: ${{ github.repository }}
@@ -85,6 +108,7 @@ jobs:
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          skip-github-pull-request: ${{ steps.base_gate.outputs.skip_github_pull_request }}
 
       # Resolve the PR identity once via jq on the raw `prs` string rather than
       # `fromJSON(...)` in a step `env:`. A step `env:` expression is evaluated
@@ -94,7 +118,7 @@ jobs:
       # by an earlier failed run.
       - name: Resolve release PR number
         id: release_pr
-        if: ${{ steps.release.outcome == 'success' }}
+        if: ${{ steps.release.outcome == 'success' && steps.base_gate.outputs.sync_release_pr == 'true' }}
         env:
           PRS_CREATED: ${{ steps.release.outputs.prs_created }}
           PRS_JSON: ${{ steps.release.outputs.prs }}
@@ -106,10 +130,12 @@ jobs:
           if [ "$PRS_CREATED" = "true" ]; then
             number="$(printf '%s' "$PRS_JSON" | jq -r '.[0].number')"
             branch="$(printf '%s' "$PRS_JSON" | jq -r '.[0].headBranchName')"
+            expected_title="$(printf '%s' "$PRS_JSON" | jq -r '.[0].title')"
             enable_auto_merge="true"
           elif [ -n "$PENDING_PR_NUMBER" ]; then
             number="$PENDING_PR_NUMBER"
             branch="release-please--branches--$BASE_BRANCH"
+            expected_title=""
             if [ "$PENDING_WAS_READY" = "true" ]; then
               enable_auto_merge="$PENDING_AUTO_MERGE"
             else
@@ -124,21 +150,28 @@ jobs:
             echo "could not resolve release PR identity from release output" >&2
             exit 1
           fi
+          if [ "$PRS_CREATED" = "true" ] && { [ -z "$expected_title" ] || [ "$expected_title" = "null" ]; }; then
+            echo "could not resolve release PR identity from release output" >&2
+            exit 1
+          fi
           echo "has_release_pr=true" >> "$GITHUB_OUTPUT"
           echo "number=$number" >> "$GITHUB_OUTPUT"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "expected_title=$expected_title" >> "$GITHUB_OUTPUT"
           echo "enable_auto_merge=$enable_auto_merge" >> "$GITHUB_OUTPUT"
 
       # The canonical branch is drafted before Release Please runs regardless
       # of mutable title. Validate the complete PR identity separately before
       # allowing it into synchronization or publication.
       - name: Validate release PR identity
+        id: release_pr_identity
         if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           PR_NUMBER: ${{ steps.release_pr.outputs.number }}
           REPO: ${{ github.repository }}
           BASE_BRANCH: ${{ github.ref_name }}
+          EXPECTED_RELEASE_TITLE: ${{ steps.release_pr.outputs.expected_title }}
         run: |
           release_branch="release-please--branches--$BASE_BRANCH"
           release_title_prefix="chore($BASE_BRANCH): release "
@@ -153,13 +186,23 @@ jobs:
             echo "::error::release PR identity is not the canonical same-repository branch; leaving it draft"
             exit 1
           fi
+          if [ -n "$EXPECTED_RELEASE_TITLE" ] && [ "$title" != "$EXPECTED_RELEASE_TITLE" ]; then
+            echo "::error::release PR title changed from the Release Please result; leaving it draft"
+            exit 1
+          fi
           case "$title" in
-            "$release_title_prefix"*) ;;
+            "$release_title_prefix"*) expected_version="${title#"$release_title_prefix"}" ;;
             *)
               echo "::error::release PR title does not match '$release_title_prefix*'; leaving it draft"
               exit 1
               ;;
           esac
+          if ! printf '%s\n' "$expected_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::release PR title does not exactly match '${release_title_prefix}X.Y.Z'; leaving it draft"
+            exit 1
+          fi
+          echo "expected_version=$expected_version" >> "$GITHUB_OUTPUT"
+          echo "validated_title=$title" >> "$GITHUB_OUTPUT"
 
       # Never merge a newer base into metadata generated for this run's SHA.
       # If main advances, the queued workflow run must regenerate the release.
@@ -306,8 +349,10 @@ jobs:
 
       - name: Validate generated release head
         if: ${{ steps.release_pr.outputs.has_release_pr == 'true' }}
+        env:
+          EXPECTED_VERSION: ${{ steps.release_pr_identity.outputs.expected_version }}
         run: |
-          "$(uv python find 3.12)" scripts/check-release-head.py --base-sha "${{ github.sha }}"
+          "$(uv python find 3.12)" scripts/check-release-head.py --base-sha "${{ github.sha }}" --expected-version "$EXPECTED_VERSION"
           uv lock --check
           "$(uv python find 3.12)" scripts/check-public-boundary.py
           git diff --exit-code -- CHANGELOG.md .release-please-manifest.json pyproject.toml uv.lock
@@ -366,6 +411,7 @@ jobs:
           BASE_BRANCH: ${{ github.ref_name }}
           EXPECTED_BASE_SHA: ${{ github.sha }}
           ENABLE_AUTO_MERGE: ${{ steps.release_pr.outputs.enable_auto_merge }}
+          VALIDATED_TITLE: ${{ steps.release_pr_identity.outputs.validated_title }}
         run: |
           validated_sha="$(git rev-parse HEAD)"
           if ! strict="$(gh api "repos/$REPO/branches/$BASE_BRANCH/protection/required_status_checks" --jq .strict)"; then
@@ -381,10 +427,18 @@ jobs:
             exit 1
           fi
 
-          live_head_sha="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)"
+          release_branch="release-please--branches--$BASE_BRANCH"
+          details="$(gh pr view "$PR_NUMBER" \
+            --repo "$REPO" \
+            --json headRefName,baseRefName,title,isCrossRepository,headRefOid)"
+          head_ref="$(printf '%s' "$details" | jq -r .headRefName)"
+          base_ref="$(printf '%s' "$details" | jq -r .baseRefName)"
+          title="$(printf '%s' "$details" | jq -r .title)"
+          cross_repository="$(printf '%s' "$details" | jq -r .isCrossRepository)"
+          live_head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
           live_base_sha="$(gh api "repos/$REPO/commits/$BASE_BRANCH" --jq .sha)"
-          if [ "$live_head_sha" != "$validated_sha" ] || [ "$live_base_sha" != "$EXPECTED_BASE_SHA" ]; then
-            echo "::error::release base or PR head changed before ready transition; leaving it draft"
+          if [ "$cross_repository" != "false" ] || [ "$head_ref" != "$release_branch" ] || [ "$base_ref" != "$BASE_BRANCH" ] || [ "$title" != "$VALIDATED_TITLE" ] || [ "$live_head_sha" != "$validated_sha" ] || [ "$live_base_sha" != "$EXPECTED_BASE_SHA" ]; then
+            echo "::error::release PR identity, base, or head changed before ready transition; leaving it draft"
             exit 1
           fi
 
@@ -421,13 +475,19 @@ jobs:
             --approve \
             --body "Automated approval for validated release PR."
 
-          details="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,mergeable)"
+          details="$(gh pr view "$PR_NUMBER" \
+            --repo "$REPO" \
+            --json headRefOid,headRefName,baseRefName,title,isCrossRepository,mergeable)"
           live_head_sha="$(printf '%s' "$details" | jq -r .headRefOid)"
+          head_ref="$(printf '%s' "$details" | jq -r .headRefName)"
+          base_ref="$(printf '%s' "$details" | jq -r .baseRefName)"
+          title="$(printf '%s' "$details" | jq -r .title)"
+          cross_repository="$(printf '%s' "$details" | jq -r .isCrossRepository)"
           mergeable="$(printf '%s' "$details" | jq -r .mergeable)"
           behind_by="$(gh api "repos/$REPO/compare/$EXPECTED_BASE_SHA...$live_head_sha" --jq .behind_by)"
           live_base_sha="$(gh api "repos/$REPO/commits/$BASE_BRANCH" --jq .sha)"
-          if [ "$live_base_sha" != "$EXPECTED_BASE_SHA" ] || [ "$live_head_sha" != "$validated_sha" ] || [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
-            echo "::error::release base/head changed or became unmergeable before auto-merge"
+          if [ "$cross_repository" != "false" ] || [ "$head_ref" != "$release_branch" ] || [ "$base_ref" != "$BASE_BRANCH" ] || [ "$title" != "$VALIDATED_TITLE" ] || [ "$live_base_sha" != "$EXPECTED_BASE_SHA" ] || [ "$live_head_sha" != "$validated_sha" ] || [ "$mergeable" = "CONFLICTING" ] || [ "$mergeable" = "UNKNOWN" ] || [ "$behind_by" != "0" ]; then
+            echo "::error::release identity, base, or head changed or became unmergeable before auto-merge"
             exit 1
           fi
 
@@ -436,6 +496,7 @@ jobs:
               --repo "$REPO" \
               --auto \
               --squash \
+              --subject "$VALIDATED_TITLE" \
               --delete-branch \
               --match-head-commit "$validated_sha"
           fi
