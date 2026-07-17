@@ -7,7 +7,7 @@ from typing import Any
 
 # Tool names that are considered local-terminal/fs execution primitives.
 # These are defense-in-depth rejected on mcp_only routes via StaticPermissionPolicy.
-_LOCAL_TOOL_NAMES = frozenset({"shell", "bash", "python"})
+_LOCAL_TOOL_NAMES = frozenset({"shell", "bash", "python", "terminal", "fs"})
 _LOCAL_TOOL_PREFIXES = ("terminal/", "fs/")
 
 

@@ -583,18 +583,37 @@ async def run_permission_preflight(
         if not route.mcp_only:
             continue
         checked_surface = surfaces.get(route.profile)
-        if checked_surface is None:
-            continue
         ref = route_ref(index, route)
-        for tool_name in checked_surface.tool_names:
-            if is_local_tool(tool_name):
+        if checked_surface is not None:
+            for tool_name in checked_surface.tool_names:
+                if is_local_tool(tool_name):
+                    local_tools.append(
+                        LocalToolExposedIssue(
+                            route_ref=ref,
+                            profile=route.profile,
+                            tool_name=tool_name,
+                        )
+                    )
+        # Also flag local tools in the route's own allowlist — the runtime
+        # backstop rejects these, so preflight should surface the config mistake.
+        for rule in route.permission_policy.rules:
+            if is_local_tool(rule.tool_name):
                 local_tools.append(
                     LocalToolExposedIssue(
                         route_ref=ref,
                         profile=route.profile,
-                        tool_name=tool_name,
+                        tool_name=rule.tool_name,
                     )
                 )
+    # Deduplicate while preserving sort order by first occurrence.
+    seen_local_tools: set[tuple[str, str, str]] = set()
+    deduped: list[LocalToolExposedIssue] = []
+    for issue in local_tools:
+        key = (issue.route_ref, issue.profile, issue.tool_name)
+        if key not in seen_local_tools:
+            seen_local_tools.add(key)
+            deduped.append(issue)
+    local_tools = deduped
     local_tools.sort(key=lambda item: (item.profile, item.route_ref, item.tool_name))
 
     return PreflightReport(

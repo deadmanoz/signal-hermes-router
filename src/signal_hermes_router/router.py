@@ -1026,7 +1026,7 @@ class SignalHermesRouter:
 
                 blocks = self._build_turn_prompt_blocks(turn, manifests)
                 permission_policy = turn.permission_policy or route.permission_policy
-                if route.mcp_only and permission_policy is not None:
+                if route.mcp_only:
                     permission_policy = permission_policy.with_mcp_only(True)
                 try:
                     session = await self.sessions.get(
