@@ -424,9 +424,9 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             active = make_route(
                 name="mcp-only-route",
                 group_id="EXAMPLE_MCP_GROUP",
-                profile="vizical",
+                profile="calendar",
                 state=RouteState.ACTIVE,
-                permission_policy=policy("vizical_search"),
+                permission_policy=policy("calendar_search"),
                 mcp_only=True,
             )
             app = AppConfig(
@@ -437,7 +437,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
             )
 
             async def probe(profile: str) -> ToolSurface:
-                return callable_surface(profile, ["vizical_search", "terminal/create", "bash"])
+                return callable_surface(profile, ["calendar_search", "terminal/create", "bash"])
 
             report = await run_permission_preflight(app, probe)
 
@@ -445,7 +445,7 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         issues = report.to_dict()["issues"]
         missing = [i for i in issues if i["code"] == "missing_tool"]
         local_tools = [i for i in issues if i["code"] == "local_tool_exposed"]
-        self.assertEqual(len(missing), 0)  # vizical_search is present
+        self.assertEqual(len(missing), 0)  # calendar_search is present
         self.assertEqual(len(local_tools), 2)
         self.assertEqual(sorted([i["tool"] for i in local_tools]), ["bash", "terminal/create"])
 

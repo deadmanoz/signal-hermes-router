@@ -2704,7 +2704,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 session_policy=SessionPolicy.PERSISTENT_ROUTE,
                 state=RouteState.ACTIVE,
                 permission_policy=StaticPermissionPolicy.from_config(
-                    [{"tool": "bash"}], mcp_only=True
+                    [{"tool": "bash"}]
                 ),
                 mcp_only=True,
             )
@@ -2753,10 +2753,10 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             )
 
             await router.handle_synthetic_job("daily-job", scheduled_at=1)
-            # The policy handed to the session should have mcp_only=True
-            self.assertTrue(profile.policies[-1][1].mcp_only)
-            # Verify the policy actually rejects a local tool
-            self.assertFalse(profile.policies[-1][1].allows_tool_call({"toolName": "bash"}))
+            # The job policy (policies[0]) should have been upgraded to mcp_only=True
+            self.assertTrue(profile.policies[0][1].mcp_only)
+            # Verify the job policy actually rejects a local tool
+            self.assertFalse(profile.policies[0][1].allows_tool_call({"toolName": "bash"}))
 
     async def test_synthetic_failure_recovery_resets_replacement_session_policy(self) -> None:
         class RestartingSupervisor(FakeSupervisor):
