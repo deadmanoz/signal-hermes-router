@@ -198,3 +198,12 @@ successful validation.
 ## Pre-activation requirement
 
 Create a private [profile audit checklist](profile-audit-checklist.md) record before activating or changing profile skills, Hermes version, or allowlists. Inspect the `hermes-acp` toolset for the exact tools exposed by the pinned Hermes version before activation.
+
+## MCP-only routes
+
+A route may be declared `mcp_only: true` in `routes.yaml`. When set, the router:
+
+1. **Preflight:** Reports `local_tool_exposed` issues for any tool in the profile's `full_callable` surface whose name matches a known local-terminal/fs pattern (`terminal/*`, `fs/*`, `shell`, `bash`, `python`). This is a wiring signal, not a capability policy — it tells the operator the profile surface contains tools that look like local execution primitives.
+2. **Runtime defense-in-depth:** Rejects `session/request_permission` for any tool call matching those patterns, regardless of whether the tool name appears in the route's allowlist. This only covers tools the agent routes through the permission prompt; deny-by-default already handles non-allowlisted tools.
+
+`mcp_only` does not change the ACP client capability advertisement (`terminal: False`, `fs: False`). It is an additional deployment-side gate that surfaces profile-local tool exposure. Profile safety remains owned by the Hermes profile config and the pre-activation audit checklist; the router's `mcp_only` flag is a wiring validation, not a replacement for profile-side tool curation.

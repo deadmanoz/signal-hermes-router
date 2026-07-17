@@ -49,6 +49,11 @@ routes:
         arguments:
           path:
             prefix: "/private/deployment/read-only/"
+    # Opt-in (default false). When true, preflight reports local_tool_exposed
+    # issues for any local terminal/fs tool in the profile's full_callable surface.
+    # The router also defense-in-depth rejects session/request_permission for
+    # those tools at runtime, but the primary gate is the preflight check.
+    # mcp_only: true
 
   # Direct-message routes are opt-in and exact-sender only. Keep real sender
   # UUIDs/numbers in a private deployment repo and load them through secret refs.

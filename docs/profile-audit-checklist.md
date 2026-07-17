@@ -14,6 +14,8 @@ Routes covered:
 
 Checks:
 
+- [ ] For MCP-only routes, `signal-hermes-router preflight-permissions` shows no `local_tool_exposed` issues.
+- [ ] Route `mcp_only` flag reviewed: when true, the profile's `full_callable` surface contains no local terminal/fs tools.
 - [ ] Profile skills listed from the private profile directory.
 - [ ] Pinned `hermes-agent` version recorded.
 - [ ] `hermes-acp` toolset contents inspected and attached or summarized.
