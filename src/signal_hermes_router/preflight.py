@@ -657,7 +657,7 @@ async def run_permission_preflight(
             seen_local_tools.add(key)
             deduped.append(issue)
     local_tools = deduped
-    local_tools.sort(key=lambda item: (item.profile, item.route_ref, item.tool_name))
+    local_tools.sort(key=lambda item: (item.profile, item.route_ref, item.tool_name.lower()))
 
     return PreflightReport(
         expected_permissions=expected,

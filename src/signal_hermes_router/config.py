@@ -142,6 +142,11 @@ class Route:
     def __post_init__(self) -> None:
         # Sync the permission_policy mcp_only flag from the route-level flag
         # so there is one source of truth. Required for frozen dataclass.
+        if self.permission_policy.mcp_only and not self.mcp_only:
+            raise ValueError(
+                "Route mcp_only=False conflicts with permission_policy mcp_only=True; "
+                "set route mcp_only=True or remove mcp_only from the policy"
+            )
         if self.permission_policy.mcp_only != self.mcp_only:
             object.__setattr__(
                 self,

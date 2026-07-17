@@ -86,19 +86,19 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertTrue(route.mcp_only)
         self.assertTrue(route.permission_policy.mcp_only)
-        # Route constructed with mcp_only=False overrides a True policy
-        # because the route-level flag is the single source of truth.
+        # Route constructed with mcp_only=False and a policy with mcp_only=True
+        # is a programmer error — the stricter setting must not be silently dropped.
         policy = StaticPermissionPolicy.from_config([{"tool": "read_file"}], mcp_only=True)
-        route = Route(
-            platform="signal",
-            profile="test",
-            session_policy=SessionPolicy.PERSISTENT_ROUTE,
-            state=RouteState.ACTIVE,
-            mcp_only=False,
-            permission_policy=policy,
-        )
-        self.assertFalse(route.mcp_only)
-        self.assertFalse(route.permission_policy.mcp_only)
+        with self.assertRaises(ValueError) as ctx:
+            Route(
+                platform="signal",
+                profile="test",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+                mcp_only=False,
+                permission_policy=policy,
+            )
+        self.assertIn("mcp_only=False conflicts with permission_policy mcp_only=True", str(ctx.exception))
 
     def test_load_app_config_reads_yaml_and_router_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
