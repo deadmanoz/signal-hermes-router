@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -141,6 +141,12 @@ class StaticPermissionPolicy:
     @staticmethod
     def _reject_option(request: dict[str, Any]) -> str | None:
         return _first_option_id(request, ("reject_once", "reject_always"))
+
+    def with_mcp_only(self, mcp_only: bool) -> "StaticPermissionPolicy":
+        """Return a copy with mcp_only set, for enforcement-point override."""
+        if self.mcp_only == mcp_only:
+            return self
+        return replace(self, mcp_only=mcp_only)
 
     def acp_response(self, request: dict[str, Any]) -> dict[str, Any]:
         option_id = self.select_option(request)
