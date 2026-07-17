@@ -5,6 +5,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# Tool names that are considered local-terminal/fs execution primitives.
+# These are defense-in-depth rejected on mcp_only routes via StaticPermissionPolicy.
+_LOCAL_TOOL_NAMES = frozenset({"shell", "bash", "python"})
+_LOCAL_TOOL_PREFIXES = ("terminal/", "fs/")
+
+
+def is_local_tool(tool_name: str) -> bool:
+    """Return True if tool_name matches a known local-terminal/fs pattern."""
+    lower = tool_name.lower()
+    if lower in _LOCAL_TOOL_NAMES:
+        return True
+    return lower.startswith(_LOCAL_TOOL_PREFIXES)
+
 
 @dataclass(frozen=True)
 class ArgPredicate:
@@ -107,6 +120,8 @@ class StaticPermissionPolicy:
             or tool_call.get("title")
             or ""
         )
+        if self.mcp_only and is_local_tool(str(tool_name)):
+            return False
         raw_input = tool_call.get("rawInput") or tool_call.get("raw_input") or {}
         if not isinstance(raw_input, dict):
             raw_input = {"value": raw_input}
