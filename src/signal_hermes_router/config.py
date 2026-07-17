@@ -558,6 +558,7 @@ def _parse_synthetic_definitions(
         if not prompt.strip():
             raise ValueError(f"{key}[{index}] prompt must not be empty")
         raw_permissions = value.get("permissions")
+        route = named_routes[route_name]
         definitions.append(
             factory(
                 id=synthetic_id,

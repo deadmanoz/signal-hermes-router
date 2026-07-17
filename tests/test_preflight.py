@@ -156,6 +156,36 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(local_tools), 1)
         self.assertEqual(local_tools[0]["tool"], "terminal/create")
 
+    async def test_mcp_only_route_preflight_shows_missing_and_local_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            active = make_route(
+                name="mcp-only-route",
+                group_id="EXAMPLE_MCP_GROUP",
+                profile="vizical",
+                state=RouteState.ACTIVE,
+                permission_policy=policy("vizical_search"),
+                mcp_only=True,
+            )
+            app = AppConfig(
+                router=router_config_for_tmp(tmp),
+                routes=(active,),
+                scheduled_jobs=(),
+                notifications=(),
+            )
+
+            async def probe(profile: str) -> ToolSurface:
+                return callable_surface(profile, ["vizical_search", "terminal/create", "bash"])
+
+            report = await run_permission_preflight(app, probe)
+
+        self.assertEqual(report.status, "failed")
+        issues = report.to_dict()["issues"]
+        missing = [i for i in issues if i["code"] == "missing_tool"]
+        local_tools = [i for i in issues if i["code"] == "local_tool_exposed"]
+        self.assertEqual(len(missing), 0)  # vizical_search is present
+        self.assertEqual(len(local_tools), 2)
+        self.assertEqual(sorted([i["tool"] for i in local_tools]), ["bash", "terminal/create"])
+
     async def test_preflight_reports_missing_tools_without_private_route_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = preflight_app(tmp)
