@@ -63,7 +63,9 @@ def _normalize_lock_version(document: dict[str, object], version: str) -> dict[s
     return normalized
 
 
-def validate_release_head(base: dict[str, str], head: dict[str, str]) -> list[str]:
+def validate_release_head(
+    base: dict[str, str], head: dict[str, str], expected_version: str
+) -> list[str]:
     errors: list[str] = []
     try:
         base_manifest = json.loads(base[".release-please-manifest.json"])
@@ -80,6 +82,10 @@ def validate_release_head(base: dict[str, str], head: dict[str, str]) -> list[st
             errors.append("release manifest must contain only a string '.' version")
             return errors
 
+        if not VERSION_RE.fullmatch(expected_version):
+            errors.append("expected release version must use numeric X.Y.Z form")
+            return errors
+
         base_version = base_manifest["."]
         release_version = head_manifest["."]
         if not VERSION_RE.fullmatch(base_version) or not VERSION_RE.fullmatch(release_version):
@@ -87,6 +93,8 @@ def validate_release_head(base: dict[str, str], head: dict[str, str]) -> list[st
             return errors
         if tuple(map(int, release_version.split("."))) <= tuple(map(int, base_version.split("."))):
             errors.append("release version must increase from the base version")
+        if release_version != expected_version:
+            errors.append("release manifest version does not match the expected release version")
 
         if _project_version(base_pyproject, "base pyproject.toml") != base_version:
             errors.append("base pyproject.toml version does not match the base manifest")
@@ -128,6 +136,8 @@ def validate_release_head(base: dict[str, str], head: dict[str, str]) -> list[st
                     errors.append(
                         "CHANGELOG.md release heading does not match the version transition"
                     )
+                elif len(re.findall(r"^## ", new_section, flags=re.MULTILINE)) != 1:
+                    errors.append("CHANGELOG.md must prepend exactly one release section")
     except (KeyError, TypeError, ValueError, json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
         errors.append(str(exc))
     return errors
@@ -149,12 +159,13 @@ def _read_base_files(base_sha: str) -> dict[str, str]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-sha", required=True)
+    parser.add_argument("--expected-version", required=True)
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
     base = _read_base_files(args.base_sha)
     head = {path: (root / path).read_text(encoding="utf-8") for path in GENERATED_PATHS}
-    errors = validate_release_head(base, head)
+    errors = validate_release_head(base, head, args.expected_version)
     if errors:
         print("Release head validation failed:")
         for error in errors:

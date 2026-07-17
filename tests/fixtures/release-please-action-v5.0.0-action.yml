@@ -1,0 +1,34 @@
+# Relevant snapshot of googleapis/release-please-action action.yml at
+# 45996ed1f6d02564a971a2fa1b5860e934307cf7 (v5.0.0), retrieved 2026-07-17.
+# This is parser test data: re-fetch it from the action revision when its pin changes.
+name: 'release-please-action'
+description: 'automated releases based on conventional commits'
+author: Google LLC
+inputs:
+  token:
+    description: 'GitHub token for creating and grooming release PRs, defaults to using secrets.GITHUB_TOKEN'
+    required: false
+  release-type:
+    description: 'what type of release is this, one of (ruby, python, node, terraform-module)'
+    required: false
+  path:
+    description: "create a release from a path other than the repository's root"
+    required: false
+  target-branch:
+    description: branch to open pull release PR against (detected by default)
+    required: false
+  skip-github-release:
+    description: 'if set to true, then do not try to tag releases'
+    required: false
+    default: false
+  skip-github-pull-request:
+    description: 'if set to true, then do not try to open pull requests'
+    required: false
+    default: false
+  skip-labeling:
+    description: 'if set to true, then do not try to label the PR'
+    required: false
+    default: false
+runs:
+  using: 'node24'
+  main: 'dist/index.js'
