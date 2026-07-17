@@ -13,6 +13,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "release-please-config.json"
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "release-please.yml"
+RELEASE_PLEASE_ACTION_FIXTURE = (
+    ROOT / "tests" / "fixtures" / "release-please-action-v5.0.0-action.yml"
+)
 
 
 class ReleaseProcessTests(unittest.TestCase):
@@ -143,7 +146,11 @@ gh() {{
         harness = """
 set -e -o pipefail
 gh() {
-  printf '%s\\n' "$LIVE_PRS"
+  if [[ "$*" == *"--json state --jq .state"* ]]; then
+    printf '%s\\n' "$EXPECTED_PR_STATE"
+  else
+    printf '%s\\n' "$LIVE_PRS"
+  fi
 }
 """
 
@@ -162,6 +169,7 @@ gh() {
                         "GITHUB_OUTPUT": str(output_path),
                         "LIVE_PRS": json.dumps(prs),
                         "REPO": "example/repo",
+                        "EXPECTED_PR_STATE": "",
                         **extra_env,
                     },
                     text=True,
@@ -233,9 +241,12 @@ gh() {{
                 text=True,
             )
 
-        supported_input = run_input_check(
-            "name: release-please-action\ninputs:\n  skip-github-pull-request:\n    default: false\nruns:\n  using: node24\n"
+        action_fixture = RELEASE_PLEASE_ACTION_FIXTURE.read_text(encoding="utf-8")
+        self.assertIn(
+            verify_input["env"]["RELEASE_PLEASE_ACTION_REF"],
+            action_fixture,
         )
+        supported_input = run_input_check(action_fixture)
         self.assertEqual(supported_input.returncode, 0, supported_input.stderr)
         missing_input = run_input_check(
             "name: release-please-action\ninputs:\n  skip-github-release:\n    default: false\nruns:\n  using: node24\n"
@@ -332,6 +343,34 @@ gh() {{
             },
         )
         self.assertNotEqual(created.returncode, 0)
+
+        for state in ("MERGED", "CLOSED"):
+            transitioned, _ = run_step(
+                confirm_run,
+                [],
+                {
+                    "HAD_RELEASE_PR": "true",
+                    "EXPECTED_PR_NUMBER": "123",
+                    "EXPECTED_HEAD_SHA": "a1" * 20,
+                    "EXPECTED_IS_DRAFT": "false",
+                    "EXPECTED_PR_STATE": state,
+                    "EXPECTED_TITLE": "chore(main): release 0.1.31",
+                },
+            )
+            self.assertEqual(transitioned.returncode, 0, transitioned.stderr)
+
+        missing, _ = run_step(
+            confirm_run,
+            [],
+            {
+                "HAD_RELEASE_PR": "true",
+                "EXPECTED_PR_NUMBER": "123",
+                "EXPECTED_HEAD_SHA": "a1" * 20,
+                "EXPECTED_IS_DRAFT": "false",
+                "EXPECTED_TITLE": "chore(main): release 0.1.31",
+            },
+        )
+        self.assertNotEqual(missing.returncode, 0)
 
     def test_existing_pending_pr_is_drafted_before_release_please_runs(self) -> None:
         capture = self.steps_by_name["Capture pending release PR state"]

@@ -210,6 +210,18 @@ jobs:
             echo "::error::stale release run created a release PR despite skip-github-pull-request; leaving it as-is"
             exit 1
           fi
+          if [ "$HAD_RELEASE_PR" = "true" ] && [ "$count" -eq 0 ]; then
+            state="$(gh pr view "$EXPECTED_PR_NUMBER" \
+              --repo "$REPO" \
+              --json state \
+              --jq .state 2>/dev/null || true)"
+            case "$state" in
+              MERGED|CLOSED)
+                echo "::warning::stale release PR #$EXPECTED_PR_NUMBER became $state while this run was executing; leaving it as-is"
+                exit 0
+                ;;
+            esac
+          fi
           if [ "$HAD_RELEASE_PR" != "true" ] || [ "$count" -ne 1 ]; then
             echo "::error::stale release run could not preserve a unique canonical release PR; leaving it as-is"
             exit 1
