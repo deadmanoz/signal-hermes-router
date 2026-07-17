@@ -160,7 +160,7 @@ jobs:
           skip-github-pull-request: ${{ steps.base_gate.outputs.skip_github_pull_request }}
 
       - name: Confirm stale run did not mutate release PR
-        if: ${{ steps.release.outcome == 'success' && steps.base_gate.outputs.sync_release_pr == 'false' }}
+        if: ${{ always() && steps.base_gate.outputs.sync_release_pr == 'false' && steps.stale_release_pr.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           HAD_RELEASE_PR: ${{ steps.stale_release_pr.outputs.has_pr }}

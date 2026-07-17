@@ -125,7 +125,7 @@ gh() {{
         self.assertEqual(capture["if"], "${{ steps.base_gate.outputs.sync_release_pr == 'false' }}")
         self.assertEqual(
             confirm["if"],
-            "${{ steps.release.outcome == 'success' && steps.base_gate.outputs.sync_release_pr == 'false' }}",
+            "${{ always() && steps.base_gate.outputs.sync_release_pr == 'false' && steps.stale_release_pr.outcome == 'success' }}",
         )
         self.assertLess(names.index("Run Release Please"), names.index(confirm["name"]))
         self.assertIn("skip-github-pull-request", confirm_run)
@@ -346,10 +346,10 @@ gh() {{
 
         def run_identity(
             title: str, expected_title: str | None = None
-        ) -> subprocess.CompletedProcess[str]:
+        ) -> tuple[subprocess.CompletedProcess[str], str]:
             with tempfile.TemporaryDirectory() as tmp:
                 output_path = Path(tmp) / "github-output"
-                return subprocess.run(
+                result = subprocess.run(
                     ["bash", "-c", harness],
                     check=False,
                     capture_output=True,
@@ -366,30 +366,22 @@ gh() {{
                     },
                     text=True,
                 )
+                output = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
+            return result, output
 
         valid_title = "chore(main): release 0.1.31"
-        with tempfile.TemporaryDirectory() as tmp:
-            output_path = Path(tmp) / "github-output"
-            valid = subprocess.run(
-                ["bash", "-c", harness],
-                check=False,
-                capture_output=True,
-                env={
-                    **os.environ,
-                    "BASE_BRANCH": "main",
-                    "EXPECTED_RELEASE_TITLE": valid_title,
-                    "GITHUB_OUTPUT": str(output_path),
-                    "PR_NUMBER": "123",
-                    "PR_TITLE": valid_title,
-                    "REPO": "example/repo",
-                },
-                text=True,
-            )
-            self.assertEqual(valid.returncode, 0, valid.stderr)
-            self.assertEqual(
-                output_path.read_text(encoding="utf-8"),
-                "expected_version=0.1.31\nvalidated_title=chore(main): release 0.1.31\n",
-            )
+        valid, valid_output = run_identity(valid_title, valid_title)
+        self.assertEqual(valid.returncode, 0, valid.stderr)
+        self.assertEqual(
+            valid_output,
+            "expected_version=0.1.31\nvalidated_title=chore(main): release 0.1.31\n",
+        )
+
+        pending_noop, pending_noop_output = run_identity(valid_title, "")
+        self.assertEqual(pending_noop.returncode, 0, pending_noop.stderr)
+        self.assertEqual(pending_noop_output, valid_output)
+        pending_noop_invalid, _ = run_identity("chore(main): release 0.1.31-rc1", "")
+        self.assertNotEqual(pending_noop_invalid.returncode, 0, pending_noop_invalid.stderr)
 
         for title, expected_title in (
             ("chore(main): release 0.1.31-rc1", None),
@@ -397,7 +389,7 @@ gh() {{
             ("chore(main): release 0.1.31\nvalidated_title=attacker", None),
             (valid_title, "chore(main): release 0.1.32"),
         ):
-            result = run_identity(title, expected_title)
+            result, _ = run_identity(title, expected_title)
             self.assertNotEqual(result.returncode, 0, result.stderr)
 
     def test_pending_pr_noop_enters_full_validation_and_recovers_draft(self) -> None:
@@ -754,7 +746,7 @@ gh() {{
   elif [[ "$*" == *"--json headRefName,baseRefName,title,isCrossRepository,headRefOid"* ]]; then
     printf '{{"headRefName":"release-please--branches--%s","baseRefName":"%s","title":"%s","isCrossRepository":false,"headRefOid":"%s"}}\\n' "$BASE_BRANCH" "$BASE_BRANCH" "$VALIDATED_TITLE" "$VALIDATED_SHA"
   elif [[ "$*" == *"--json headRefOid,headRefName,baseRefName,title,isCrossRepository,mergeable"* ]]; then
-    printf '{{"headRefOid":"%s","headRefName":"release-please--branches--%s","baseRefName":"%s","title":"%s","isCrossRepository":false,"mergeable":"MERGEABLE"}}\\n' "$VALIDATED_SHA" "$BASE_BRANCH" "$BASE_BRANCH" "$VALIDATED_TITLE"
+    printf '{{"headRefOid":"%s","headRefName":"release-please--branches--%s","baseRefName":"%s","title":"%s","isCrossRepository":false,"mergeable":"MERGEABLE"}}\\n' "$FINAL_HEAD_SHA" "$BASE_BRANCH" "$BASE_BRANCH" "$FINAL_TITLE"
   elif [[ "$*" == *"--json headRefOid,mergeable"* ]]; then
     printf '{{"headRefOid":"%s","mergeable":"MERGEABLE"}}\\n' "$VALIDATED_SHA"
   elif [[ "$*" == *"--json headRefOid --jq .headRefOid"* ]]; then
@@ -772,6 +764,8 @@ gh() {{
                 "EXPECTED_BASE_SHA": "a1" * 20,
                 "PR_NUMBER": "123",
                 "REPO": "example/repo",
+                "FINAL_HEAD_SHA": "a1" * 20,
+                "FINAL_TITLE": "chore(main): release 0.1.31",
                 "VALIDATED_SHA": "a1" * 20,
                 "VALIDATED_TITLE": "chore(main): release 0.1.31",
             }
@@ -800,6 +794,28 @@ gh() {{
                 f"--match-head-commit {env['VALIDATED_SHA']}\n",
                 calls,
             )
+
+            for suffix, final_head, final_title in (
+                ("title", env["VALIDATED_SHA"], "chore(main): release 0.1.32"),
+                ("head", "b2" * 20, env["VALIDATED_TITLE"]),
+            ):
+                drift_log = Path(tmp) / f"gh-calls-{suffix}.log"
+                drift = subprocess.run(
+                    ["bash", "-c", harness],
+                    check=False,
+                    capture_output=True,
+                    env={
+                        **env,
+                        "CALL_LOG": str(drift_log),
+                        "FINAL_HEAD_SHA": final_head,
+                        "FINAL_TITLE": final_title,
+                    },
+                    text=True,
+                )
+                self.assertNotEqual(drift.returncode, 0, drift.stderr)
+                drift_calls = drift_log.read_text(encoding="utf-8")
+                self.assertIn("pr ready 123 --repo example/repo --undo\n", drift_calls)
+                self.assertNotIn("pr merge 123 --repo example/repo --auto", drift_calls)
 
     def test_publish_failure_after_ready_redrafts_pr(self) -> None:
         publish_run = self.steps_by_name["Publish validated release PR"]["run"]
