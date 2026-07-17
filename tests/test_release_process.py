@@ -118,62 +118,114 @@ gh() {{
     def test_stale_release_pr_postcondition_rejects_a_mutation(self) -> None:
         names = [step["name"] for step in self.steps]
         capture = self.steps_by_name["Capture stale release PR state"]
+        capture_run = capture["run"]
         confirm = self.steps_by_name["Confirm stale run did not mutate release PR"]
         confirm_run = confirm["run"]
 
         self.assertEqual(capture["if"], "${{ steps.base_gate.outputs.sync_release_pr == 'false' }}")
         self.assertEqual(
             confirm["if"],
-            "${{ steps.release.outcome == 'success' && steps.stale_release_pr.outputs.has_pr == 'true' }}",
+            "${{ steps.release.outcome == 'success' && steps.base_gate.outputs.sync_release_pr == 'false' }}",
         )
         self.assertLess(names.index("Run Release Please"), names.index(confirm["name"]))
         self.assertIn("skip-github-pull-request", confirm_run)
-        self.assertIn("headRefName,baseRefName,headRefOid,updatedAt,isCrossRepository", confirm_run)
-        self.assertIn('[ "$updated_at" != "$EXPECTED_UPDATED_AT" ]', confirm_run)
+        self.assertIn("headRefName,baseRefName,headRefOid,isDraft,isCrossRepository", capture_run)
+        self.assertIn("headRefName,baseRefName,headRefOid,isDraft,isCrossRepository", confirm_run)
+        self.assertIn('if [ "$HAD_RELEASE_PR" = "false" ]', confirm_run)
+        self.assertIn("stale release run created a release PR", confirm_run)
+        self.assertIn('[ "$is_draft" != "$EXPECTED_IS_DRAFT" ]', confirm_run)
 
-        harness = f"""
+        harness = """
 set -e -o pipefail
-gh() {{
-  printf '{{"headRefName":"release-please--branches--%s","baseRefName":"%s","headRefOid":"%s","updatedAt":"%s","isCrossRepository":false}}\\n' "$BASE_BRANCH" "$BASE_BRANCH" "$LIVE_HEAD_SHA" "$LIVE_UPDATED_AT"
-}}
-{confirm_run}
+gh() {
+  printf '%s\\n' "$LIVE_PRS"
+}
 """
-        with tempfile.TemporaryDirectory() as tmp:
-            output_path = Path(tmp) / "github-output"
-            env = {
-                **os.environ,
-                "BASE_BRANCH": "main",
-                "EXPECTED_HEAD_SHA": "a1" * 20,
-                "EXPECTED_UPDATED_AT": "2026-07-17T12:00:00Z",
-                "GITHUB_OUTPUT": str(output_path),
-                "PR_NUMBER": "123",
-                "REPO": "example/repo",
-            }
-            current = subprocess.run(
-                ["bash", "-c", harness],
-                check=False,
-                capture_output=True,
-                env={
-                    **env,
-                    "LIVE_HEAD_SHA": env["EXPECTED_HEAD_SHA"],
-                    "LIVE_UPDATED_AT": env["EXPECTED_UPDATED_AT"],
-                },
-                text=True,
-            )
-            self.assertEqual(current.returncode, 0, current.stderr)
 
-            changed = subprocess.run(
-                ["bash", "-c", harness],
-                check=False,
-                capture_output=True,
-                env={
-                    **env,
-                    "LIVE_HEAD_SHA": "b2" * 20,
-                    "LIVE_UPDATED_AT": "2026-07-17T12:01:00Z",
-                },
-                text=True,
-            )
-            self.assertNotEqual(changed.returncode, 0)
+        def run_step(
+            step: str, prs: list[dict[str, object]], extra_env: dict[str, str]
+        ) -> tuple[subprocess.CompletedProcess[str], str]:
+            with tempfile.TemporaryDirectory() as tmp:
+                output_path = Path(tmp) / "github-output"
+                result = subprocess.run(
+                    ["bash", "-c", harness + step],
+                    check=False,
+                    capture_output=True,
+                    env={
+                        **os.environ,
+                        "BASE_BRANCH": "main",
+                        "GITHUB_OUTPUT": str(output_path),
+                        "LIVE_PRS": json.dumps(prs),
+                        "REPO": "example/repo",
+                        **extra_env,
+                    },
+                    text=True,
+                )
+                output = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
+            return result, output
+
+        canonical_pr: dict[str, object] = {
+            "number": 123,
+            "headRefName": "release-please--branches--main",
+            "baseRefName": "main",
+            "headRefOid": "a1" * 20,
+            "isDraft": False,
+            "isCrossRepository": False,
+        }
+        current, captured = run_step(capture_run, [canonical_pr], {})
+        self.assertEqual(current.returncode, 0, current.stderr)
+        self.assertEqual(
+            captured,
+            "has_pr=true\nnumber=123\nhead_sha=" + ("a1" * 20) + "\nis_draft=false\n",
+        )
+
+        cross_repository = {**canonical_pr, "isCrossRepository": True}
+        cross_only, cross_output = run_step(capture_run, [cross_repository], {})
+        self.assertEqual(cross_only.returncode, 0, cross_only.stderr)
+        self.assertEqual(cross_output, "has_pr=false\n")
+
+        multiple, _ = run_step(capture_run, [canonical_pr, canonical_pr], {})
+        self.assertNotEqual(multiple.returncode, 0)
+
+        malformed = {**canonical_pr, "baseRefName": "other"}
+        non_canonical, _ = run_step(capture_run, [malformed], {})
+        self.assertNotEqual(non_canonical.returncode, 0)
+
+        existing, _ = run_step(
+            confirm_run,
+            [canonical_pr],
+            {
+                "HAD_RELEASE_PR": "true",
+                "EXPECTED_HEAD_SHA": "a1" * 20,
+                "EXPECTED_IS_DRAFT": "false",
+            },
+        )
+        self.assertEqual(existing.returncode, 0, existing.stderr)
+
+        changed, _ = run_step(
+            confirm_run,
+            [{**canonical_pr, "headRefOid": "b2" * 20}],
+            {
+                "HAD_RELEASE_PR": "true",
+                "EXPECTED_HEAD_SHA": "a1" * 20,
+                "EXPECTED_IS_DRAFT": "false",
+            },
+        )
+        self.assertNotEqual(changed.returncode, 0)
+
+        absent, _ = run_step(
+            confirm_run,
+            [],
+            {"HAD_RELEASE_PR": "false", "EXPECTED_HEAD_SHA": "", "EXPECTED_IS_DRAFT": ""},
+        )
+        self.assertEqual(absent.returncode, 0, absent.stderr)
+
+        created, _ = run_step(
+            confirm_run,
+            [canonical_pr],
+            {"HAD_RELEASE_PR": "false", "EXPECTED_HEAD_SHA": "", "EXPECTED_IS_DRAFT": ""},
+        )
+        self.assertNotEqual(created.returncode, 0)
 
     def test_existing_pending_pr_is_drafted_before_release_please_runs(self) -> None:
         capture = self.steps_by_name["Capture pending release PR state"]
