@@ -1937,8 +1937,12 @@ class SignalHermesRouter:
             route.key for route in new_config.routes if route.state == RouteState.ACTIVE
         }
         old_by_key = {route.key: route for route in old_config.routes}
-        # Sessions for a still-active route whose session_policy changed are
-        # unreachable under the new keying; they are evicted by the reap too.
+        # A session_policy change on a still-active route leaves cached
+        # sessions unreachable under the new keying; the reap evicts them
+        # (compared per session, so a later flip-back keeps them). The keys
+        # are passed for DRAIN scope: the route stays live so it is not in
+        # the tombstone-derived drain set, but an in-flight turn on it must
+        # still be waited out before its old-policy session is evicted.
         policy_changed_keys = {
             route.key
             for route in new_config.routes
@@ -1967,21 +1971,25 @@ class SignalHermesRouter:
             prompt_timeout + RELOAD_RETIRE_DRAIN_MARGIN_SECONDS,
         )
 
-    async def _reap_after_drain(self, policy_changed_keys: set[str]) -> None:
+    async def _reap_after_drain(self, extra_drain_keys: set[str]) -> None:
         # In-flight turns captured their Route (and its profile/session
         # bindings) before the swap. Drain the route locks of EVERY route key
         # ever seen that is not live right now — not just the keys this
         # reload touched: the evict/retire below is global, so the drain must
         # be global too, or a later reload's reap could cut down a session an
-        # earlier reload's reap was still waiting out. The wait is bounded
-        # (see _reap_drain_seconds): a wedged turn must not pin retired
-        # runtime state forever; closing under it fails that turn through the
-        # normal broken-pipe path.
+        # earlier reload's reap was still waiting out. extra_drain_keys adds
+        # still-live routes whose session_policy changed: they are not in the
+        # tombstone-derived set, but evicting their old-policy sessions must
+        # still wait out any in-flight turn. The wait is bounded (see
+        # _reap_drain_seconds): a wedged turn must not pin retired runtime
+        # state forever; closing under it fails that turn through the normal
+        # broken-pipe path.
         live_now = {
             route.key for route in self.config.routes if route.state == RouteState.ACTIVE
         }
         drain_keys = sorted(
-            key for key in self._route_profile_tombstones if key not in live_now
+            {key for key in self._route_profile_tombstones if key not in live_now}
+            | extra_drain_keys
         )
         deadline = time.monotonic() + self._reap_drain_seconds()
         for key in drain_keys:
@@ -2008,9 +2016,13 @@ class SignalHermesRouter:
         evicted = self.sessions.drop_sessions_not_in(
             {route.key for route in live_routes}
         )
-        # Policy-changed keys are live routes, so they are disjoint from the
-        # non-live eviction above.
-        evicted += self.sessions.drop_sessions_for_keys(policy_changed_keys)
+        # Sessions whose creation-time policy no longer matches their route's
+        # current policy are unreachable under the new keying. Compared per
+        # session against the CURRENT config, so a flip-flop reload that
+        # restored the original policy keeps the still-reachable session.
+        evicted += self.sessions.drop_sessions_with_mismatched_policy(
+            {route.key: route.session_policy for route in self.config.routes}
+        )
         if evicted:
             LOGGER.info(
                 "config reload evicted %d cached session(s) for routes no longer "

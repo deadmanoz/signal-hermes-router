@@ -5443,6 +5443,96 @@ routes:
             # The route is still active: the profile is not retired.
             self.assertEqual(harness.supervisor.retired, [])
 
+    async def test_reload_config_policy_flip_flop_keeps_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: flip-policy-route
+    platform: signal
+    group_id: group-one
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            route = harness.router.config.find_route_by_name("flip-policy-route")
+            assert route is not None
+            from signal_hermes_router.sessions import RoutedSession
+            harness.router.sessions._sessions["sk"] = RoutedSession(
+                profile=harness.profile,  # type: ignore[arg-type]
+                session_id="session-1",
+                cwd=Path(tmp) / "work" / "sk",
+            )
+            harness.router.sessions._session_routes["sk"] = route.key
+
+            # Park the reap behind a held route lock (an in-flight turn).
+            lock = harness.router._route_locks[route.key]
+            await lock.acquire()
+            try:
+                # Reload #1 switches to ephemeral; the reap parks on the lock.
+                routes_path.write_text(
+                    """
+routes:
+  - name: flip-policy-route
+    platform: signal
+    group_id: group-one
+    profile: p
+    state: active
+    session_policy: ephemeral
+""",
+                    encoding="utf-8",
+                )
+                response = await harness.router._handle_reload_config_control({})
+                self.assertEqual(response["status"], "ok")
+                await asyncio.sleep(0.02)
+
+                # Reload #2 flips back before the drain completes: the cached
+                # session is reachable under the restored keying again.
+                routes_path.write_text(
+                    """
+routes:
+  - name: flip-policy-route
+    platform: signal
+    group_id: group-one
+    profile: p
+    state: active
+""",
+                    encoding="utf-8",
+                )
+                response = await harness.router._handle_reload_config_control({})
+                self.assertEqual(response["status"], "ok")
+            finally:
+                lock.release()
+
+            tasks = [t for t in harness.router._signal_turn_tasks if not t.done()]
+            if tasks:
+                await asyncio.gather(*tasks)
+            self.assertEqual(list(harness.router.sessions._sessions), ["sk"])
+            self.assertEqual(harness.profile.released_session_ids, [])
+            reloaded = harness.router.config.find_route_by_name("flip-policy-route")
+            self.assertEqual(reloaded.session_policy, SessionPolicy.PERSISTENT_ROUTE)
+
     def test_reap_drain_seconds_tracks_prompt_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             harness = make_router_harness(tmp)

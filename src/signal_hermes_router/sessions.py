@@ -32,6 +32,11 @@ class RoutedSession:
     session_id: str
     cwd: Path
     ephemeral: bool = False
+    # The route's session_policy at creation time. Config reload compares it
+    # against the route's current policy: a mismatch means the session is
+    # unreachable under the new keying and is evicted; a match (including a
+    # flip-flop reload that restored the original policy) keeps it.
+    policy: SessionPolicy = SessionPolicy.PERSISTENT_ROUTE
     # Rotation bookkeeping for cached persistent sessions: monotonic creation
     # time of the underlying ACP session's context window and the number of
     # turns it has served. Both survive a session/resume (context is
@@ -283,6 +288,7 @@ class SessionRegistry:
             session_id=session_id,
             cwd=cwd,
             ephemeral=ephemeral,
+            policy=route.session_policy,
             created_at=self._clock(),
             turn_count=1,
         )
@@ -357,15 +363,6 @@ class SessionRegistry:
             cached_sessions=len(keys),
         )
 
-    def has_sessions_outside(self, live_route_keys: set[str]) -> bool:
-        """True when any cached session belongs to a route outside the given
-        live set — a cheap probe so reload cleanup can skip scheduling a
-        drain task when there is nothing to evict."""
-        return any(
-            route_key not in live_route_keys
-            for route_key in self._session_routes.values()
-        )
-
     def drop_sessions_not_in(self, live_route_keys: set[str]) -> int:
         """Evict cached sessions whose route can no longer prompt (a live
         config reload made the route non-active or removed it), releasing
@@ -374,28 +371,37 @@ class SessionRegistry:
         ones currently under a breaker override — the route prompts again as
         soon as the breaker recovers."""
         return self._drop_sessions_matching(
-            lambda route_key: route_key not in live_route_keys
+            lambda _sk, route_key, _s: route_key not in live_route_keys
         )
 
-    def drop_sessions_for_keys(self, route_keys: set[str]) -> int:
-        """Evict cached sessions belonging to the given route keys, releasing
-        per-session state on the owning profile. Returns the number evicted.
-        Used by config reload for still-active routes whose session_policy
-        changed: their cached sessions are unreachable under the new keying."""
+    def drop_sessions_with_mismatched_policy(
+        self, current_policies: dict[str, SessionPolicy]
+    ) -> int:
+        """Evict cached sessions whose creation-time session_policy no longer
+        matches their route's current policy (a live config reload changed
+        the keying, leaving them unreachable), releasing per-session state on
+        the owning profile. Returns the number evicted. Comparing per session
+        means a flip-flop reload that restored the original policy keeps the
+        still-reachable session."""
         return self._drop_sessions_matching(
-            lambda route_key: route_key in route_keys
+            lambda _sk, route_key, session: (
+                route_key in current_policies
+                and session.policy != current_policies[route_key]
+            )
         )
 
-    def _drop_sessions_matching(self, predicate: Callable[[str], bool]) -> int:
+    def _drop_sessions_matching(
+        self, predicate: Callable[[str, str, RoutedSession], bool]
+    ) -> int:
         evicted = 0
         for session_key, route_key in list(self._session_routes.items()):
-            if not predicate(route_key):
+            session = self._sessions.get(session_key)
+            if session is None or not predicate(session_key, route_key, session):
                 continue
-            session = self._sessions.pop(session_key, None)
+            self._sessions.pop(session_key, None)
             self._session_routes.pop(session_key, None)
-            if session is not None:
-                session.profile.release_session(session.session_id)
-                evicted += 1
+            session.profile.release_session(session.session_id)
+            evicted += 1
         return evicted
 
     async def _resume_or_recreate(
@@ -438,6 +444,7 @@ class SessionRegistry:
             session_id=session_id,
             cwd=previous.cwd,
             ephemeral=previous.ephemeral,
+            policy=route.session_policy,
             created_at=previous.created_at if resumed_previous else self._clock(),
             turn_count=previous.turn_count if resumed_previous else 0,
         )
