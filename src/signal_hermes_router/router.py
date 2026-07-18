@@ -1805,12 +1805,18 @@ class SignalHermesRouter:
             else self._config_paths[1]
         )
         try:
-            # Parse the candidate in a worker thread: secret resolvers
-            # (op:// shells out via subprocess.run) and the filesystem are
-            # blocking, and a slow parse on the event loop would stall Signal
-            # event handling, control responses, and ACP timeouts for the
-            # whole process. Only the validated swap happens on the loop.
-            candidate = await asyncio.to_thread(load_app_config, config_path, routes_path)
+            # Parse the candidate in a TRACKED worker thread: secret
+            # resolvers (op:// shells out via subprocess.run) and the
+            # filesystem are blocking, and a slow parse on the event loop
+            # would stall Signal event handling, control responses, and ACP
+            # timeouts for the whole process. The tracked dispatch lets
+            # close() observe the worker even when this control task is
+            # cancelled mid-parse (a bare asyncio.to_thread would leak the
+            # thread past the bounded shutdown path). Only the validated
+            # swap happens on the loop.
+            candidate = await self._dispatch_io_worker(
+                partial(load_app_config, config_path, routes_path)
+            )
         except Exception as exc:
             # Never log the traceback here (no exc_info): validation errors
             # can embed raw candidate route identifiers (a duplicate-key
@@ -1992,6 +1998,22 @@ class SignalHermesRouter:
             | extra_drain_keys
         )
         deadline = time.monotonic() + self._reap_drain_seconds()
+        # Turns admitted before the swap are not necessarily holding their
+        # route lock yet (a notify-route turn with attachments does dedupe
+        # and attachment-freeze awaits first), but every spawned turn is in
+        # the tracked task sets. Wait for the pre-swap set before the lock
+        # drain and re-validation, or a turn still in its pre-lock awaits
+        # would create a session/profile for a retired route only after the
+        # reap had already finished.
+        pending_turns = {
+            task
+            for task in self._signal_turn_tasks | self._control_client_tasks
+            if not task.done() and task is not asyncio.current_task()
+        }
+        if pending_turns:
+            await asyncio.wait(
+                pending_turns, timeout=max(0.0, deadline - time.monotonic())
+            )
         for key in drain_keys:
             remaining = deadline - time.monotonic()
             if remaining <= 0:

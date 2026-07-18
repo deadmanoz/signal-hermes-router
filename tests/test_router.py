@@ -5549,6 +5549,161 @@ routes:
                 300.0 + router_module.RELOAD_RETIRE_DRAIN_MARGIN_SECONDS,
             )
 
+    async def test_reload_config_reap_waits_for_tracked_pre_lock_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: pre-lock-route
+    platform: signal
+    group_id: group-one
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            route = harness.router.config.find_route_by_name("pre-lock-route")
+            assert route is not None
+            # An admitted notify-route turn with attachments is tracked from
+            # spawn but does not hold the route lock during its pre-lock
+            # dedupe/freeze awaits.
+            blocker = asyncio.ensure_future(asyncio.sleep(0.2))
+            harness.router._signal_turn_tasks.add(blocker)
+            blocker.add_done_callback(harness.router._settle_tracked_task)
+
+            routes_path.write_text(
+                """
+routes:
+  - name: pre-lock-route
+    platform: signal
+    group_id: group-one
+    profile: p
+    state: disabled
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            reap_tasks = [
+                t
+                for t in harness.router._signal_turn_tasks
+                if not t.done() and t is not blocker
+            ]
+            self.assertEqual(len(reap_tasks), 1)
+            # The reap must still be waiting for the tracked turn, not
+            # reaping around it.
+            await asyncio.sleep(0.05)
+            self.assertFalse(reap_tasks[0].done())
+            # The turn creates its session/profile at the end of its
+            # pre-lock window.
+            harness.supervisor.cached.append("p")
+            from signal_hermes_router.sessions import RoutedSession
+            harness.router.sessions._sessions["sk"] = RoutedSession(
+                profile=harness.profile,  # type: ignore[arg-type]
+                session_id="session-1",
+                cwd=Path(tmp) / "work" / "sk",
+            )
+            harness.router.sessions._session_routes["sk"] = route.key
+
+            await asyncio.gather(blocker, *reap_tasks)
+            self.assertEqual(harness.router.sessions._sessions, {})
+            self.assertEqual(harness.profile.released_session_ids, ["session-1"])
+            self.assertEqual(harness.supervisor.retired, ["p"])
+
+    async def test_reload_config_tracks_parse_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: new-route
+    platform: signal
+    group_id: new-group
+    profile: new-profile
+    state: active
+""",
+                encoding="utf-8",
+            )
+            harness = make_router_harness(tmp)
+            harness.router._config_paths = (config_path, routes_path)
+
+            from signal_hermes_router.config import load_app_config as real_load
+
+            def slow_load(*args: Any, **kwargs: Any) -> Any:
+                time.sleep(0.2)
+                return real_load(*args, **kwargs)
+
+            with patch.object(router_module, "load_app_config", slow_load):
+                task = asyncio.create_task(harness.router._handle_reload_config_control({}))
+                await asyncio.sleep(0.05)
+                # The blocking parse runs in a router-tracked I/O worker so
+                # close() can observe it even if the control task is cancelled.
+                self.assertTrue(
+                    any(
+                        not future.done()
+                        for future in harness.router._io_worker_futures
+                    )
+                )
+                response = await task
+            self.assertEqual(response["status"], "ok")
+            self.assertTrue(
+                all(future.done() for future in harness.router._io_worker_futures)
+            )
+
+    async def test_retire_profile_serializes_with_acquisition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from signal_hermes_router.acp import ACPProfile
+            supervisor = ProfileSupervisor(work_root=Path(tmp))
+            profile = ACPProfile(profile="p", work_root=Path(tmp), command=["true"])
+            supervisor._profiles["p"] = profile
+            # A turn holding the acquisition lock must not observe the empty
+            # cache slot and spawn a second subprocess while retirement is
+            # still closing the first.
+            lock = supervisor._acquire_locks["p"]
+            await lock.acquire()
+            task = asyncio.create_task(supervisor.retire_profile("p"))
+            try:
+                await asyncio.sleep(0.02)
+                self.assertFalse(task.done())
+            finally:
+                lock.release()
+            self.assertTrue(await task)
+            self.assertNotIn("p", supervisor._profiles)
+
     async def test_control_socket_refuses_non_socket_path_and_removes_stale_socket(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = Route(

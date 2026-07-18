@@ -143,7 +143,8 @@ inconsistent:
   too. All of this happens only after in-flight turns on the affected routes
   drain — the reap is scheduled whenever any known route key leaves the
   active set, so a turn admitted just before the swap (still creating its
-  session in its pre-lock awaits) is caught as well. The drain bound tracks
+  session in its pre-lock awaits) is caught as well — the reap waits for all
+  turns tracked at swap time before re-validating. The drain bound tracks
   the supervisor's prompt timeout plus a margin, so a healthy long-running
   prompt is always waited out; only a genuinely wedged turn fails through
   the normal broken-pipe path. Profiles and sessions for routes that stayed

@@ -216,12 +216,16 @@ class ProfileSupervisor:
         """Close and evict the cached subprocess for a profile that no route
         can use anymore (a live config reload left it with no active routes).
         Returns True when a cached entry was retired. Unlike restart_profile
-        there is no successor acquisition, so the profile simply goes away."""
-        existing = self._profiles.pop(profile_name, None)
-        if existing is None:
-            return False
-        await existing.close()
-        return True
+        there is no successor acquisition, so the profile simply goes away.
+        Serialized per profile name with get_profile: without the lock a
+        concurrent turn could observe the empty cache slot and spawn a second
+        subprocess while this one is still closing."""
+        async with self._acquire_locks[profile_name]:
+            existing = self._profiles.pop(profile_name, None)
+            if existing is None:
+                return False
+            await existing.close()
+            return True
 
     async def close(self) -> None:
         profiles = list(self._profiles.values())
