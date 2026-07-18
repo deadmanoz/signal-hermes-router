@@ -232,7 +232,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             )
             seen: list[dict] = []
 
-            async def handle(raw: dict) -> None:
+            async def handle(raw: dict, *, config: object = None) -> None:
                 seen.append(raw)
                 if raw["id"] == 1:
                     raise RuntimeError("synthetic")
@@ -6052,6 +6052,231 @@ notifications:
             prompt_texts = [block["text"] for prompt in harness.profile.prompts for block in prompt]
             self.assertIn("original prompt", prompt_texts)
             self.assertNotIn("changed prompt", prompt_texts)
+
+    async def test_reload_config_parse_timeout_returns_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-one
+    profile: p1
+    state: active
+""",
+                encoding="utf-8",
+            )
+            harness = make_router_harness(tmp)
+            harness.router._config_paths = (config_path, routes_path)
+
+            from signal_hermes_router.config import load_app_config as real_load
+
+            def hung_load(*args: Any, **kwargs: Any) -> Any:
+                # A wedged secret resolver or filesystem read.
+                time.sleep(1.0)
+                return real_load(*args, **kwargs)
+
+            with (
+                patch.object(router_module, "load_app_config", hung_load),
+                patch.object(router_module, "RELOAD_PARSE_TIMEOUT_SECONDS", 0.2),
+            ):
+                response = await harness.router._handle_reload_config_control({})
+                self.assertEqual(response["status"], "error")
+                self.assertEqual(response["error"], "config_parse_timeout")
+                self.assertEqual(response["generation"], 0)
+                # The parse worker was not cancelled by the timeout: it stays
+                # tracked so close() can observe it, and finishes on its own.
+                futures = list(harness.router._io_worker_futures)
+                self.assertTrue(futures)
+                await asyncio.sleep(1.0)
+                self.assertTrue(all(future.done() for future in futures))
+            # The reload lock was released: a later reload proceeds normally.
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+
+    async def test_retire_profile_contains_close_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from signal_hermes_router.acp import ACPProfile
+            supervisor = ProfileSupervisor(work_root=Path(tmp))
+            bad = ACPProfile(profile="bad", work_root=Path(tmp), command=["true"])
+            good = ACPProfile(profile="good", work_root=Path(tmp), command=["true"])
+            supervisor._profiles["bad"] = bad
+            supervisor._profiles["good"] = good
+
+            async def failing_close() -> None:
+                raise RuntimeError("boom")
+
+            bad.close = failing_close  # type: ignore[method-assign]
+
+            # A subprocess whose close() raises is still evicted and must not
+            # abort the reload reaper before it retires the other profiles.
+            with self.assertLogs("signal_hermes_router.sessions", level="WARNING"):
+                self.assertTrue(await supervisor.retire_profile("bad"))
+            self.assertNotIn("bad", supervisor._profiles)
+            self.assertTrue(await supervisor.retire_profile("good"))
+            self.assertEqual(supervisor._profiles, {})
+
+    async def test_signal_event_pinned_to_admission_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-one
+    profile: p1
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            # Wiring: the consumer pins the config at acceptance.
+            captured: dict[str, Any] = {}
+
+            class OneEventSignal(FakeSignal):
+                async def events(self):  # type: ignore[override]
+                    yield make_group_raw(group_id="group-one", timestamp=9)
+
+            harness.router.signal = OneEventSignal()  # type: ignore[assignment]
+
+            async def recorder(raw: dict, *, config: Any = None) -> None:
+                captured["config"] = config
+
+            harness.router.handle_raw_event = recorder  # type: ignore[method-assign]
+            expected = harness.router.config
+            await harness.router._run_signal_events()
+            self.assertIs(captured["config"], expected)
+            # Restore the real handler and signal client for the semantics
+            # checks below.
+            del harness.router.handle_raw_event  # type: ignore[attr-defined]
+            harness.router.signal = harness.signal  # type: ignore[assignment]
+
+            # Semantics: an event admitted before a reload that removed its
+            # route still runs against the admission-time config...
+            old_config = harness.router.config
+            routes_path.write_text("routes: []\n", encoding="utf-8")
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            now_ms = int(time.time() * 1000)
+            await harness.router.handle_raw_event(
+                make_group_raw(group_id="group-one", timestamp=now_ms),
+                config=old_config,
+            )
+            self.assertEqual(harness.signal.sends, [("group-one", "reply")])
+            # ...while an unpinned lookup after the swap discards it.
+            result = await harness.router.handle_raw_event(
+                make_group_raw(group_id="group-one", timestamp=now_ms + 1)
+            )
+            self.assertIsNone(result)
+            self.assertEqual(harness.signal.sends, [("group-one", "reply")])
+
+    async def test_trigger_job_pinned_to_admission_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-one
+    profile: p1
+    state: active
+
+scheduled_jobs:
+  - id: j1
+    route: r1
+    prompt: job prompt
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            # Wiring: the control request runner pins the config at admission.
+            captured: dict[str, Any] = {}
+
+            async def recorder(line: bytes, *, config: Any = None) -> dict[str, Any]:
+                captured["config"] = config
+                return {"status": "ok"}
+
+            harness.router._handle_control_line = recorder  # type: ignore[method-assign]
+            expected = harness.router.config
+            await harness.router._run_control_request(b'{"command":"route_status"}')
+            self.assertIs(captured["config"], expected)
+
+            # Semantics: a job admitted before a reload that removed it still
+            # runs against the admission-time config...
+            old_config = harness.router.config
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-one
+    profile: p1
+    state: active
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            outcome = await harness.router.handle_synthetic_job("j1", config=old_config)
+            self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+            self.assertEqual(harness.signal.sends, [("group-one", "reply")])
+            # ...while an unpinned lookup after the swap reports unknown_job.
+            outcome = await harness.router.handle_synthetic_job("j1")
+            self.assertEqual(outcome.status, TurnOutcomeStatus.ERROR)
+            self.assertEqual(outcome.error, "unknown_job")
 
     async def test_reload_config_serializes_concurrent_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

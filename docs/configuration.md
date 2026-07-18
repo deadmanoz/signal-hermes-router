@@ -63,6 +63,11 @@ from the router's perspective and is not created or chmodded by the router.
   when control is enabled and no explicit path is set) - local Unix socket
   used by `signal-hermes-router trigger-job` and `notify-route` to ask the
   running router to inject a configured synthetic turn.
+- `router.signal_attachment_root` (default
+  `~/.local/share/signal-cli/attachments`) - read-only path used to resolve
+  signal-cli events that reference an attachment by ID instead of carrying
+  inline bytes. The value is `expanduser`-ed at config load time. The router
+  does not create or change permissions on this directory.
 
 ## Live configuration reload (routes only)
 
@@ -124,6 +129,14 @@ inconsistent:
 {"error": "profile_changed_for_existing_route", "generation": 0, "status": "error"}
 ```
 
+The candidate parse is bounded server-side (60 s): a blocking filesystem read or
+a hung secret resolver fails the reload instead of holding every later reload
+request behind it:
+
+```json
+{"error": "config_parse_timeout", "generation": 0, "status": "error"}
+```
+
 ### Safety guarantees
 
 - **Parse-before-swap, off the event loop**: The candidate file is fully
@@ -182,12 +195,6 @@ inconsistent:
 2. Atomically replace the routes file on disk (e.g. `mv routes.yaml.new routes.yaml`).
 3. Run `signal-hermes-router reload-config`.
 4. Inspect the response `generation` to confirm the reload took effect.
-
-- `router.signal_attachment_root` (default
-  `~/.local/share/signal-cli/attachments`) - read-only path used to resolve
-  signal-cli events that reference an attachment by ID instead of carrying
-  inline bytes. The value is `expanduser`-ed at config load time. The router
-  does not create or change permissions on this directory.
 
 ## Secret resolvers
 

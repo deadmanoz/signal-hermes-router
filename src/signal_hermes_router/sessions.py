@@ -224,7 +224,19 @@ class ProfileSupervisor:
             existing = self._profiles.pop(profile_name, None)
             if existing is None:
                 return False
-            await existing.close()
+            try:
+                await existing.close()
+            except Exception as exc:
+                # Contain per-profile failures like shutdown close() does:
+                # the entry is already evicted, and one bad subprocess must
+                # not abort the reload reaper before it retires the
+                # remaining profiles. The redacted class name is all the log
+                # needs; the profile is gone from the cache either way.
+                LOGGER.warning(
+                    "Hermes profile close failed during retirement: %s",
+                    exc.__class__.__name__,
+                )
+                LOGGER.debug("Hermes profile close failure details", exc_info=True)
             return True
 
     async def close(self) -> None:

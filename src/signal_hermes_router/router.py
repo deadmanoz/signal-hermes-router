@@ -110,6 +110,14 @@ SHUTDOWN_CLEANUP_CANCEL_GRACE_SECONDS = 1.0
 # path instead. Code constants by design, not configuration.
 RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS = 15.0
 RELOAD_RETIRE_DRAIN_MARGIN_SECONDS = 30.0
+# Server-side bound on one reload's candidate parse. A blocking filesystem
+# read or a hung secret resolver (op:// shells out with no timeout) must not
+# hold the reload lock forever: later reload requests would queue behind the
+# stuck parse with no operator-side recovery short of restarting the router.
+# On expiry the reload fails with an error; the worker thread itself cannot
+# be killed, but it stays tracked so close() can observe it. A code constant
+# by design, not configuration.
+RELOAD_PARSE_TIMEOUT_SECONDS = 60.0
 # Retention sweep deletions run on the event loop (so the pre-unlink mtime
 # recheck cannot interleave with media writes) in bounded batches with a
 # yield in between; this bounds each uninterrupted loop slice. A code
@@ -278,8 +286,11 @@ class SignalHermesRouter:
             # Each accepted event runs as a tracked task awaited through
             # shield: cancelling this consumer (SIGTERM/SIGINT teardown or
             # begin_shutdown) does not abort the accepted turn, which close()
-            # then drains to normal delivery.
-            task = asyncio.create_task(self.handle_raw_event(raw))
+            # then drains to normal delivery. The config is pinned at
+            # acceptance: the task may not run until after a reload swapped
+            # self.config, and an admitted event must still resolve its route
+            # against the config it was admitted under.
+            task = asyncio.create_task(self.handle_raw_event(raw, config=self.config))
             self._signal_turn_tasks.add(task)
             task.add_done_callback(self._settle_tracked_task)
             try:
@@ -719,13 +730,19 @@ class SignalHermesRouter:
     def _is_live_media(self, path: Path) -> bool:
         return path in self._live_media
 
-    async def handle_raw_event(self, raw: dict) -> TurnResult | None:
+    async def handle_raw_event(
+        self, raw: dict, *, config: AppConfig | None = None
+    ) -> TurnResult | None:
+        # config pins the admission-time snapshot (see _run_signal_events):
+        # the task may run after a reload swapped self.config, and an
+        # admitted event must resolve its route under the old config.
+        config = self.config if config is None else config
         probe = probe_signal_route(raw)
         route = None
         if probe.group_id is not None:
-            route = self.config.find_group_route("signal", probe.group_id)
+            route = config.find_group_route("signal", probe.group_id)
         elif probe.is_direct_data_message:
-            route = self.config.find_direct_route(
+            route = config.find_direct_route(
                 "signal",
                 probe.source_uuid,
                 probe.source_number,
@@ -740,10 +757,13 @@ class SignalHermesRouter:
         if event is None:
             _discard_event(probe.summary)
             return None
-        return await self.handle_event(event)
+        return await self.handle_event(event, config=config)
 
-    async def handle_event(self, event: NormalizedEvent) -> TurnResult | None:
-        route = self.config.find_route_for_event(event)
+    async def handle_event(
+        self, event: NormalizedEvent, *, config: AppConfig | None = None
+    ) -> TurnResult | None:
+        config = self.config if config is None else config
+        route = config.find_route_for_event(event)
         if route is None:
             _discard_event(
                 SignalEventSummary(
@@ -785,8 +805,12 @@ class SignalHermesRouter:
         scheduled_at: int | None = None,
         idempotency_key: str | None = None,
         route_lock_timeout: float | None = None,
+        config: AppConfig | None = None,
     ) -> TurnOutcome:
-        job = self.config.find_synthetic_job(job_id)
+        # config pins the admission-time snapshot when the control path
+        # accepted the request before a reload swapped self.config.
+        config = self.config if config is None else config
+        job = config.find_synthetic_job(job_id)
         if job is None:
             return TurnOutcome(
                 TurnOutcomeStatus.ERROR,
@@ -799,6 +823,7 @@ class SignalHermesRouter:
             scheduled_at=scheduled_at,
             idempotency_key=idempotency_key,
             route_lock_timeout=route_lock_timeout,
+            config=config,
         )
 
     async def handle_notification(
@@ -1846,12 +1871,28 @@ class SignalHermesRouter:
             # cancelled mid-parse (a bare asyncio.to_thread would leak the
             # thread past the bounded shutdown path), and the shielded await
             # keeps the cancellation from untracking the still-running
-            # worker. Only the validated swap happens on the loop.
-            candidate = await self._await_io_worker(
-                self._dispatch_io_worker(
-                    partial(load_app_config, config_path, routes_path)
-                )
+            # worker. Only the validated swap happens on the loop. The wait
+            # is bounded so a hung resolver cannot hold the reload lock (and
+            # every later reload request) hostage; timing out fails this
+            # reload but leaves the tracked worker for close() to observe.
+            candidate = await asyncio.wait_for(
+                self._await_io_worker(
+                    self._dispatch_io_worker(
+                        partial(load_app_config, config_path, routes_path)
+                    )
+                ),
+                timeout=RELOAD_PARSE_TIMEOUT_SECONDS,
             )
+        except TimeoutError:
+            LOGGER.error(
+                "config reload rejected: parse exceeded the %ds server-side bound",
+                RELOAD_PARSE_TIMEOUT_SECONDS,
+            )
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "error": "config_parse_timeout",
+                "generation": self._config_generation,
+            }
         except Exception as exc:
             # Never log the traceback here (no exc_info): validation errors
             # can embed raw candidate route identifiers (a duplicate-key
@@ -2409,8 +2450,11 @@ class SignalHermesRouter:
         # Track each REQUEST as its own task, separate from the connection
         # loop: the reload reaper and close() must wait out in-flight control
         # turns, but an idle keep-alive connection is not in-flight work and
-        # must not delay either one.
-        task = asyncio.ensure_future(self._handle_control_line(line))
+        # must not delay either one. The config is pinned here, at admission:
+        # the request task may not run until after a reload swapped
+        # self.config, and an admitted turn must still resolve its route or
+        # job against the config it was admitted under.
+        task = asyncio.ensure_future(self._handle_control_line(line, config=self.config))
         self._control_request_tasks.add(task)
         task.add_done_callback(self._settle_tracked_task)
         return await task
@@ -2437,7 +2481,9 @@ class SignalHermesRouter:
             return False
         return True
 
-    async def _handle_control_line(self, line: bytes) -> dict[str, Any]:
+    async def _handle_control_line(
+        self, line: bytes, *, config: AppConfig | None = None
+    ) -> dict[str, Any]:
         if self._closing:
             # Admission gate: busy is the success-class "retry later" status,
             # so the caller's retry lands on the replacement router. Turns
@@ -2454,9 +2500,9 @@ class SignalHermesRouter:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": "malformed_request"}
         command = payload.get("command")
         if command == "trigger_job":
-            return await self._handle_trigger_job_control(payload)
+            return await self._handle_trigger_job_control(payload, config=config)
         if command == "notify_route":
-            return await self._handle_notify_route_control(payload)
+            return await self._handle_notify_route_control(payload, config=config)
         if command == "preflight_permissions":
             return await self._handle_preflight_permissions_control(payload)
         if command == "route_status":
@@ -2465,7 +2511,9 @@ class SignalHermesRouter:
             return await self._handle_reload_config_control(payload)
         return {"status": TurnOutcomeStatus.ERROR.value, "error": "unknown_command"}
 
-    async def _handle_trigger_job_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _handle_trigger_job_control(
+        self, payload: dict[str, Any], *, config: AppConfig | None = None
+    ) -> dict[str, Any]:
         job_id = payload.get("job_id")
         if not isinstance(job_id, str) or not job_id:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": "missing_job_id"}
@@ -2484,6 +2532,7 @@ class SignalHermesRouter:
                 scheduled_at=scheduled_at,
                 idempotency_key=idempotency_key,
                 route_lock_timeout=timeout,
+                config=config,
             )
         except Exception as exc:
             LOGGER.error(
@@ -2507,7 +2556,9 @@ class SignalHermesRouter:
             }
         return outcome.to_control_response()
 
-    async def _handle_notify_route_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _handle_notify_route_control(
+        self, payload: dict[str, Any], *, config: AppConfig | None = None
+    ) -> dict[str, Any]:
         notification_id = payload.get("notification_id")
         if not isinstance(notification_id, str) or not notification_id:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": "missing_notification_id"}
@@ -2531,8 +2582,10 @@ class SignalHermesRouter:
         # reads the notification/route, and a reload landing mid-request must
         # not make an admitted notification run against a different
         # definition (or fail as unknown_notification after being admitted) —
-        # the same in-flight preservation guarantee Signal turns get.
-        config = self.config
+        # the same in-flight preservation guarantee Signal turns get. When
+        # the request was admitted through _run_control_request the snapshot
+        # was pinned even earlier, at acceptance.
+        config = self.config if config is None else config
         deduped_response = await self._deduped_notification_control_response(
             notification_id,
             idempotency_key,
