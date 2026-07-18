@@ -209,6 +209,11 @@ class SignalHermesRouter:
         self._shutdown_event = asyncio.Event()
         self._signal_turn_tasks: set[asyncio.Task[Any]] = set()
         self._control_client_tasks: set[asyncio.Task[None]] = set()
+        # Per-request control tasks, tracked separately from the connection
+        # loops above: the reload reaper waits out in-flight control TURNS,
+        # but an idle keep-alive connection is not in-flight work and must
+        # not delay the reap.
+        self._control_request_tasks: set[asyncio.Task[Any]] = set()
         # Reaper tasks scheduled by config reloads. They also live in
         # _signal_turn_tasks so the shutdown drain still covers them, but a
         # reaper must never wait on another reaper (two back-to-back reloads
@@ -322,7 +327,9 @@ class SignalHermesRouter:
             # finish via the normal delivery path.
             await self._drain_route_locks(drain_deadline)
             stragglers |= await self._drain_tasks(
-                set(self._control_client_tasks), drain_deadline, "control client"
+                set(self._control_client_tasks) | set(self._control_request_tasks),
+                drain_deadline,
+                "control client",
             )
             for task in (
                 self._signal_events_task,
@@ -458,6 +465,7 @@ class SignalHermesRouter:
     def _settle_tracked_task(self, task: asyncio.Task[Any]) -> None:
         self._signal_turn_tasks.discard(task)
         self._control_client_tasks.discard(task)
+        self._control_request_tasks.discard(task)
         self._reap_tasks.discard(task)
         if task.cancelled():
             return
@@ -801,8 +809,13 @@ class SignalHermesRouter:
         outbound_attachments: Any = (),
         idempotency_key: str | None = None,
         route_lock_timeout: float | None = None,
+        config: AppConfig | None = None,
     ) -> TurnOutcome:
-        notification = self.config.find_notification(notification_id)
+        # config lets the control path pin the snapshot captured before its
+        # first await (in-flight preservation across a concurrent reload);
+        # direct callers get the current config.
+        config = self.config if config is None else config
+        notification = config.find_notification(notification_id)
         if notification is None:
             return TurnOutcome(
                 TurnOutcomeStatus.ERROR,
@@ -817,6 +830,7 @@ class SignalHermesRouter:
             route_lock_timeout=route_lock_timeout,
             payload=payload,
             outbound_attachments=outbound_attachments,
+            config=config,
         )
 
     async def _handle_synthetic_definition(
@@ -828,6 +842,7 @@ class SignalHermesRouter:
         route_lock_timeout: float | None = None,
         payload: CanonicalNotificationPayload | None = None,
         outbound_attachments: Any = (),
+        config: AppConfig | None = None,
     ) -> TurnOutcome:
         def _synthetic_outcome(
             status: TurnOutcomeStatus,
@@ -843,7 +858,9 @@ class SignalHermesRouter:
                 synthetic_kind=synthetic.kind,
             )
 
-        route = self.config.find_route_by_name(synthetic.route_name)
+        route = (self.config if config is None else config).find_route_by_name(
+            synthetic.route_name
+        )
         if route is None:
             return _synthetic_outcome(TurnOutcomeStatus.ERROR, error="unknown_route")
         self.redactor.add(route.key, route.group_id, route.sender_id, route.sender_number)
@@ -2035,7 +2052,7 @@ class SignalHermesRouter:
         # reap had already finished.
         pending_turns = {
             task
-            for task in self._signal_turn_tasks | self._control_client_tasks
+            for task in self._signal_turn_tasks | self._control_request_tasks
             if not task.done()
             and task is not asyncio.current_task()
             and task not in self._reap_tasks
@@ -2098,6 +2115,16 @@ class SignalHermesRouter:
                 for route in self.config.routes
                 if route.state == RouteState.ACTIVE
             }:
+                continue
+            # Retire only when EVERY route key that could still have an
+            # in-flight turn on this profile is one this reaper drained — the
+            # same scope as the session eviction above. A route disabled by a
+            # LATER reload is drained by that reload's own reaper; closing
+            # the shared subprocess here would truncate its in-flight reply.
+            if any(
+                profile == profile_name and key not in drained
+                for key, profile in self._route_profile_tombstones.items()
+            ):
                 continue
             if await self.supervisor.retire_profile(profile_name):
                 LOGGER.info(
@@ -2370,13 +2397,23 @@ class SignalHermesRouter:
                     break
                 if not line:
                     break
-                response = await self._handle_control_line(line)
+                response = await self._run_control_request(line)
                 if not await self._write_control_response(writer, response):
                     break
         finally:
             writer.close()
             with suppress(Exception):
                 await writer.wait_closed()
+
+    async def _run_control_request(self, line: bytes) -> dict[str, Any]:
+        # Track each REQUEST as its own task, separate from the connection
+        # loop: the reload reaper and close() must wait out in-flight control
+        # turns, but an idle keep-alive connection is not in-flight work and
+        # must not delay either one.
+        task = asyncio.ensure_future(self._handle_control_line(line))
+        self._control_request_tasks.add(task)
+        task.add_done_callback(self._settle_tracked_task)
+        return await task
 
     async def _write_control_response(
         self,
@@ -2490,9 +2527,16 @@ class SignalHermesRouter:
         timeout, error = _parse_control_timeout(payload.get("timeout"))
         if error is not None:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": error}
+        # Capture the config BEFORE the first await: the dedupe claim below
+        # reads the notification/route, and a reload landing mid-request must
+        # not make an admitted notification run against a different
+        # definition (or fail as unknown_notification after being admitted) —
+        # the same in-flight preservation guarantee Signal turns get.
+        config = self.config
         deduped_response = await self._deduped_notification_control_response(
             notification_id,
             idempotency_key,
+            config=config,
         )
         if deduped_response is not None:
             return deduped_response
@@ -2503,6 +2547,7 @@ class SignalHermesRouter:
                 outbound_attachments=payload.get("attachments", []),
                 idempotency_key=idempotency_key,
                 route_lock_timeout=timeout,
+                config=config,
             )
         except Exception as exc:
             LOGGER.error(
@@ -2529,13 +2574,15 @@ class SignalHermesRouter:
         self,
         notification_id: str,
         idempotency_key: str | None,
+        *,
+        config: AppConfig,
     ) -> dict[str, Any] | None:
         if not idempotency_key:
             return None
-        notification = self.config.find_notification(notification_id)
+        notification = config.find_notification(notification_id)
         if notification is None:
             return None
-        route = self.config.find_route_by_name(notification.route_name)
+        route = config.find_route_by_name(notification.route_name)
         if route is None:
             return None
         dedupe_sender_id, dedupe_timestamp = self._synthetic_dedupe_identity(
