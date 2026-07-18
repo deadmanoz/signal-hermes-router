@@ -5414,6 +5414,282 @@ routes:
             )
             self.assertCountEqual(harness.supervisor.retired, ["p1", "p2"])
 
+    async def test_reload_config_reap_rechecks_profile_liveness_before_retiring(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: old-route
+    platform: signal
+    group_id: group-one
+    profile: p-old
+    state: active
+  - name: r1
+    platform: signal
+    group_id: group-two
+    profile: p1
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+            harness.supervisor.cached.extend(["p-old", "p1"])
+
+            # Reload #1 removes old-route and disables r1: neither profile
+            # has an active route, so the reaper will retire both.
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-two
+    profile: p1
+    state: disabled
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+
+            # While the reaper is retiring p-old, a later reload re-activates
+            # r1. The reaper must re-check liveness against the CURRENT
+            # config instead of its pre-drain snapshot, or it would retire a
+            # profile that is live again.
+            original_retire = harness.supervisor.retire_profile
+            reactivated = False
+
+            async def retire_with_concurrent_reload(profile_name: str) -> bool:
+                nonlocal reactivated
+                if not reactivated:
+                    reactivated = True
+                    routes_path.write_text(
+                        """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-two
+    profile: p1
+    state: active
+""",
+                        encoding="utf-8",
+                    )
+                    reload_response = await harness.router._handle_reload_config_control({})
+                    assert reload_response["status"] == "ok"
+                return await original_retire(profile_name)
+
+            harness.supervisor.retire_profile = retire_with_concurrent_reload  # type: ignore[method-assign]
+            tasks = [t for t in harness.router._signal_turn_tasks if not t.done()]
+            self.assertTrue(tasks)
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+
+            self.assertTrue(reactivated)
+            self.assertEqual(harness.supervisor.retired, ["p-old"])
+            self.assertEqual(harness.supervisor.cached, ["p1"])
+
+    async def test_reload_config_removed_route_clears_breaker_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: breaker-route
+    platform: signal
+    group_id: group-one
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            route = harness.router.config.find_route_by_name("breaker-route")
+            assert route is not None
+            for _ in range(3):
+                harness.router.circuit.record_failure(route.key)
+            harness.router.route_state_overrides[route.key] = RouteState.MAINTENANCE
+            harness.router._trip_times[route.key] = time.monotonic()
+            harness.router._trip_times_ms[route.key] = harness.router._clock_ms()
+
+            # Reload REMOVES the route: it never appears in the override
+            # clearing loop, but its stale MAINTENANCE override must not
+            # survive either.
+            routes_path.write_text("routes: []\n", encoding="utf-8")
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            self.assertIsNone(harness.router.route_state_overrides.get(route.key))
+            self.assertNotIn(route.key, harness.router._trip_times)
+            self.assertNotIn(route.key, harness.router._trip_times_ms)
+
+            # Re-added active before the cooldown expires, the route prompts
+            # normally instead of answering with maintenance replies.
+            routes_path.write_text(
+                """
+routes:
+  - name: breaker-route
+    platform: signal
+    group_id: group-one
+    profile: p
+    state: active
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            await harness.router.handle_event(make_event(group_id="group-one", timestamp=1))
+            self.assertEqual(harness.signal.sends, [("group-one", "reply")])
+
+    async def test_reload_config_reap_evicts_only_drained_route_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-one
+    profile: p1
+    state: active
+  - name: r2
+    platform: signal
+    group_id: group-two
+    profile: p2
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+            harness.profile.prompt_delay = 0.3
+
+            r1 = harness.router.config.find_route_by_name("r1")
+            assert r1 is not None
+            # Hold r1's route lock so reload #1's reaper parks in its drain
+            # while later events unfold.
+            await harness.router._route_locks[r1.key].acquire()
+
+            # Reload #1 disables r1; its reaper drains {r1} and parks.
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-one
+    profile: p1
+    state: disabled
+  - name: r2
+    platform: signal
+    group_id: group-two
+    profile: p2
+    state: active
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            await asyncio.sleep(0.05)
+            reaper_a = next(iter(harness.router._reap_tasks))
+            self.assertFalse(reaper_a.done())
+
+            # A turn starts on r2 (still active) AFTER reaper A snapshot its
+            # pending-turn set, so A never waits for it.
+            turn_task = asyncio.create_task(
+                harness.router.handle_event(make_event(group_id="group-two", timestamp=1))
+            )
+            for _ in range(100):
+                if harness.profile.prompts:
+                    break
+                await asyncio.sleep(0.001)
+            self.assertTrue(harness.profile.prompts)
+
+            # Reload #2 disables r2; its own reaper waits out the r2 turn.
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-one
+    profile: p1
+    state: disabled
+  - name: r2
+    platform: signal
+    group_id: group-two
+    profile: p2
+    state: disabled
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            reaper_b = next(
+                t for t in harness.router._reap_tasks if t is not reaper_a
+            )
+
+            # Releasing r1's lock lets reaper A finish its drain. Its
+            # revalidation sees BOTH routes non-live, but it must evict only
+            # the keys it actually drained — r2's session belongs to reaper
+            # B, which is still waiting out the in-flight turn.
+            harness.router._route_locks[r1.key].release()
+            await asyncio.wait_for(asyncio.gather(reaper_a), timeout=5)
+            self.assertFalse(turn_task.done())
+            self.assertEqual(harness.profile.released_session_ids, [])
+
+            await turn_task
+            self.assertEqual(harness.signal.sends, [("group-two", "reply")])
+            await asyncio.wait_for(asyncio.gather(reaper_b), timeout=5)
+            self.assertEqual(harness.profile.released_session_ids, ["session-1"])
+            self.assertEqual(harness.router.sessions._sessions, {})
+
     async def test_reload_config_serializes_concurrent_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.yaml"

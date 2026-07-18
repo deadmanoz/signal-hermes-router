@@ -1932,6 +1932,15 @@ class SignalHermesRouter:
                 self.route_state_overrides.pop(route.key, None)
                 self._trip_times.pop(route.key, None)
                 self._trip_times_ms.pop(route.key, None)
+        # Routes absent from the new config never appear in the loop above;
+        # clear their overrides and trip state too, or a stale MAINTENANCE
+        # override would keep masking the route (maintenance replies instead
+        # of prompting) if it is re-added active before the cooldown expires.
+        for key in list(self.route_state_overrides):
+            if key not in new_keys:
+                self.route_state_overrides.pop(key, None)
+                self._trip_times.pop(key, None)
+                self._trip_times_ms.pop(key, None)
         # Do NOT prune route locks: in-flight turns may hold them.
         # Session registry entries and cached profile subprocesses for routes
         # that can no longer prompt are reaped by the caller's
@@ -2053,18 +2062,25 @@ class SignalHermesRouter:
         # Re-validate against the CURRENT config: a later reload may have
         # re-activated routes while the drain was in flight; never evict a
         # session or retire a profile that is live again.
-        live_routes = [
-            route for route in self.config.routes if route.state == RouteState.ACTIVE
-        ]
+        live_keys = {
+            route.key for route in self.config.routes if route.state == RouteState.ACTIVE
+        }
+        # Evict only the route keys this reaper actually drained. A later
+        # reload may have disabled ANOTHER route while this reaper waited,
+        # and this reaper never waited out that route's in-flight turn —
+        # evicting its session here would truncate the reply mid-prompt. The
+        # later reload's own reaper drains and evicts it.
+        drained = set(drain_keys)
         evicted = self.sessions.drop_sessions_not_in(
-            {route.key for route in live_routes}
+            live_keys, only_route_keys=drained
         )
         # Sessions whose creation-time policy no longer matches their route's
         # current policy are unreachable under the new keying. Compared per
         # session against the CURRENT config, so a flip-flop reload that
         # restored the original policy keeps the still-reachable session.
         evicted += self.sessions.drop_sessions_with_mismatched_policy(
-            {route.key: route.session_policy for route in self.config.routes}
+            {route.key: route.session_policy for route in self.config.routes},
+            only_route_keys=drained,
         )
         if evicted:
             LOGGER.info(
@@ -2072,9 +2088,16 @@ class SignalHermesRouter:
                 "active or whose session policy changed",
                 evicted,
             )
-        live_profiles = {route.profile for route in live_routes}
         for profile_name in self.supervisor.cached_profile_names():
-            if profile_name in live_profiles:
+            # Re-check against the CURRENT config immediately before retiring:
+            # a later reload may have re-activated a route for this profile
+            # while this reaper was draining or retiring another profile, and
+            # retiring a live profile breaks a turn that already acquired it.
+            if profile_name in {
+                route.profile
+                for route in self.config.routes
+                if route.state == RouteState.ACTIVE
+            }:
                 continue
             if await self.supervisor.retire_profile(profile_name):
                 LOGGER.info(

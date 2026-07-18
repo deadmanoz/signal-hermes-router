@@ -367,30 +367,41 @@ class SessionRegistry:
             cached_sessions=len(keys),
         )
 
-    def drop_sessions_not_in(self, live_route_keys: set[str]) -> int:
+    def drop_sessions_not_in(
+        self, live_route_keys: set[str], *, only_route_keys: set[str] | None = None
+    ) -> int:
         """Evict cached sessions whose route can no longer prompt (a live
         config reload made the route non-active or removed it), releasing
         per-session state on the owning profile. Returns the number evicted.
         Sessions for routes that stayed configured-active are kept, including
         ones currently under a breaker override — the route prompts again as
-        soon as the breaker recovers."""
+        soon as the breaker recovers. When only_route_keys is given, only
+        sessions for those route keys are eligible: a reaper must not evict
+        the session of a route disabled by a LATER reload, whose in-flight
+        turn it never drained."""
         return self._drop_sessions_matching(
             lambda _sk, route_key, _s: route_key not in live_route_keys
+            and (only_route_keys is None or route_key in only_route_keys)
         )
 
     def drop_sessions_with_mismatched_policy(
-        self, current_policies: dict[str, SessionPolicy]
+        self,
+        current_policies: dict[str, SessionPolicy],
+        *,
+        only_route_keys: set[str] | None = None,
     ) -> int:
         """Evict cached sessions whose creation-time session_policy no longer
         matches their route's current policy (a live config reload changed
         the keying, leaving them unreachable), releasing per-session state on
         the owning profile. Returns the number evicted. Comparing per session
         means a flip-flop reload that restored the original policy keeps the
-        still-reachable session."""
+        still-reachable session. only_route_keys scopes the eviction the same
+        way as drop_sessions_not_in."""
         return self._drop_sessions_matching(
             lambda _sk, route_key, session: (
                 route_key in current_policies
                 and session.policy != current_policies[route_key]
+                and (only_route_keys is None or route_key in only_route_keys)
             )
         )
 
