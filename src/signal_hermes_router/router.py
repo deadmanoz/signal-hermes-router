@@ -209,6 +209,11 @@ class SignalHermesRouter:
         self._shutdown_event = asyncio.Event()
         self._signal_turn_tasks: set[asyncio.Task[Any]] = set()
         self._control_client_tasks: set[asyncio.Task[None]] = set()
+        # Reaper tasks scheduled by config reloads. They also live in
+        # _signal_turn_tasks so the shutdown drain still covers them, but a
+        # reaper must never wait on another reaper (two back-to-back reloads
+        # would otherwise wait on each other until the drain bound expires).
+        self._reap_tasks: set[asyncio.Task[Any]] = set()
         self._signal_events_task: asyncio.Task[None] | None = None
         self._control_server_task: asyncio.Task[None] | None = None
         self._retention_task: asyncio.Task[None] | None = None
@@ -453,6 +458,7 @@ class SignalHermesRouter:
     def _settle_tracked_task(self, task: asyncio.Task[Any]) -> None:
         self._signal_turn_tasks.discard(task)
         self._control_client_tasks.discard(task)
+        self._reap_tasks.discard(task)
         if task.cancelled():
             return
         exc = task.exception()
@@ -1804,6 +1810,15 @@ class SignalHermesRouter:
             if raw_candidate_routes
             else self._config_paths[1]
         )
+        if raw_candidate_routes and not routes_path.is_absolute():
+            # A relative override resolves against the long-lived router's
+            # cwd, not the operator's shell, so it could validate and apply
+            # a different file than the operator intended.
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "error": "candidate_routes_not_absolute",
+                "generation": self._config_generation,
+            }
         try:
             # Parse the candidate in a TRACKED worker thread: secret
             # resolvers (op:// shells out via subprocess.run) and the
@@ -1812,10 +1827,13 @@ class SignalHermesRouter:
             # timeouts for the whole process. The tracked dispatch lets
             # close() observe the worker even when this control task is
             # cancelled mid-parse (a bare asyncio.to_thread would leak the
-            # thread past the bounded shutdown path). Only the validated
-            # swap happens on the loop.
-            candidate = await self._dispatch_io_worker(
-                partial(load_app_config, config_path, routes_path)
+            # thread past the bounded shutdown path), and the shielded await
+            # keeps the cancellation from untracking the still-running
+            # worker. Only the validated swap happens on the loop.
+            candidate = await self._await_io_worker(
+                self._dispatch_io_worker(
+                    partial(load_app_config, config_path, routes_path)
+                )
             )
         except Exception as exc:
             # Never log the traceback here (no exc_info): validation errors
@@ -1962,6 +1980,7 @@ class SignalHermesRouter:
             return
         task = asyncio.ensure_future(self._reap_after_drain(policy_changed_keys))
         self._signal_turn_tasks.add(task)
+        self._reap_tasks.add(task)
         task.add_done_callback(self._settle_tracked_task)
 
     def _reap_drain_seconds(self) -> float:
@@ -2008,7 +2027,9 @@ class SignalHermesRouter:
         pending_turns = {
             task
             for task in self._signal_turn_tasks | self._control_client_tasks
-            if not task.done() and task is not asyncio.current_task()
+            if not task.done()
+            and task is not asyncio.current_task()
+            and task not in self._reap_tasks
         }
         if pending_turns:
             await asyncio.wait(

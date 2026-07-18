@@ -410,7 +410,47 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
                 [
                     {
                         "command": "reload_config",
-                        "candidate_routes": str(Path(tmp) / "routes.yaml"),
+                        "candidate_routes": str((Path(tmp) / "routes.yaml").resolve()),
+                    }
+                ],
+            )
+
+    async def test_reload_config_via_control_socket_resolves_relative_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "control.sock"
+            requests: list[dict] = []
+
+            async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                requests.append(json.loads((await reader.readline()).decode("utf-8")))
+                writer.write(b'{"status":"ok","generation":1,"route_count":2}\n')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_unix_server(handle, path=str(socket_path))
+            async with server:
+                # A relative override is resolved in the operator's shell so
+                # the daemon never re-interprets it against its own cwd.
+                old_cwd = os.getcwd()
+                os.chdir(tmp)
+                try:
+                    response = await cli_module.reload_config_via_control_socket(
+                        socket_path,
+                        candidate_routes=Path("routes.yaml"),
+                        client_timeout=1.5,
+                    )
+                finally:
+                    os.chdir(old_cwd)
+                server.close()
+                await server.wait_closed()
+
+            self.assertEqual(response, {"status": "ok", "generation": 1, "route_count": 2})
+            self.assertEqual(
+                requests,
+                [
+                    {
+                        "command": "reload_config",
+                        "candidate_routes": str((Path(tmp) / "routes.yaml").resolve()),
                     }
                 ],
             )

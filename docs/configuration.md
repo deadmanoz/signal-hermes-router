@@ -86,6 +86,15 @@ Override with a candidate file:
 signal-hermes-router reload-config --candidate-routes /path/to/new/routes.yaml
 ```
 
+The CLI resolves the override to an absolute path before sending it, and the
+router rejects a relative `candidate_routes` override outright — a relative
+path would resolve against the long-running daemon's working directory, not
+the shell the operator ran the command from:
+
+```json
+{"error": "candidate_routes_not_absolute", "generation": 0, "status": "error"}
+```
+
 ### Response
 
 A successful reload returns a JSON response with a monotonic generation counter:
