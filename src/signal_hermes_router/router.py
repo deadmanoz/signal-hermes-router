@@ -2156,8 +2156,7 @@ class SignalHermesRouter:
         # later reload's own reaper drains and evicts it. The same holds when
         # the drain timed out: keys past the wedged one stay un-drained, and
         # evicting them here would punish a healthy turn for an unrelated
-        # wedge; they are reaped once the wedged turn finishes or a later
-        # reload re-drains them.
+        # wedge; a later reload re-drains them.
         evicted = self.sessions.drop_sessions_not_in(
             live_keys, only_route_keys=drained
         )

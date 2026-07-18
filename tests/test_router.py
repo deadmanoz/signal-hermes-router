@@ -6520,8 +6520,10 @@ routes:
                 )
                 harness.router.sessions._session_routes[session_id] = route.key
 
-            # A wedged in-flight turn holds r1's lock past the drain bound.
-            await harness.router._route_locks[r1.key].acquire()
+            # A wedged in-flight turn holds r2's lock past the drain bound.
+            # r1 sorts first ("signal:group-one" < "signal:group-two"), so
+            # the drain reaches it before the wedge.
+            await harness.router._route_locks[r2.key].acquire()
             routes_path.write_text(
                 """
 routes:
@@ -6545,15 +6547,17 @@ routes:
                 self.assertEqual(len(reapers), 1)
                 await asyncio.wait_for(asyncio.gather(*reapers), timeout=5)
 
-            # The drain timed out on r1's lock: NOTHING may be evicted or
-            # retired — r2's healthy session must not pay for r1's wedge.
-            self.assertEqual(harness.profile.released_session_ids, [])
-            self.assertEqual(set(harness.router.sessions._sessions), {"session-1", "session-2"})
-            self.assertEqual(harness.supervisor.retired, [])
+            # Partial drain: r1 was actually drained, so its session and
+            # profile are reaped; the drain timed out on r2's lock, so r2's
+            # healthy session and profile must NOT pay for the wedge.
+            self.assertEqual(harness.profile.released_session_ids, ["session-1"])
+            self.assertEqual(set(harness.router.sessions._sessions), {"session-2"})
+            self.assertEqual(harness.supervisor.retired, ["p1"])
+            self.assertEqual(harness.supervisor.cached, ["p2"])
 
-            # Once the wedge clears, a later reload's reaper drains both
-            # routes and completes the cleanup.
-            harness.router._route_locks[r1.key].release()
+            # Once the wedge clears, a later reload's reaper drains r2 and
+            # completes the cleanup.
+            harness.router._route_locks[r2.key].release()
             response = await harness.router._handle_reload_config_control({})
             self.assertEqual(response["status"], "ok")
             reapers = [t for t in harness.router._reap_tasks if not t.done()]
