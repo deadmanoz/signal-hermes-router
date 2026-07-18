@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import stat
 import sys
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -265,7 +265,14 @@ class FakeSupervisor:
     def cached_profile_names(self) -> list[str]:
         return list(self.cached)
 
-    async def retire_profile(self, profile_name: str) -> bool:
+    async def retire_profile(
+        self,
+        profile_name: str,
+        *,
+        should_retire: Callable[[], bool] | None = None,
+    ) -> bool:
+        if should_retire is not None and not should_retire():
+            return False
         if profile_name not in self.cached:
             return False
         self.cached.remove(profile_name)

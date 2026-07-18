@@ -212,15 +212,27 @@ class ProfileSupervisor:
         """Names of profiles with a cached subprocess entry, live or dead."""
         return list(self._profiles)
 
-    async def retire_profile(self, profile_name: str) -> bool:
+    async def retire_profile(
+        self,
+        profile_name: str,
+        *,
+        should_retire: Callable[[], bool] | None = None,
+    ) -> bool:
         """Close and evict the cached subprocess for a profile that no route
         can use anymore (a live config reload left it with no active routes).
         Returns True when a cached entry was retired. Unlike restart_profile
         there is no successor acquisition, so the profile simply goes away.
         Serialized per profile name with get_profile: without the lock a
         concurrent turn could observe the empty cache slot and spawn a second
-        subprocess while this one is still closing."""
+        subprocess while this one is still closing. When should_retire is
+        given it is re-evaluated UNDER that same lock immediately before the
+        pop: a caller that checked liveness without the lock (the reload
+        reaper reads the current config outside it) can otherwise close a
+        subprocess a concurrent reload made live again while retirement
+        waited on the lock. A False verdict leaves the cache untouched."""
         async with self._acquire_locks[profile_name]:
+            if should_retire is not None and not should_retire():
+                return False
             existing = self._profiles.pop(profile_name, None)
             if existing is None:
                 return False
@@ -379,6 +391,26 @@ class SessionRegistry:
             cached_sessions=len(keys),
         )
 
+    def route_keys_with_mismatched_policy(
+        self, current_policies: dict[str, SessionPolicy]
+    ) -> set[str]:
+        """Configured route keys holding at least one cached session whose
+        creation-time session_policy differs from the route's current policy.
+
+        Unlike an old-vs-new config diff, this sees keys that were removed
+        and re-added across reloads (no old-config entry to compare) and
+        mismatches a previous reaper left behind after a drain timeout: the
+        stale sessions are still cached, so every reload re-discovers them.
+        """
+        mismatched: set[str] = set()
+        for session_key, route_key in self._session_routes.items():
+            session = self._sessions.get(session_key)
+            if session is None or route_key not in current_policies:
+                continue
+            if session.policy != current_policies[route_key]:
+                mismatched.add(route_key)
+        return mismatched
+
     def drop_sessions_not_in(
         self, live_route_keys: set[str], *, only_route_keys: set[str] | None = None
     ) -> int:
@@ -392,8 +424,10 @@ class SessionRegistry:
         the session of a route disabled by a LATER reload, whose in-flight
         turn it never drained."""
         return self._drop_sessions_matching(
-            lambda _sk, route_key, _s: route_key not in live_route_keys
-            and (only_route_keys is None or route_key in only_route_keys)
+            lambda _sk, route_key, _s: (
+                route_key not in live_route_keys
+                and (only_route_keys is None or route_key in only_route_keys)
+            )
         )
 
     def drop_sessions_with_mismatched_policy(
@@ -417,9 +451,7 @@ class SessionRegistry:
             )
         )
 
-    def _drop_sessions_matching(
-        self, predicate: Callable[[str, str, RoutedSession], bool]
-    ) -> int:
+    def _drop_sessions_matching(self, predicate: Callable[[str, str, RoutedSession], bool]) -> int:
         evicted = 0
         for session_key, route_key in list(self._session_routes.items()):
             session = self._sessions.get(session_key)

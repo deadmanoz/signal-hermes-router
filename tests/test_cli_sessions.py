@@ -93,6 +93,7 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
                 encoding="utf-8",
             )
             from signal_hermes_router.config import load_app_config
+
             app = load_app_config(config_path, routes_path)
             instances: list[SignalHermesRouter] = []
 
@@ -143,6 +144,9 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
 
                 async def run_forever(self) -> None:
                     self.ran = True
+
+                def set_config_paths(self, config_path: Path, routes_path: Path) -> None:
+                    self.config_paths = (config_path, routes_path)
 
                 async def close(self) -> None:
                     self.closed = True
@@ -204,9 +208,7 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
         status.assert_awaited_once_with(status_args)
 
         reload_args = argparse.Namespace(command="reload-config")
-        with patch.object(
-            cli_module, "_reload_config", AsyncMock(return_value=0)
-        ) as reload_cfg:
+        with patch.object(cli_module, "_reload_config", AsyncMock(return_value=0)) as reload_cfg:
             self.assertEqual(await cli_module._main_async(reload_args), 0)
         reload_cfg.assert_awaited_once_with(reload_args)
 
@@ -485,12 +487,92 @@ class CliTests(unittest.IsolatedAsyncioTestCase):
                 [
                     {
                         "command": "reload_config",
-                        "candidate_routes": str(
-                            Path("~/routes.yaml").expanduser().resolve()
-                        ),
+                        "candidate_routes": str(Path("~/routes.yaml").expanduser().resolve()),
                     }
                 ],
             )
+
+    async def test_reload_config_cli_ignores_unresolvable_router_secret(self) -> None:
+        # The documented reload command must reach the daemon even when a
+        # startup-only env:///op:// router value in config.yaml is no longer
+        # resolvable locally: socket discovery reads only the control values.
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "control.sock"
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  signal_base_url: env://SHR_TEST_UNSET_ROUTER_SECRET\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  control:\n"
+                "    socket_path: " + str(socket_path) + "\n",
+                encoding="utf-8",
+            )
+            requests: list[dict] = []
+
+            async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                requests.append(json.loads((await reader.readline()).decode("utf-8")))
+                writer.write(b'{"status":"ok","generation":1,"route_count":1}\n')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_unix_server(handle, path=str(socket_path))
+            async with server:
+                args = argparse.Namespace(
+                    command="reload-config",
+                    config=config_path,
+                    control_socket=None,
+                    candidate_routes=None,
+                    client_timeout=1.5,
+                )
+                exit_code = await cli_module._reload_config(args)
+                server.close()
+                await server.wait_closed()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(requests, [{"command": "reload_config"}])
+
+    async def test_route_status_cli_ignores_unresolvable_payload_cap(self) -> None:
+        # route-status only needs the socket path: an expired env:///op://
+        # ref in the notify-only payload cap must not fail it locally.
+        with tempfile.TemporaryDirectory() as tmp:
+            socket_path = Path(tmp) / "control.sock"
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  control:\n"
+                "    socket_path: " + str(socket_path) + "\n"
+                "    max_notification_payload_bytes: env://SHR_TEST_UNSET_CAP_SECRET\n",
+                encoding="utf-8",
+            )
+            requests: list[dict] = []
+
+            async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                requests.append(json.loads((await reader.readline()).decode("utf-8")))
+                writer.write(b'{"status":"ok","routes":[],"route_count":0}\n')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_unix_server(handle, path=str(socket_path))
+            async with server:
+                args = argparse.Namespace(
+                    command="route-status",
+                    config=config_path,
+                    control_socket=None,
+                    route=(),
+                    route_index=(),
+                    profile=(),
+                    client_timeout=1.5,
+                    json=True,
+                )
+                exit_code = await cli_module._route_status(args)
+                server.close()
+                await server.wait_closed()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(requests, [{"command": "route_status"}])
 
     async def test_route_status_via_control_socket_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -769,7 +851,7 @@ router:
                 client_timeout=cli_module.DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
             )
             with (
-                patch.object(cli_module, "load_router_config", side_effect=AssertionError),
+                patch.object(cli_module, "load_control_discovery", side_effect=AssertionError),
                 patch.object(
                     cli_module,
                     "notify_route_via_control_socket",
@@ -792,7 +874,7 @@ router:
             large_value = "x" * (DEFAULT_MAX_NOTIFICATION_PAYLOAD_BYTES + 1)
             payload_file.write_text(json.dumps({"a": large_value}), encoding="utf-8")
             with (
-                patch.object(cli_module, "load_router_config", side_effect=AssertionError),
+                patch.object(cli_module, "load_control_discovery", side_effect=AssertionError),
                 patch.object(
                     cli_module,
                     "notify_route_via_control_socket",
@@ -830,7 +912,7 @@ router:
             )
 
             with (
-                patch.object(cli_module, "load_router_config", side_effect=AssertionError),
+                patch.object(cli_module, "load_control_discovery", side_effect=AssertionError),
                 patch.object(
                     cli_module,
                     "notify_route_via_control_socket",
@@ -867,7 +949,7 @@ router:
             )
 
             with (
-                patch.object(cli_module, "load_router_config", side_effect=AssertionError),
+                patch.object(cli_module, "load_control_discovery", side_effect=AssertionError),
                 patch.object(cli_module, "notify_route_via_control_socket", AsyncMock()) as notify,
                 patch.object(cli_module.logging, "error"),
             ):
@@ -1922,6 +2004,9 @@ class _FakeServeRouter:
 
     def begin_shutdown(self) -> None:
         self.begin_shutdown_calls += 1
+
+    def set_config_paths(self, config_path: Path, routes_path: Path) -> None:
+        self.config_paths = (config_path, routes_path)
 
     async def run_forever(self) -> None:
         self.started.set()

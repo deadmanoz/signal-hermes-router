@@ -13,7 +13,7 @@ import signal
 from pathlib import Path
 from typing import Any
 
-from .config import load_app_config, load_router_config
+from .config import load_app_config, load_control_discovery
 from .models import TurnOutcomeStatus
 from .payloads import (
     canonicalize_notification_payload,
@@ -163,7 +163,7 @@ async def _run(config_path: Path, routes_path: Path) -> None:
         config.router.allow_remote_signal_base_url,
     )
     router = SignalHermesRouter(config)
-    router._config_paths = (config_path, routes_path)
+    router.set_config_paths(config_path, routes_path)
     loop = asyncio.get_running_loop()
     serve_task = asyncio.current_task()
     assert serve_task is not None
@@ -229,9 +229,7 @@ def _resolve_client_timeout(args: argparse.Namespace) -> float | None:
 
 async def _trigger_job(args: argparse.Namespace) -> int:
     try:
-        socket_path = (
-            args.control_socket or load_router_config(args.config).control_socket_path
-        ).expanduser()
+        socket_path = (args.control_socket or load_control_discovery(args.config)[0]).expanduser()
         scheduled_at = parse_scheduled_at(args.scheduled_at) if args.scheduled_at else None
         client_timeout = _resolve_client_timeout(args)
         response = await trigger_job_via_control_socket(
@@ -256,9 +254,10 @@ async def _notify_route(args: argparse.Namespace) -> int:
             socket_path = args.control_socket.expanduser()
             max_payload_bytes = None
         else:
-            router_config = load_router_config(args.config)
-            socket_path = router_config.control_socket_path.expanduser()
-            max_payload_bytes = router_config.control.max_notification_payload_bytes
+            discovered_socket, max_payload_bytes = load_control_discovery(
+                args.config, resolve_payload_cap=True
+            )
+            socket_path = discovered_socket.expanduser()
         client_timeout = _resolve_client_timeout(args)
         raw_payload = json.loads(args.payload_file.read_text(encoding="utf-8"))
         payload = canonicalize_notification_payload(
@@ -327,9 +326,7 @@ async def _preflight_permissions(args: argparse.Namespace) -> int:
 
 async def _route_status(args: argparse.Namespace) -> int:
     try:
-        socket_path = (
-            args.control_socket or load_router_config(args.config).control_socket_path
-        ).expanduser()
+        socket_path = (args.control_socket or load_control_discovery(args.config)[0]).expanduser()
         client_timeout = _resolve_client_timeout(args)
         response = await route_status_via_control_socket(
             socket_path,
@@ -351,9 +348,7 @@ async def _route_status(args: argparse.Namespace) -> int:
 
 async def _reload_config(args: argparse.Namespace) -> int:
     try:
-        socket_path = (
-            args.control_socket or load_router_config(args.config).control_socket_path
-        ).expanduser()
+        socket_path = (args.control_socket or load_control_discovery(args.config)[0]).expanduser()
         client_timeout = _resolve_client_timeout(args)
         response = await reload_config_via_control_socket(
             socket_path,

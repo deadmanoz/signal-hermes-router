@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import re
@@ -292,6 +293,80 @@ def load_app_config(config_path: Path, routes_path: Path) -> AppConfig:
         scheduled_jobs=tuple(parse_scheduled_jobs(raw_routes, routes)),
         notifications=tuple(parse_notifications(raw_routes, routes)),
     )
+
+
+def raw_config_fingerprint(config_path: Path) -> str:
+    """Canonical fingerprint of the raw, UNRESOLVED ``config.yaml`` mapping.
+
+    Live reload compares fingerprints instead of re-parsing and re-resolving
+    the router-level config: the running router already holds a validated
+    ``RouterConfig``, and route reload availability must not depend on
+    startup-only ``env://``/``op://`` values still being resolvable. Any
+    structural or scalar change to the file (short of formatting and
+    comments) changes the fingerprint, so the ``router_config_changed``
+    rejection still fires for edits a parsed comparison would ignore.
+    """
+    raw = _load_yaml(config_path)
+    canonical = json.dumps(raw, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def load_routes_config(routes_path: Path, router: RouterConfig) -> AppConfig:
+    """Parse ``routes.yaml`` against an already-validated ``RouterConfig``.
+
+    This is the live-reload parse path: route-level secret refs are resolved
+    (they may legitimately change between reloads), but the router-level
+    config is taken from the running router, not re-read and re-resolved.
+    """
+    raw_routes = resolve_secret_refs(_load_yaml(routes_path))
+    routes = tuple(parse_routes(raw_routes))
+    return AppConfig(
+        router=router,
+        routes=routes,
+        scheduled_jobs=tuple(parse_scheduled_jobs(raw_routes, routes)),
+        notifications=tuple(parse_notifications(raw_routes, routes)),
+    )
+
+
+def load_control_discovery(
+    config_path: Path, *, resolve_payload_cap: bool = False
+) -> tuple[Path, int | None]:
+    """Discover the control socket path and, on request, the client-side
+    notification payload cap from the raw ``config.yaml``.
+
+    Control-socket CLI commands talk to the already-running daemon, so they
+    must keep working when a startup-only ``env://``/``op://`` value
+    elsewhere in ``config.yaml`` is no longer resolvable locally — the same
+    guarantee the daemon-side reload keeps. Only the values that locate the
+    socket are read; secret refs in THOSE values are still resolved, since
+    they are needed to connect. The notify-only payload cap is parsed only
+    when ``resolve_payload_cap`` is set (the ``notify-route`` prevalidation
+    path): every other command ignores the cap, so an expired or invalid
+    cap value must not fail them locally before they reach the socket. When
+    the cap is requested but the field is absent, the default cap is
+    returned — omitting the field must not disable the client-side
+    prevalidation the full config parse would apply.
+    """
+    raw = _load_yaml(config_path)
+    router_raw = raw.get("router") or raw
+    if not isinstance(router_raw, dict):
+        raise ValueError(f"{config_path} router section must be a mapping")
+    control = router_raw.get("control") or {}
+    cap = None
+    if resolve_payload_cap:
+        payload_cap = control.get("max_notification_payload_bytes")
+        if payload_cap is None:
+            cap = DEFAULT_MAX_NOTIFICATION_PAYLOAD_BYTES
+        else:
+            cap = _as_positive_int(
+                resolve_secret_refs(payload_cap),
+                "router.control.max_notification_payload_bytes",
+            )
+    socket_path = control.get("socket_path")
+    if socket_path not in (None, ""):
+        return Path(str(resolve_secret_refs(socket_path))), cap
+    work_root = router_raw.get("work_root", RouterConfig().work_root)
+    return Path(str(resolve_secret_refs(work_root))) / "control.sock", cap
 
 
 def load_router_config(config_path: Path) -> RouterConfig:
