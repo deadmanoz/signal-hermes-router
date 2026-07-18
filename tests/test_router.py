@@ -6345,14 +6345,19 @@ routes:
             self.assertEqual(response["status"], "ok")
 
             await turn_task
-            # The failure reply still went out, but no MAINTENANCE override
-            # survived to mask the reloaded state.
-            self.assertEqual(len(harness.signal.sends), 1)
+            # The failure reply still went out (the maintenance text on
+            # trip), but no MAINTENANCE override survived to mask the
+            # reloaded state.
+            self.assertEqual(
+                harness.signal.sends,
+                [("group-one", "This route is temporarily under maintenance.")],
+            )
             self.assertIsNone(harness.router.route_state_overrides.get(route.key))
             self.assertNotIn(route.key, harness.router._trip_times)
 
-            # Flip back to active: a fresh failure now trips the breaker for
-            # real, proving the guard only blocks non-active routes.
+            # Flip back to active: another failure trips the breaker for
+            # real (the window still holds the earlier failures), proving
+            # the guard only blocks non-active routes.
             routes_path.write_text(
                 """
 routes:
