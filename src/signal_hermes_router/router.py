@@ -2126,6 +2126,7 @@ class SignalHermesRouter:
             await asyncio.wait(
                 pending_turns, timeout=max(0.0, deadline - time.monotonic())
             )
+        drained: set[str] = set()
         for key in drain_keys:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -2136,11 +2137,12 @@ class SignalHermesRouter:
             except TimeoutError:
                 LOGGER.warning(
                     "config reload reap timed out waiting for in-flight turn "
-                    "on route %s; reaping anyway",
+                    "on route %s; leaving un-drained routes to a later reap",
                     self.redactor.ref("route", key),
                 )
                 break
             lock.release()
+            drained.add(key)
         # Re-validate against the CURRENT config: a later reload may have
         # re-activated routes while the drain was in flight; never evict a
         # session or retire a profile that is live again.
@@ -2151,8 +2153,11 @@ class SignalHermesRouter:
         # reload may have disabled ANOTHER route while this reaper waited,
         # and this reaper never waited out that route's in-flight turn —
         # evicting its session here would truncate the reply mid-prompt. The
-        # later reload's own reaper drains and evicts it.
-        drained = set(drain_keys)
+        # later reload's own reaper drains and evicts it. The same holds when
+        # the drain timed out: keys past the wedged one stay un-drained, and
+        # evicting them here would punish a healthy turn for an unrelated
+        # wedge; they are reaped once the wedged turn finishes or a later
+        # reload re-drains them.
         evicted = self.sessions.drop_sessions_not_in(
             live_keys, only_route_keys=drained
         )

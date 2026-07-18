@@ -6466,6 +6466,105 @@ routes:
             self.assertEqual(harness.supervisor.retired, ["p1"])
             self.assertEqual(harness.router._reap_tasks, set())
 
+    async def test_reload_config_reap_timeout_evicts_only_actually_drained_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-one
+    profile: p1
+    state: active
+  - name: r2
+    platform: signal
+    group_id: group-two
+    profile: p2
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            from signal_hermes_router.sessions import RoutedSession
+            r1 = harness.router.config.find_route_by_name("r1")
+            r2 = harness.router.config.find_route_by_name("r2")
+            assert r1 is not None and r2 is not None
+            for route, profile_name, session_id in (
+                (r1, "p1", "session-1"),
+                (r2, "p2", "session-2"),
+            ):
+                harness.supervisor.cached.append(profile_name)
+                harness.router.sessions._sessions[session_id] = RoutedSession(
+                    profile=harness.profile,  # type: ignore[arg-type]
+                    session_id=session_id,
+                    cwd=Path(tmp) / "work" / session_id,
+                )
+                harness.router.sessions._session_routes[session_id] = route.key
+
+            # A wedged in-flight turn holds r1's lock past the drain bound.
+            await harness.router._route_locks[r1.key].acquire()
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-one
+    profile: p1
+    state: disabled
+  - name: r2
+    platform: signal
+    group_id: group-two
+    profile: p2
+    state: disabled
+""",
+                encoding="utf-8",
+            )
+            with patch.object(harness.router, "_reap_drain_seconds", return_value=0.2):
+                response = await harness.router._handle_reload_config_control({})
+                self.assertEqual(response["status"], "ok")
+                reapers = [t for t in harness.router._reap_tasks if not t.done()]
+                self.assertEqual(len(reapers), 1)
+                await asyncio.wait_for(asyncio.gather(*reapers), timeout=5)
+
+            # The drain timed out on r1's lock: NOTHING may be evicted or
+            # retired — r2's healthy session must not pay for r1's wedge.
+            self.assertEqual(harness.profile.released_session_ids, [])
+            self.assertEqual(set(harness.router.sessions._sessions), {"session-1", "session-2"})
+            self.assertEqual(harness.supervisor.retired, [])
+
+            # Once the wedge clears, a later reload's reaper drains both
+            # routes and completes the cleanup.
+            harness.router._route_locks[r1.key].release()
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            reapers = [t for t in harness.router._reap_tasks if not t.done()]
+            self.assertEqual(len(reapers), 1)
+            await asyncio.wait_for(asyncio.gather(*reapers), timeout=5)
+            self.assertEqual(harness.router.sessions._sessions, {})
+            self.assertCountEqual(
+                harness.profile.released_session_ids, ["session-1", "session-2"]
+            )
+            self.assertCountEqual(harness.supervisor.retired, ["p1", "p2"])
+
     async def test_reload_config_serializes_concurrent_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.yaml"
