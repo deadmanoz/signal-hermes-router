@@ -6278,6 +6278,100 @@ routes:
             self.assertEqual(outcome.status, TurnOutcomeStatus.ERROR)
             self.assertEqual(outcome.error, "unknown_job")
 
+    async def test_reload_config_late_breaker_trip_does_not_mask_reloaded_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-one
+    profile: p1
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            route = harness.router.config.find_route_by_name("r1")
+            assert route is not None
+            # One failure short of the trip threshold.
+            harness.router.circuit.record_failure(route.key)
+            harness.router.circuit.record_failure(route.key)
+
+            # A turn admitted while the route is active fails slowly; the
+            # reload disabling the route lands before the failure handler
+            # runs, so the trip must not mask the reloaded DISABLED state.
+            harness.profile.fail = True
+            harness.profile.prompt_delay = 0.2
+            turn_task = asyncio.create_task(
+                harness.router.handle_event(make_event(group_id="group-one", timestamp=1))
+            )
+            for _ in range(100):
+                if harness.profile.prompts:
+                    break
+                await asyncio.sleep(0.001)
+            self.assertTrue(harness.profile.prompts)
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-one
+    profile: p1
+    state: disabled
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+
+            await turn_task
+            # The failure reply still went out, but no MAINTENANCE override
+            # survived to mask the reloaded state.
+            self.assertEqual(len(harness.signal.sends), 1)
+            self.assertIsNone(harness.router.route_state_overrides.get(route.key))
+            self.assertNotIn(route.key, harness.router._trip_times)
+
+            # Flip back to active: a fresh failure now trips the breaker for
+            # real, proving the guard only blocks non-active routes.
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-one
+    profile: p1
+    state: active
+""",
+                encoding="utf-8",
+            )
+            response = await harness.router._handle_reload_config_control({})
+            self.assertEqual(response["status"], "ok")
+            await harness.router.handle_event(make_event(group_id="group-one", timestamp=2))
+            self.assertEqual(
+                harness.router.route_state_overrides.get(route.key),
+                RouteState.MAINTENANCE,
+            )
+
     async def test_reload_config_serializes_concurrent_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.yaml"

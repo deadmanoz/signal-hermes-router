@@ -502,10 +502,12 @@ async def reload_config_via_control_socket(
 ) -> dict[str, Any]:
     request: dict[str, Any] = {"command": "reload_config"}
     if candidate_routes is not None:
-        # Resolve to an absolute path in the operator's shell: the router
-        # rejects relative overrides because they would resolve against the
-        # long-lived daemon's cwd, not the directory the operator ran from.
-        request["candidate_routes"] = str(candidate_routes.resolve())
+        # Expand ~ and resolve to an absolute path in the operator's shell:
+        # Path.resolve() alone does not expand the home directory, and the
+        # router rejects relative overrides because they would resolve
+        # against the long-lived daemon's cwd, not the directory the
+        # operator ran from.
+        request["candidate_routes"] = str(candidate_routes.expanduser().resolve())
     return await _control_round_trip(socket_path, request, client_timeout=client_timeout)
 
 

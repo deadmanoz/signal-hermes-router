@@ -1722,14 +1722,30 @@ class SignalHermesRouter:
         last_failure_at_ms = self._record_route_failure(route, failure)
         trip = self.circuit.record_failure(route.key)
         if trip:
-            self.route_state_overrides[route.key] = RouteState.MAINTENANCE
-            self._trip_times[route.key] = time.monotonic()
-            self._trip_times_ms[route.key] = self._clock_ms()
-            LOGGER.error(
-                "route %s tripped circuit breaker after %s failures",
-                self.redactor.ref("route", route.key),
-                trip.failures,
+            # This turn was admitted under a possibly-stale config: a reload
+            # may have since disabled, shadowed, or removed the route, and
+            # the swap's override-clearing loop has already run. The
+            # maintenance override exists to mask an ACTIVE route whose
+            # profile keeps failing — never let a late trip mask the
+            # operator's reloaded state.
+            current = next(
+                (r for r in self.config.routes if r.key == route.key), None
             )
+            if current is None or current.state != RouteState.ACTIVE:
+                LOGGER.info(
+                    "route %s tripped circuit breaker but is not active in the "
+                    "current config; not masking the reloaded state",
+                    self.redactor.ref("route", route.key),
+                )
+            else:
+                self.route_state_overrides[route.key] = RouteState.MAINTENANCE
+                self._trip_times[route.key] = time.monotonic()
+                self._trip_times_ms[route.key] = self._clock_ms()
+                LOGGER.error(
+                    "route %s tripped circuit breaker after %s failures",
+                    self.redactor.ref("route", route.key),
+                    trip.failures,
+                )
             reply_text = route.maintenance_reply or self.config.router.maintenance_reply
         else:
             reply_text = self._failure_reply_for(route, failure)
