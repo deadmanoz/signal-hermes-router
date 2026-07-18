@@ -342,6 +342,14 @@ class SignalHermesRouter:
                 drain_deadline,
                 "control client",
             )
+            # A reload request drained above can schedule a retire reaper
+            # during its swap — after the _signal_turn_tasks snapshot at the
+            # top of this method. Drain those reapers now that no reload
+            # request can still be running, so session/profile cleanup does
+            # not race session/supervisor teardown below.
+            stragglers |= await self._drain_tasks(
+                set(self._reap_tasks), drain_deadline, "reload reap"
+            )
             for task in (
                 self._signal_events_task,
                 self._control_server_task,

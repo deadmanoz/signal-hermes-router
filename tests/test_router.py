@@ -6377,6 +6377,95 @@ routes:
                 RouteState.MAINTENANCE,
             )
 
+    async def test_close_drains_reaper_scheduled_by_inflight_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            routes_path = Path(tmp) / "routes.yaml"
+            config_path.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  state_db: " + str(Path(tmp) / "state.db") + "\n"
+                "  media_root: " + str(Path(tmp) / "media") + "\n"
+                "  signal_attachment_root: " + str(Path(tmp) / "signal-attachments") + "\n"
+                "  signal_base_url: http://127.0.0.1:8080\n"
+                "  allow_remote_signal_base_url: false\n"
+                "  circuit_breaker:\n"
+                "    failures: 3\n"
+                "    window_seconds: 60\n",
+                encoding="utf-8",
+            )
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-one
+    profile: p1
+    state: active
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config
+            app = load_app_config(config_path, routes_path)
+            harness = make_router_harness(tmp, app=app)
+            harness.router._config_paths = (config_path, routes_path)
+
+            route = harness.router.config.find_route_by_name("r1")
+            assert route is not None
+            harness.supervisor.cached.append("p1")
+            from signal_hermes_router.sessions import RoutedSession
+            harness.router.sessions._sessions["sk"] = RoutedSession(
+                profile=harness.profile,  # type: ignore[arg-type]
+                session_id="session-1",
+                cwd=Path(tmp) / "work" / "sk",
+            )
+            harness.router.sessions._session_routes["sk"] = route.key
+
+            # The candidate disables r1; a slow parse keeps the reload
+            # request in flight when shutdown begins, so its reaper is
+            # scheduled only after close()'s first task snapshot.
+            routes_path.write_text(
+                """
+routes:
+  - name: r1
+    platform: signal
+    group_id: group-one
+    profile: p1
+    state: disabled
+""",
+                encoding="utf-8",
+            )
+            from signal_hermes_router.config import load_app_config as real_load
+
+            def slow_load(*args: Any, **kwargs: Any) -> Any:
+                time.sleep(0.3)
+                return real_load(*args, **kwargs)
+
+            with patch.object(router_module, "load_app_config", slow_load):
+                reload_req = asyncio.ensure_future(
+                    harness.router._handle_reload_config_control({})
+                )
+                harness.router._control_request_tasks.add(reload_req)
+                reload_req.add_done_callback(harness.router._settle_tracked_task)
+
+                close_task = asyncio.create_task(harness.router.close())
+                await asyncio.sleep(0.1)
+                # A turn admitted after the first snapshot: the reaper waits
+                # on it, so only an explicit reap drain after the
+                # control-request drain lets close() return with the cleanup
+                # actually finished.
+                blocker = asyncio.ensure_future(asyncio.sleep(1.0))
+                harness.router._signal_turn_tasks.add(blocker)
+                blocker.add_done_callback(harness.router._settle_tracked_task)
+
+                await asyncio.wait_for(close_task, timeout=15)
+
+            self.assertTrue(reload_req.done())
+            self.assertEqual(harness.router.sessions._sessions, {})
+            self.assertEqual(harness.profile.released_session_ids, ["session-1"])
+            self.assertEqual(harness.supervisor.retired, ["p1"])
+            self.assertEqual(harness.router._reap_tasks, set())
+
     async def test_reload_config_serializes_concurrent_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.yaml"
