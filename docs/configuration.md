@@ -61,8 +61,9 @@ from the router's perspective and is not created or chmodded by the router.
   (`signal_hermes_router.sessions`).
 - `router.control.socket_path` (default `router.work_root / "control.sock"`
   when control is enabled and no explicit path is set) - local Unix socket
-  used by `signal-hermes-router trigger-job` and `notify-route` to ask the
-  running router to inject a configured synthetic turn.
+  used by `signal-hermes-router trigger-job`, `notify-route`, `route-status`,
+  `reload-config`, and `preflight-permissions` to interact with the running
+  router.
 - `router.signal_attachment_root` (default
   `~/.local/share/signal-cli/attachments`) - read-only path used to resolve
   signal-cli events that reference an attachment by ID instead of carrying
@@ -521,46 +522,11 @@ limit before writing to the socket. The router repeats that validation and
 returns a JSON `payload_too_large` error for marginally over-limit requests
 that fit inside the control request headroom.
 
-`notify-route --attachment` accepts one image path. The router rejects
-non-arrays from the control socket, multiple paths, non-string or relative
-paths, paths that escape `router.media_root`, missing paths, non-files,
-oversize files, non-private file or parent modes, and paths whose filename
-does not infer an `image/*` content type. MIME gating is filename-based through
-Python's `mimetypes`; stage PNG, JPEG, GIF, or WebP files rather than relying
-on magic-byte sniffing or platform HEIC mappings. The producer must stage
-images under `router.media_root` using `0700` directories and `0600` files.
-
-Before the ACP turn runs, the router copies each accepted image to a private
-router-owned `.outbound` artifact under `router.media_root`. Signal-cli sees
-that frozen path, not the producer's original path, and the router deletes the
-frozen artifact after the send attempt. Attachment sends require a loopback
-`router.signal_base_url` because signal-cli must read the same filesystem path;
-remote signal-cli base URLs are rejected for attachment-bearing notifications
-even when `allow_remote_signal_base_url` permits text-only routing.
+`notify-route --attachment` accepts one image path. See [docs/media.md](media.md#outbound-notification-images) for the full staging contract, validation rules, `.outbound` artifact behavior, and remote-signal-cli restrictions.
 
 `preflight-permissions` compares configured permission tool names against a
-version 1 ACP tool-surface contract in offline mode, or against versioned
-tool-surface data from profiles managed by the running router when invoked
-through the control socket. The offline form and the `agentCapabilities._meta`
-live form must declare `schema_version: 1` and `scope: full_callable`. The
-`_tool_surface/list` live form may use the Hermes-native `{tools: [...]}` shape;
-the router normalizes this into the version-1 `full_callable` contract because
-the dedicated extension method is semantically the complete callable catalog. The
-scope means the complete dispatchable catalog, not the compressed tool list shown
-to a model by Tool Search. The live path uses the router's normal
-`ProfileSupervisor`, so probing an idle profile can start that profile's ACP
-subprocess and supervisor cooldowns still apply. If a profile is already
-handling a turn when preflight starts probing it, live preflight reports
-`probe_profile_busy` instead of waiting behind that turn. Live profile
-inspection reads `agentCapabilities._meta` first and then tries the optional
-JSON-RPC extension method `_tool_surface/list`. Agents that expose neither
-source report `probe_unsupported`. Unversioned surfaces from `agentCapabilities._meta`,
-the offline contract file, or generic external input, along with unsupported,
-model-facing, or ambiguous surfaces from any source, fail with a `probe_contract_*`
-error and produce no missing-tool findings; the sole exception is the Hermes-native
-`{tools: [...]}` shape returned by `_tool_surface/list`, which is normalized rather
-than rejected. See [Permissions](permissions.md#permission-preflight)
-for the contract shape and production transition checklist.
+version 1 ACP tool-surface contract. See [Permissions](permissions.md#permission-preflight)
+for the contract shape, live-probe behavior, and production transition checklist.
 
 Reports use only `route:<name>` or `routes[<index>]` references, profile names,
 source IDs, and tool names. They do not report raw Signal IDs, direct sender
