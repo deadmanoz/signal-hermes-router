@@ -5,10 +5,12 @@ import unittest
 from pathlib import Path
 
 from signal_hermes_router.config import (
+    DEFAULT_MAX_NOTIFICATION_PAYLOAD_BYTES,
     AppConfig,
     Route,
     RouterConfig,
     load_app_config,
+    load_control_discovery,
     load_router_config,
     normalize_profile_name,
     parse_notifications,
@@ -151,6 +153,106 @@ router:
 
             self.assertTrue(router.control.enabled)
             self.assertEqual(router.control_socket_path, Path("private-work") / "control.sock")
+
+    def test_load_control_discovery_skips_unresolvable_router_secrets(self) -> None:
+        # Control-socket CLI commands talk to the already-running daemon, so
+        # an unresolvable startup-only secret elsewhere in config.yaml must
+        # not break socket discovery.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            config.write_text(
+                "router:\n"
+                "  signal_base_url: env://SHR_TEST_UNSET_ROUTER_SECRET\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  control:\n"
+                "    socket_path: " + str(Path(tmp) / "custom.sock") + "\n"
+                "    max_notification_payload_bytes: 4096\n",
+                encoding="utf-8",
+            )
+
+            socket_path, cap = load_control_discovery(config, resolve_payload_cap=True)
+
+            self.assertEqual(socket_path, Path(tmp) / "custom.sock")
+            self.assertEqual(cap, 4096)
+            # Socket-only callers do not need the cap: it stays unread.
+            socket_only, deferred_cap = load_control_discovery(config)
+            self.assertEqual(socket_only, Path(tmp) / "custom.sock")
+            self.assertIsNone(deferred_cap)
+
+    def test_load_control_discovery_falls_back_to_work_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            config.write_text(
+                "router:\n  work_root: " + str(Path(tmp) / "work") + "\n",
+                encoding="utf-8",
+            )
+
+            socket_path, cap = load_control_discovery(config)
+
+            self.assertEqual(socket_path, Path(tmp) / "work" / "control.sock")
+            self.assertIsNone(cap)
+
+    def test_load_control_discovery_defers_payload_cap_resolution(self) -> None:
+        # Commands that only need the socket path must not fail when the
+        # optional notify-only payload cap is an expired env:///op:// ref:
+        # the cap is parsed only for the notify-route prevalidation path.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            config.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  control:\n"
+                "    socket_path: " + str(Path(tmp) / "custom.sock") + "\n"
+                "    max_notification_payload_bytes: env://SHR_TEST_UNSET_CAP_SECRET\n",
+                encoding="utf-8",
+            )
+
+            socket_path, cap = load_control_discovery(config)
+            self.assertEqual(socket_path, Path(tmp) / "custom.sock")
+            self.assertIsNone(cap)
+            with self.assertRaises(KeyError):
+                load_control_discovery(config, resolve_payload_cap=True)
+
+    def test_load_control_discovery_defaults_payload_cap_when_field_absent(self) -> None:
+        # A config that omits max_notification_payload_bytes must still get
+        # the default cap on the notify-route prevalidation path: returning
+        # None there would silently disable the client-side payload check
+        # the full config parse applies.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            config.write_text(
+                "router:\n  work_root: " + str(Path(tmp) / "work") + "\n",
+                encoding="utf-8",
+            )
+
+            socket_path, cap = load_control_discovery(config, resolve_payload_cap=True)
+            self.assertEqual(socket_path, Path(tmp) / "work" / "control.sock")
+            self.assertEqual(cap, DEFAULT_MAX_NOTIFICATION_PAYLOAD_BYTES)
+            # Socket-only callers still defer the cap entirely.
+            _, deferred_cap = load_control_discovery(config)
+            self.assertIsNone(deferred_cap)
+
+    def test_load_control_discovery_resolves_refs_in_socket_values(self) -> None:
+        # Secret refs in the values that locate the socket are still
+        # resolved: they are needed to connect.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            socket_file = Path(tmp) / "resolved.sock"
+            socket_file.write_text("", encoding="utf-8")
+            secret_file = Path(tmp) / "socket-path.txt"
+            secret_file.write_text(str(socket_file), encoding="utf-8")
+            config.write_text(
+                "router:\n"
+                "  work_root: " + str(Path(tmp) / "work") + "\n"
+                "  control:\n"
+                "    socket_path: file://" + str(secret_file) + "\n",
+                encoding="utf-8",
+            )
+
+            socket_path, cap = load_control_discovery(config)
+
+            self.assertEqual(socket_path, socket_file)
+            self.assertIsNone(cap)
 
     def test_app_config_find_route_returns_none_for_missing_route(self) -> None:
         app = AppConfig(

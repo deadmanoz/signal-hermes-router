@@ -69,6 +69,178 @@ from the router's perspective and is not created or chmodded by the router.
   inline bytes. The value is `expanduser`-ed at config load time. The router
   does not create or change permissions on this directory.
 
+## Live configuration reload (routes only)
+
+The router can reload its `routes.yaml` without restarting the process. This is
+useful when adding new notification definitions, scheduled jobs, or changing route
+states. Router-level settings (`config.yaml`) — including signal endpoint,
+media_root, work_root, state_db, circuit breaker thresholds, control socket
+path, and retention intervals — are bound at startup and require a process
+restart to change.
+
+### Control socket command
+
+```bash
+signal-hermes-router reload-config
+```
+
+By default the router re-reads the same `routes.yaml` it was started with.
+Override with a candidate file:
+
+```bash
+signal-hermes-router reload-config --candidate-routes /path/to/new/routes.yaml
+```
+
+The CLI resolves the override to an absolute path before sending it, and the
+router rejects a relative `candidate_routes` override outright — a relative
+path would resolve against the long-running daemon's working directory, not
+the shell the operator ran the command from:
+
+```json
+{"error": "candidate_routes_not_absolute", "generation": 0, "status": "error"}
+```
+
+### Response
+
+A successful reload returns a JSON response with a monotonic generation counter:
+
+```json
+{"generation": 1, "route_count": 3, "status": "ok"}
+```
+
+An invalid candidate leaves the active configuration unchanged and returns:
+
+```json
+{"detail": "ValueError", "error": "config_invalid", "generation": 0, "status": "error"}
+```
+
+If the candidate `routes.yaml` is paired with a different `config.yaml` (i.e.
+router-level settings changed), the reload is rejected:
+
+```json
+{"error": "router_config_changed", "generation": 0, "status": "error"}
+```
+
+If an existing route key changes its Hermes `profile`, the reload is also rejected
+because session and circuit-breaker state are keyed by route key and would become
+inconsistent:
+
+```json
+{"error": "profile_changed_for_existing_route", "generation": 0, "status": "error"}
+```
+
+The candidate parse is bounded server-side (60 s): a blocking filesystem read or
+a hung secret resolver fails the reload instead of holding every later reload
+request behind it:
+
+```json
+{"error": "config_parse_timeout", "generation": 0, "status": "error"}
+```
+
+A timed-out parse's worker thread cannot be killed, so its dedicated executor
+is detached and the next reload parses on a fresh one — an operator fix to the
+routes file or secret reference takes effect without restarting the router.
+Detachments are capped (3); beyond that the wedged executor is kept and later
+reloads fail fast instead of queueing another parse behind the hung worker:
+
+```json
+{"error": "config_parse_saturated", "generation": 0, "status": "error"}
+```
+
+The saturation clears on its own once every abandoned hung worker has exited
+and the kept executor's hung item has completed (a fixed routes file or
+secret reference unblocks it); until then, or if the wedge is permanent, the
+recovery is a router restart.
+
+Reloads never re-resolve router-level secrets: the candidate routes are parsed
+against the router's already-validated startup `RouterConfig`, and router-level
+drift is detected by fingerprinting the raw, unresolved `config.yaml` (any
+structural or scalar edit — short of formatting and comments — rejects the
+reload as `router_config_changed`). A valid routes-only change therefore
+succeeds even when a startup-only `env://`/`op://` value is no longer
+resolvable. Candidate parses run on a dedicated single-thread executor, so a
+hung resolver cannot consume the turn I/O workers that dedupe and media writes
+depend on. The control-socket CLI commands themselves (`reload-config`,
+`route-status`, `trigger-job`, `notify-route`) likewise do not resolve unrelated
+router secrets: they discover the control socket from the raw config, so they
+keep working while the daemon is up even when a startup-only secret has
+expired. Only `notify-route` additionally reads
+`router.control.max_notification_payload_bytes` for client-side payload
+prevalidation; the other commands never touch that notify-only value.
+
+### Safety guarantees
+
+- **Parse-before-swap, off the event loop**: The candidate file is fully
+  parsed and validated in a worker thread before any runtime state changes,
+  so a slow secret resolver (e.g. `op://`) or filesystem cannot stall Signal
+  event handling, control responses, or ACP timeouts. Only the validated
+  swap happens on the event loop.
+- **Routes-only**: Only routes, scheduled jobs, and notification definitions
+  may change on reload. Router-level settings remain bound to startup values.
+- **Profile stability for existing routes**: A route key that already exists
+  cannot change its `profile` on reload.  This prevents session cache and
+  circuit-breaker state from becoming inconsistent.  Remapping a group to a
+  different profile requires a process restart.
+- **In-flight preservation**: Turns already admitted use their original
+  `Route` objects; only new turns see the updated configuration. Note that
+  in-flight turns may still read a handful of router-level settings (e.g.
+  `media_root`, `max_attachment_bytes`) live from `self.config.router` across
+  await boundaries, so a reload during an active turn can observe a mix of old
+  and new values for those fields. In practice this is safe because the
+  router-level settings are rejected from changing (see Routes-only above).
+- **Retired-route cleanup**: Routes that can no longer prompt after a reload
+  (reloaded to `shadow`/`disabled`/`maintenance`, or removed) have their
+  cached sessions evicted, and a Hermes profile left with no remaining active
+  route has its cached subprocess closed. Still-active routes whose
+  `session_policy` changed have their now-unreachable cached sessions evicted
+  too — including sessions left over from a remove/re-add cycle or from a
+  previous reap that timed out, which the registry-level mismatch scan
+  rediscovers on every reload. All of this happens only after in-flight turns
+  on the affected routes drain — the reap is scheduled whenever any known
+  route key leaves the active set, so a turn admitted just before the swap
+  (still creating its session in its pre-lock awaits) is caught as well — and
+  the pre-drain wait is scoped to turns that can touch an affected route, so
+  a long turn on an unrelated active route cannot consume the drain bound.
+  The drain bound tracks the supervisor's prompt timeout plus a margin, so a
+  healthy long-running prompt is always waited out. If a turn is still
+  running when the bound expires, its route is left un-drained (its session
+  and profile stay cached) and a follow-up reap retries until it finishes.
+  The retries are bounded (3 follow-ups): a genuinely wedged turn then has
+  the cleanup completed under it — cached session evicted, profile retired —
+  so it fails through the normal broken-pipe path without pinning retired
+  runtime state forever. Profiles and sessions for routes that stayed
+  active (with unchanged policy) are untouched.
+- **Breaker-override coherence**: A stale circuit-breaker `MAINTENANCE`
+  override is cleared when the route's configured state becomes anything
+  other than `active`, so a reloaded `shadow`/`disabled` route applies
+  immediately instead of sending maintenance replies. An override on a route
+  that stayed `active` survives — reload never silently resets a tripped
+  breaker; normal recovery clears it. A turn already admitted under an open
+  breaker keeps the maintenance mask even when a concurrent reload clears
+  the override before the turn runs: queued pre-reload work never probes the
+  profile that was failing at admission.
+- **Serialized application**: Concurrent `reload-config` calls apply in
+  command order — a slower candidate parse can never swap its older
+  candidate over a newer configuration.
+- **Redacted rejection logging**: A rejected candidate's route identifiers
+  were never registered with the redactor, so rejection logging reports only
+  the exception class and never emits a traceback at any log level.
+- **Orphaned rate-limit cleanup**: Rate-limit buckets for removed routes are
+  pruned; active-route buckets survive the reload. In-flight turns refund
+  their reserved token to the exact bucket they reserved from, so a refund
+  can never mint capacity in a replacement bucket created by a later
+  remove/re-add cycle.
+- **Redaction continuity**: Route identifiers from both old and new
+  configurations remain in the redactor so no identifiers leak across reload.
+
+### Deployment sequence
+
+1. Validate the candidate `routes.yaml` locally (e.g. with a test instance or
+   by running `signal-hermes-router` in a temporary environment).
+2. Atomically replace the routes file on disk (e.g. `mv routes.yaml.new routes.yaml`).
+3. Run `signal-hermes-router reload-config`.
+4. Inspect the response `generation` to confirm the reload took effect.
+
 ## Secret resolvers
 
 String values in YAML are passed through `signal_hermes_router.secrets.resolve_secret_refs`. Supported URI schemes:

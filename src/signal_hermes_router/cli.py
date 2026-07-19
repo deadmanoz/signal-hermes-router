@@ -13,7 +13,7 @@ import signal
 from pathlib import Path
 from typing import Any
 
-from .config import load_app_config, load_router_config
+from .config import load_app_config, load_control_discovery
 from .models import TurnOutcomeStatus
 from .payloads import (
     canonicalize_notification_payload,
@@ -100,6 +100,21 @@ def main(argv: list[str] | None = None) -> None:
         help="local control socket round-trip timeout in seconds",
     )
     status.add_argument("--control-socket", type=Path)
+    reload_cfg = subparsers.add_parser(
+        "reload-config", help="atomically reload router routes configuration from disk"
+    )
+    reload_cfg.add_argument(
+        "--candidate-routes",
+        type=Path,
+        help="override routes.yaml path (defaults to router startup path)",
+    )
+    reload_cfg.add_argument(
+        "--client-timeout",
+        type=float,
+        default=DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+        help="local control socket round-trip timeout in seconds",
+    )
+    reload_cfg.add_argument("--control-socket", type=Path)
     args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
     exit_code = asyncio.run(_main_async(args))
@@ -119,6 +134,8 @@ async def _main_async(args: argparse.Namespace) -> int:
         return await _preflight_permissions(args)
     if args.command == "route-status":
         return await _route_status(args)
+    if args.command == "reload-config":
+        return await _reload_config(args)
     raise ValueError(f"unknown command {args.command!r}")
 
 
@@ -146,6 +163,7 @@ async def _run(config_path: Path, routes_path: Path) -> None:
         config.router.allow_remote_signal_base_url,
     )
     router = SignalHermesRouter(config)
+    router.set_config_paths(config_path, routes_path)
     loop = asyncio.get_running_loop()
     serve_task = asyncio.current_task()
     assert serve_task is not None
@@ -211,9 +229,7 @@ def _resolve_client_timeout(args: argparse.Namespace) -> float | None:
 
 async def _trigger_job(args: argparse.Namespace) -> int:
     try:
-        socket_path = (
-            args.control_socket or load_router_config(args.config).control_socket_path
-        ).expanduser()
+        socket_path = (args.control_socket or load_control_discovery(args.config)[0]).expanduser()
         scheduled_at = parse_scheduled_at(args.scheduled_at) if args.scheduled_at else None
         client_timeout = _resolve_client_timeout(args)
         response = await trigger_job_via_control_socket(
@@ -238,9 +254,10 @@ async def _notify_route(args: argparse.Namespace) -> int:
             socket_path = args.control_socket.expanduser()
             max_payload_bytes = None
         else:
-            router_config = load_router_config(args.config)
-            socket_path = router_config.control_socket_path.expanduser()
-            max_payload_bytes = router_config.control.max_notification_payload_bytes
+            discovered_socket, max_payload_bytes = load_control_discovery(
+                args.config, resolve_payload_cap=True
+            )
+            socket_path = discovered_socket.expanduser()
         client_timeout = _resolve_client_timeout(args)
         raw_payload = json.loads(args.payload_file.read_text(encoding="utf-8"))
         payload = canonicalize_notification_payload(
@@ -309,9 +326,7 @@ async def _preflight_permissions(args: argparse.Namespace) -> int:
 
 async def _route_status(args: argparse.Namespace) -> int:
     try:
-        socket_path = (
-            args.control_socket or load_router_config(args.config).control_socket_path
-        ).expanduser()
+        socket_path = (args.control_socket or load_control_discovery(args.config)[0]).expanduser()
         client_timeout = _resolve_client_timeout(args)
         response = await route_status_via_control_socket(
             socket_path,
@@ -328,6 +343,23 @@ async def _route_status(args: argparse.Namespace) -> int:
         print(json.dumps(response, sort_keys=True))
     else:
         print(_format_route_status_response(response))
+    return 0 if response.get("status") == "ok" else 1
+
+
+async def _reload_config(args: argparse.Namespace) -> int:
+    try:
+        socket_path = (args.control_socket or load_control_discovery(args.config)[0]).expanduser()
+        client_timeout = _resolve_client_timeout(args)
+        response = await reload_config_via_control_socket(
+            socket_path,
+            candidate_routes=args.candidate_routes,
+            client_timeout=client_timeout,
+        )
+    except Exception as exc:
+        logging.error("reload-config failed: %s", exc.__class__.__name__)
+        logging.debug("reload-config failure details", exc_info=True)
+        return 1
+    print(json.dumps(response, sort_keys=True))
     return 0 if response.get("status") == "ok" else 1
 
 
@@ -454,6 +486,23 @@ async def route_status_via_control_socket(
         request["route_indexes"] = list(route_indexes)
     if profiles:
         request["profiles"] = list(profiles)
+    return await _control_round_trip(socket_path, request, client_timeout=client_timeout)
+
+
+async def reload_config_via_control_socket(
+    socket_path: Path,
+    *,
+    candidate_routes: Path | None = None,
+    client_timeout: float | None = DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {"command": "reload_config"}
+    if candidate_routes is not None:
+        # Expand ~ and resolve to an absolute path in the operator's shell:
+        # Path.resolve() alone does not expand the home directory, and the
+        # router rejects relative overrides because they would resolve
+        # against the long-lived daemon's cwd, not the directory the
+        # operator ran from.
+        request["candidate_routes"] = str(candidate_routes.expanduser().resolve())
     return await _control_round_trip(socket_path, request, client_timeout=client_timeout)
 
 

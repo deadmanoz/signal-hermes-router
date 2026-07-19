@@ -7,10 +7,14 @@ import logging
 import math
 import socket
 import stat
+import threading
 import time
 import uuid
+import weakref
 from collections import Counter, defaultdict
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures.thread import _worker
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from functools import partial
@@ -18,7 +22,14 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from .circuit import CircuitBreaker
-from .config import AppConfig, Route, SyntheticRouteDefinition
+from .config import (
+    AppConfig,
+    Route,
+    RouterConfig,
+    SyntheticRouteDefinition,
+    load_routes_config,
+    raw_config_fingerprint,
+)
 from .context import build_prompt_blocks, build_synthetic_prompt_blocks
 from .dedupe import DedupeStore
 from .events import SignalEventSummary, parse_signal_event, probe_signal_route
@@ -99,6 +110,61 @@ SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 15.0
 SHUTDOWN_SETTLE_TIMEOUT_SECONDS = 5.0
 SHUTDOWN_SUPERVISOR_FLOOR_SECONDS = 10.0
 SHUTDOWN_CLEANUP_CANCEL_GRACE_SECONDS = 1.0
+# How long a config-reload profile retire waits for in-flight turns on the
+# affected routes before closing the orphaned Hermes subprocess anyway.
+# This is a FLOOR: the effective bound tracks the supervisor's prompt
+# timeout (300s by default) plus RELOAD_RETIRE_DRAIN_MARGIN_SECONDS so a
+# healthy long-running prompt is waited out; the floor only serves
+# supervisors that do not expose a timeout (test doubles). Bounded like the
+# shutdown drain: a genuinely wedged turn must not pin a retired profile
+# forever; closing under it fails that turn through the normal broken-pipe
+# path instead. Code constants by design, not configuration.
+RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS = 15.0
+RELOAD_RETIRE_DRAIN_MARGIN_SECONDS = 30.0
+# Server-side bound on one reload's candidate parse. A blocking filesystem
+# read or a hung secret resolver (op:// shells out with no timeout) must not
+# hold the reload lock forever: later reload requests would queue behind the
+# stuck parse with no operator-side recovery short of restarting the router.
+# On expiry the reload fails with an error; the worker thread itself cannot
+# be killed, but it stays tracked so close() can observe it. A code constant
+# by design, not configuration.
+RELOAD_PARSE_TIMEOUT_SECONDS = 60.0
+# A reload parse that times out leaves its (unkillable) worker thread
+# occupying the single-slot reload executor. The executor is then detached
+# and replaced so a later, fixed routes file can parse again; the number of
+# detached hung executors is capped so repeated wedges cannot accumulate
+# unbounded daemon threads. A code constant by design, not configuration.
+MAX_ABANDONED_RELOAD_EXECUTORS = 3
+# Follow-up reaps retry un-drained routes so a turn that finishes shortly
+# after the drain deadline still gets its cleanup without a later reload.
+# The chain is bounded: past this many follow-ups the cleanup is completed
+# under the still-wedged turn (its session is evicted and its profile
+# retired, failing the turn through the broken-pipe path) instead of
+# retrying forever. A code constant by design, not configuration.
+REAP_MAX_FOLLOWUP_ATTEMPTS = 3
+# Sentinel route attribution for control requests that can never resolve a
+# route (see _attribute_non_turn_task): not a valid route key (route keys
+# always carry a platform prefix), so marked tasks fall out of reload-reap
+# scope instead of contesting every drain key conservatively.
+_NON_TURN_TASK_SENTINEL = "non-turn-control-request"
+# Control commands that can never resolve a route. Must stay in sync with
+# the _handle_control_line dispatch: these branches call
+# _attribute_non_turn_task, and _run_control_request pre-marks their tasks
+# with the sentinel at tracking time (a reaper can snapshot the tracked set
+# before the task first runs).
+_NON_TURN_CONTROL_COMMANDS = frozenset({"preflight_permissions", "route_status", "reload_config"})
+
+
+def _is_non_turn_control_command(line: bytes) -> bool:
+    """Best-effort peek at the control command for pre-attribution; anything
+    unparseable returns False and is handled by the normal dispatch."""
+    try:
+        payload = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("command") in _NON_TURN_CONTROL_COMMANDS
+
+
 # Retention sweep deletions run on the event loop (so the pre-unlink mtime
 # recheck cannot interleave with media writes) in bounded batches with a
 # yield in between; this bounds each uninterrupted loop slice. A code
@@ -124,6 +190,107 @@ class RoutedTurnInput:
     scheduled_at_ms: int | None = None
     triggered_at_ms: int | None = None
     permission_policy: StaticPermissionPolicy | None = None
+    # Effective route state resolved at admission (overrides applied). A
+    # reload can clear a breaker override while this turn waits on its route
+    # lock; _run_turn uses the snapshot to keep the maintenance mask for
+    # turns admitted under an open breaker. None means "resolve fresh".
+    admitted_state: RouteState | None = None
+    # Config generation at admission. Paired with the router's
+    # _reload_cleared_overrides record, this lets _run_turn tell a breaker
+    # recovery apart from a reload remove/re-add cycle that cleared the
+    # override after this turn was admitted. None means "resolve fresh".
+    admitted_config_generation: int | None = None
+
+
+class _RouterConfigDrifted(Exception):
+    """Worker-side signal: config.yaml already differs from the startup
+    baseline fingerprint BEFORE the candidate parse began, so the parse was
+    skipped. Raised inside the parse worker and mapped to the
+    router_config_changed rejection by the reload path."""
+
+
+def _parse_reload_candidate(
+    config_path: Path,
+    routes_path: Path,
+    router_config: RouterConfig,
+    baseline_fingerprint: str | None,
+) -> tuple[str, AppConfig]:
+    """Worker-thread parse for one reload attempt.
+
+    Returns the raw config.yaml fingerprint alongside the candidate parsed
+    against the router's ACTIVE (already validated) RouterConfig: route-only
+    reloads never re-resolve router-level env:///op:// secret refs, so an
+    unresolvable startup-only secret cannot fail or stall a routes-only
+    reload. Router-level drift is detected on the loop by comparing the
+    fingerprint with the startup baseline. The fingerprint is checked TWICE:
+    once before the parse — a config that already drifted dooms the reload,
+    and spending the bounded parser (or worse, abandoning a worker to a hung
+    resolver) on it would mask the documented router_config_changed
+    rejection behind config_invalid/config_parse_timeout — and once after,
+    because the parse may block on YAML/secret I/O and a router-level edit
+    landing mid-parse must still be caught at swap time.
+    """
+    pre_fingerprint = raw_config_fingerprint(config_path)
+    if baseline_fingerprint is not None and pre_fingerprint != baseline_fingerprint:
+        raise _RouterConfigDrifted
+    candidate = load_routes_config(routes_path, router_config)
+    return raw_config_fingerprint(config_path), candidate
+
+
+class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    """ThreadPoolExecutor whose workers are daemon threads detached from the
+    interpreter-shutdown join.
+
+    The stdlib executor deliberately uses non-daemon threads AND registers
+    each worker in ``concurrent.futures.thread._threads_queues``, whose
+    ``_python_exit`` hook joins every registered thread at interpreter
+    shutdown. For the reload-parse worker both guarantees invert:
+    ``asyncio.wait_for`` abandoning a hung parse (e.g. a stuck secret
+    resolver) cannot kill its thread, and a joined survivor would block
+    interpreter shutdown on every exit path that does not hit the SIGTERM
+    hard-exit escape hatch — hanging the process despite close() returning.
+    This override therefore mirrors the stdlib ``_adjust_thread_count`` with
+    two changes: workers are daemon threads, and they are NOT registered in
+    ``_threads_queues``, so ``_python_exit`` neither wakes nor joins them
+    and the process truly detaches. Executor garbage collection still wakes
+    an idle worker through the weakref callback, so clean exits are
+    unaffected; only the unkillable hung case detaches.
+    """
+
+    def _adjust_thread_count(self) -> None:
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):  # noqa: ANN001, ANN202
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
+            # The private _worker signature changed in 3.14 (worker context
+            # replaces the initializer pair); support both spellings.
+            if hasattr(self, "_create_worker_context"):
+                worker_args = (
+                    weakref.ref(self, weakref_cb),
+                    self._create_worker_context(),  # type: ignore[attr-defined]
+                    self._work_queue,
+                )
+            else:
+                worker_args = (
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                )
+            thread = threading.Thread(
+                name=thread_name,
+                target=_worker,
+                args=worker_args,
+                daemon=True,
+            )
+            thread.start()
+            self._threads.add(thread)
+            # Deliberately NOT registered in _threads_queues (see docstring).
 
 
 class SignalHermesRouter:
@@ -138,6 +305,50 @@ class SignalHermesRouter:
         nonce_factory: Callable[[], str] | None = None,
     ) -> None:
         self.config = config
+        self._config_generation = 0
+        # Route key -> config generation at which a reload last cleared that
+        # route's MAINTENANCE breaker override. _run_turn compares a queued
+        # turn's admission generation against this record to distinguish a
+        # genuine breaker recovery (no reload clear; the probe may proceed)
+        # from a reload that removed/disabled the route and a later reload
+        # that re-added it ACTIVE (the admission-time maintenance gate must
+        # be kept). Stale entries are harmless: only turns admitted BEFORE
+        # the recorded clear are masked.
+        self._reload_cleared_overrides: dict[str, int] = {}
+        self._config_paths: tuple[Path, Path] | None = None
+        # Fingerprint of the raw, unresolved config.yaml captured when the
+        # reload paths were registered. Reloads compare the current file
+        # against it instead of re-resolving router-level secret refs, so a
+        # route-only reload does not depend on startup env:///op:// values
+        # still being resolvable.
+        self._config_fingerprint: str | None = None
+        # Dedicated single-thread executor for reload candidate parses. A
+        # hung secret resolver can occupy this one worker without touching
+        # the shared default executor that dedupe and media turn I/O use; a
+        # second parse simply queues and hits its own bounded wait.
+        self._reload_executor: ThreadPoolExecutor | None = None
+        # Executors detached after a parse timeout whose hung worker threads
+        # are still alive. Bounded by MAX_ABANDONED_RELOAD_EXECUTORS; pruned
+        # as abandoned workers finally exit. Already shut down (wait=False).
+        self._abandoned_reload_executors: list[ThreadPoolExecutor] = []
+        # Set when the abandoned-executor cap is reached: the wedged executor
+        # then stays in place and later reloads must fail fast instead of
+        # queueing another parse behind the hung worker. The kept executor's
+        # worker idles once the hung item completes, and its worker future
+        # (stored here) is the busyness probe — the executor was NOT shut
+        # down in this branch, so thread liveness cannot distinguish idle
+        # from wedged the way it can for the shut-down abandoned list.
+        self._reload_parse_saturated = False
+        self._saturated_parse_future: asyncio.Future[Any] | None = None
+        # Live preflight tool-surface probes per profile. The probe runs
+        # without the profile lock for most of its life, so the reload
+        # reaper's retire predicate skips profiles with an active probe —
+        # retiring the cached subprocess mid-probe would break a healthy
+        # operator preflight whose route was just reloaded away.
+        self._preflight_probes_inflight: dict[str, int] = {}
+        self._route_profile_tombstones: dict[str, str] = {
+            route.key: route.profile for route in config.routes
+        }
         self.redactor = Redactor()
         for route in config.routes:
             self.redactor.add(
@@ -178,8 +389,12 @@ class SignalHermesRouter:
         self._last_success_ms: dict[str, int] = {}
         self._last_failures: dict[str, tuple[int, FailureInfo]] = {}
         self._route_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # Serializes concurrent reload_config control calls: without it, a
+        # slower first parse could finish after a faster second one and swap
+        # its older candidate over the newer config.
+        self._reload_lock = asyncio.Lock()
         self._profile_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-        self._inbound_rate_buckets: dict[str, TokenBucket] = {}
+        self._inbound_rate_buckets: dict[tuple[str, float, float], TokenBucket] = {}
         self._last_busy_notice_ms: dict[str, int] = {}
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self._nonce_factory = nonce_factory or (lambda: uuid.uuid4().hex)
@@ -189,6 +404,16 @@ class SignalHermesRouter:
         self._shutdown_event = asyncio.Event()
         self._signal_turn_tasks: set[asyncio.Task[Any]] = set()
         self._control_client_tasks: set[asyncio.Task[None]] = set()
+        # Per-request control tasks, tracked separately from the connection
+        # loops above: the reload reaper waits out in-flight control TURNS,
+        # but an idle keep-alive connection is not in-flight work and must
+        # not delay the reap.
+        self._control_request_tasks: set[asyncio.Task[Any]] = set()
+        # Reaper tasks scheduled by config reloads. They also live in
+        # _signal_turn_tasks so the shutdown drain still covers them, but a
+        # reaper must never wait on another reaper (two back-to-back reloads
+        # would otherwise wait on each other until the drain bound expires).
+        self._reap_tasks: set[asyncio.Task[Any]] = set()
         self._signal_events_task: asyncio.Task[None] | None = None
         self._control_server_task: asyncio.Task[None] | None = None
         self._retention_task: asyncio.Task[None] | None = None
@@ -212,6 +437,43 @@ class SignalHermesRouter:
         # thread still writes. The sweep's execute phase defers deletions
         # while this is nonzero.
         self._media_io_inflight = 0
+
+    def set_config_paths(self, config_path: Path, routes_path: Path) -> None:
+        """Register the startup config paths for live reload and snapshot the
+        raw config.yaml fingerprint as the router_config_changed baseline."""
+        self._config_paths = (config_path, routes_path)
+        self._config_fingerprint = raw_config_fingerprint(config_path)
+
+    @staticmethod
+    def _turn_task_route_key(task: asyncio.Task[Any]) -> str | None:
+        # Route key recorded on a turn task when it resolved its route (see
+        # _attribute_turn_task). None means the task has not resolved a route
+        # yet (or was spawned by a direct _run_turn caller in tests); the
+        # reload reaper treats unattributed tasks conservatively.
+        return getattr(task, "signal_hermes_route_key", None)
+
+    def _attribute_turn_task(self, route_key: str) -> None:
+        # Record the resolved route key on the running task so the reload
+        # reaper can scope its pre-lock wait and route-lock drain to turns
+        # that can still touch a retired route. Set before the turn's first
+        # blocking await, so any task actually stuck pre-lock is attributed.
+        task = asyncio.current_task()
+        if task is not None:
+            task.signal_hermes_route_key = route_key
+
+    def _attribute_non_turn_task(self) -> None:
+        # Mark a control request that can NEVER resolve a route (route_status,
+        # preflight_permissions). Without a mark the reload reaper reads the
+        # task as not-yet-attributed and conservatively contests EVERY drain
+        # key with it: a long non-turn request would hold retired routes
+        # contested across follow-up attempts until the chain force-evicts
+        # sessions and profiles under otherwise healthy in-flight turns. The
+        # sentinel is not a valid route key (route keys always carry a
+        # platform prefix), so the task simply falls out of reap scope; only
+        # close() waits for it, via the tracked task sets as before.
+        task = asyncio.current_task()
+        if task is not None:
+            task.signal_hermes_route_key = _NON_TURN_TASK_SENTINEL
 
     async def run_forever(self) -> None:
         if self._closing:
@@ -248,8 +510,22 @@ class SignalHermesRouter:
             # Each accepted event runs as a tracked task awaited through
             # shield: cancelling this consumer (SIGTERM/SIGINT teardown or
             # begin_shutdown) does not abort the accepted turn, which close()
-            # then drains to normal delivery.
-            task = asyncio.create_task(self.handle_raw_event(raw))
+            # then drains to normal delivery. The config is pinned at
+            # acceptance: the task may not run until after a reload swapped
+            # self.config, and an admitted event must still resolve its route
+            # against the config it was admitted under. The breaker override
+            # map and config generation are pinned for the same reason: a
+            # reload can clear a MAINTENANCE override before the task runs,
+            # and a turn accepted under an open breaker must keep its
+            # admission-time maintenance gate.
+            task = asyncio.create_task(
+                self.handle_raw_event(
+                    raw,
+                    config=self.config,
+                    admission_overrides=dict(self.route_state_overrides),
+                    admission_generation=self._config_generation,
+                )
+            )
             self._signal_turn_tasks.add(task)
             task.add_done_callback(self._settle_tracked_task)
             try:
@@ -297,7 +573,17 @@ class SignalHermesRouter:
             # finish via the normal delivery path.
             await self._drain_route_locks(drain_deadline)
             stragglers |= await self._drain_tasks(
-                set(self._control_client_tasks), drain_deadline, "control client"
+                set(self._control_client_tasks) | set(self._control_request_tasks),
+                drain_deadline,
+                "control client",
+            )
+            # A reload request drained above can schedule a retire reaper
+            # during its swap — after the _signal_turn_tasks snapshot at the
+            # top of this method. Drain those reapers now that no reload
+            # request can still be running, so session/profile cleanup does
+            # not race session/supervisor teardown below.
+            stragglers |= await self._drain_tasks(
+                set(self._reap_tasks), drain_deadline, "reload reap"
             )
             for task in (
                 self._signal_events_task,
@@ -332,6 +618,18 @@ class SignalHermesRouter:
                     settle_deadline,
                     "turn I/O workers",
                 )
+            reload_executor = self._reload_executor
+            if reload_executor is not None:
+                # Non-blocking detach: a hung reload parse thread cannot be
+                # killed, but its worker is a daemon thread (it cannot hold
+                # the interpreter open at exit) and its future is tracked
+                # with the I/O workers and was observed above, so close()
+                # stays bounded. Reset to None
+                # so a straggler reload request that resisted cancellation
+                # re-creates a fresh executor instead of failing with
+                # "cannot schedule new futures after shutdown".
+                reload_executor.shutdown(wait=False)
+                self._reload_executor = None
             incomplete += await self._observe_cleanup(
                 self._wait_control_server_closed(),
                 settle_deadline,
@@ -433,6 +731,8 @@ class SignalHermesRouter:
     def _settle_tracked_task(self, task: asyncio.Task[Any]) -> None:
         self._signal_turn_tasks.discard(task)
         self._control_client_tasks.discard(task)
+        self._control_request_tasks.discard(task)
+        self._reap_tasks.discard(task)
         if task.cancelled():
             return
         exc = task.exception()
@@ -576,6 +876,80 @@ class SignalHermesRouter:
         future.add_done_callback(self._release_media_io_guard)
         return future
 
+    def _dispatch_reload_parse_worker(
+        self, config_path: Path, routes_path: Path
+    ) -> asyncio.Future[tuple[str, AppConfig]]:
+        # Reload parses run on a dedicated single-thread executor, never the
+        # shared default executor that dedupe and media turn I/O use: a hung
+        # secret resolver can occupy this one worker without stalling Signal
+        # turns, and a retry's parse queues behind the abandoned one until
+        # its own bounded wait expires instead of consuming more turn
+        # workers. The worker is a daemon thread so an abandoned hung parse
+        # cannot hold the interpreter open at exit (see the class docstring).
+        # The future is tracked like any other I/O worker so close() can
+        # observe it.
+        if self._reload_executor is None:
+            self._reload_executor = _DaemonThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="shr-reload-parse"
+            )
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            self._reload_executor,
+            partial(
+                _parse_reload_candidate,
+                config_path,
+                routes_path,
+                self.config.router,
+                self._config_fingerprint,
+            ),
+        )
+        self._io_worker_futures.add(future)
+        future.add_done_callback(self._settle_io_worker)
+        return future
+
+    def _detach_hung_reload_executor(self, future: asyncio.Future[Any]) -> None:
+        """Detach the reload executor whose worker a timed-out parse abandoned.
+
+        The worker thread cannot be killed, but leaving the executor in
+        place would queue every later reload behind the hung parse (each
+        hitting its own bounded wait) until the whole router restarts.
+        Detaching lets the next reload create a fresh executor. Detached
+        executors are capped at MAX_ABANDONED_RELOAD_EXECUTORS so repeated
+        wedges cannot accumulate unbounded daemon threads; once the cap is
+        reached the current executor stays in place and the router is marked
+        parse-saturated: later reloads then fail fast with
+        ``config_parse_saturated`` (instead of queueing another parse behind
+        the hung worker to time out again) until every abandoned worker has
+        exited AND the kept executor's hung item has completed — observed
+        through ``future``, the worker future of the timed-out parse — or
+        the process restarts. Reloads are serialized by _reload_lock across
+        the parse wait and this detach, so self._reload_executor is always
+        the executor whose parse just timed out.
+        """
+        executor = self._reload_executor
+        if executor is None:
+            return
+        # Prune detached executors whose workers have all exited; their
+        # threads no longer count against the accumulation bound.
+        self._abandoned_reload_executors = [
+            abandoned
+            for abandoned in self._abandoned_reload_executors
+            if any(thread.is_alive() for thread in abandoned._threads)
+        ]
+        if len(self._abandoned_reload_executors) >= MAX_ABANDONED_RELOAD_EXECUTORS:
+            self._reload_parse_saturated = True
+            self._saturated_parse_future = future
+            LOGGER.error(
+                "config reload executor kept despite the abandoned hung parse: "
+                "%d detached executors still wedged; later reloads fail fast "
+                "until the hung parses complete",
+                len(self._abandoned_reload_executors),
+            )
+            return
+        self._abandoned_reload_executors.append(executor)
+        executor.shutdown(wait=False)
+        self._reload_executor = None
+
     async def _run_io_worker(self, work: Callable[[], _T]) -> _T:
         return await self._await_io_worker(self._dispatch_io_worker(work))
 
@@ -685,13 +1059,24 @@ class SignalHermesRouter:
     def _is_live_media(self, path: Path) -> bool:
         return path in self._live_media
 
-    async def handle_raw_event(self, raw: dict) -> TurnResult | None:
+    async def handle_raw_event(
+        self,
+        raw: dict,
+        *,
+        config: AppConfig | None = None,
+        admission_overrides: dict[str, RouteState] | None = None,
+        admission_generation: int | None = None,
+    ) -> TurnResult | None:
+        # config pins the admission-time snapshot (see _run_signal_events):
+        # the task may run after a reload swapped self.config, and an
+        # admitted event must resolve its route under the old config.
+        config = self.config if config is None else config
         probe = probe_signal_route(raw)
         route = None
         if probe.group_id is not None:
-            route = self.config.find_group_route("signal", probe.group_id)
+            route = config.find_group_route("signal", probe.group_id)
         elif probe.is_direct_data_message:
-            route = self.config.find_direct_route(
+            route = config.find_direct_route(
                 "signal",
                 probe.source_uuid,
                 probe.source_number,
@@ -706,10 +1091,23 @@ class SignalHermesRouter:
         if event is None:
             _discard_event(probe.summary)
             return None
-        return await self.handle_event(event)
+        return await self.handle_event(
+            event,
+            config=config,
+            admission_overrides=admission_overrides,
+            admission_generation=admission_generation,
+        )
 
-    async def handle_event(self, event: NormalizedEvent) -> TurnResult | None:
-        route = self.config.find_route_for_event(event)
+    async def handle_event(
+        self,
+        event: NormalizedEvent,
+        *,
+        config: AppConfig | None = None,
+        admission_overrides: dict[str, RouteState] | None = None,
+        admission_generation: int | None = None,
+    ) -> TurnResult | None:
+        config = self.config if config is None else config
+        route = config.find_route_for_event(event)
         if route is None:
             _discard_event(
                 SignalEventSummary(
@@ -720,7 +1118,13 @@ class SignalHermesRouter:
             )
             return None
         self.redactor.add(event.group_id, event.sender_id, event.source_uuid, event.source_number)
-        turn = self._signal_turn_input(route, event)
+        self._attribute_turn_task(route.key)
+        turn = self._signal_turn_input(
+            route,
+            event,
+            admission_overrides=admission_overrides,
+            admission_generation=admission_generation,
+        )
         lock = self._route_lock(route)
         async with lock:
             if self._is_empty_signal_event(event):
@@ -751,8 +1155,14 @@ class SignalHermesRouter:
         scheduled_at: int | None = None,
         idempotency_key: str | None = None,
         route_lock_timeout: float | None = None,
+        config: AppConfig | None = None,
+        admission_overrides: dict[str, RouteState] | None = None,
+        admission_generation: int | None = None,
     ) -> TurnOutcome:
-        job = self.config.find_synthetic_job(job_id)
+        # config pins the admission-time snapshot when the control path
+        # accepted the request before a reload swapped self.config.
+        config = self.config if config is None else config
+        job = config.find_synthetic_job(job_id)
         if job is None:
             return TurnOutcome(
                 TurnOutcomeStatus.ERROR,
@@ -765,6 +1175,9 @@ class SignalHermesRouter:
             scheduled_at=scheduled_at,
             idempotency_key=idempotency_key,
             route_lock_timeout=route_lock_timeout,
+            config=config,
+            admission_overrides=admission_overrides,
+            admission_generation=admission_generation,
         )
 
     async def handle_notification(
@@ -775,8 +1188,15 @@ class SignalHermesRouter:
         outbound_attachments: Any = (),
         idempotency_key: str | None = None,
         route_lock_timeout: float | None = None,
+        config: AppConfig | None = None,
+        admission_overrides: dict[str, RouteState] | None = None,
+        admission_generation: int | None = None,
     ) -> TurnOutcome:
-        notification = self.config.find_notification(notification_id)
+        # config lets the control path pin the snapshot captured before its
+        # first await (in-flight preservation across a concurrent reload);
+        # direct callers get the current config.
+        config = self.config if config is None else config
+        notification = config.find_notification(notification_id)
         if notification is None:
             return TurnOutcome(
                 TurnOutcomeStatus.ERROR,
@@ -791,6 +1211,9 @@ class SignalHermesRouter:
             route_lock_timeout=route_lock_timeout,
             payload=payload,
             outbound_attachments=outbound_attachments,
+            config=config,
+            admission_overrides=admission_overrides,
+            admission_generation=admission_generation,
         )
 
     async def _handle_synthetic_definition(
@@ -802,6 +1225,9 @@ class SignalHermesRouter:
         route_lock_timeout: float | None = None,
         payload: CanonicalNotificationPayload | None = None,
         outbound_attachments: Any = (),
+        config: AppConfig | None = None,
+        admission_overrides: dict[str, RouteState] | None = None,
+        admission_generation: int | None = None,
     ) -> TurnOutcome:
         def _synthetic_outcome(
             status: TurnOutcomeStatus,
@@ -817,10 +1243,11 @@ class SignalHermesRouter:
                 synthetic_kind=synthetic.kind,
             )
 
-        route = self.config.find_route_by_name(synthetic.route_name)
+        route = (self.config if config is None else config).find_route_by_name(synthetic.route_name)
         if route is None:
             return _synthetic_outcome(TurnOutcomeStatus.ERROR, error="unknown_route")
         self.redactor.add(route.key, route.group_id, route.sender_id, route.sender_number)
+        self._attribute_turn_task(route.key)
         turn = self._synthetic_turn_input(
             synthetic,
             route,
@@ -828,6 +1255,8 @@ class SignalHermesRouter:
             idempotency_key,
             payload,
             outbound_attachments,
+            admission_overrides=admission_overrides,
+            admission_generation=admission_generation,
         )
         timeout = (
             self.config.router.control.route_lock_timeout_seconds
@@ -845,8 +1274,7 @@ class SignalHermesRouter:
                         route_state=self.route_state_overrides.get(route.key, route.state),
                     )
                 if not await self._turn_dedupe_has_status(turn, "processing"):
-                    self._maybe_clear_breaker_override(route)
-                    state = self.route_state_overrides.get(route.key, route.state)
+                    state = self._effective_turn_state(turn, route)
                     if state == RouteState.ACTIVE:
                         if timeout <= 0 and (lock.locked() or profile_lock.locked()):
                             return _synthetic_outcome(TurnOutcomeStatus.BUSY, route_state=state)
@@ -898,13 +1326,48 @@ class SignalHermesRouter:
         finally:
             self._cleanup_owned_outbound_attachments(frozen_attachments)
 
+    def _effective_turn_state(self, turn: RoutedTurnInput, route: Route) -> RouteState:
+        """Admission-aware route state for a turn about to gate or prompt.
+
+        A turn admitted under an open breaker keeps its maintenance gate even
+        when the override is gone by the time the state is consulted: a
+        reload clears overrides only for routes that are non-active (or
+        absent) in the new config, so if the current config still has this
+        route active, the clear was a breaker recovery and the probe may
+        proceed; otherwise a reload cleared it, and queued pre-reload work
+        must not bypass the breaker that was open at admission by prompting
+        the known-broken profile. A remove-then-readd-ACTIVE reload pair
+        also leaves the route currently ACTIVE, so that cycle is detected
+        through the reload-clear record instead: any reload clear newer than
+        the turn's admission keeps the admission-time maintenance gate.
+
+        Every gate that decides between the ACTIVE path and the maintenance
+        reply must consult this helper — including the synthetic-turn
+        attachment pre-freeze, which runs before _run_turn and would
+        otherwise admit a reload-unmasked maintenance turn onto the
+        ACTIVE-only freeze path.
+        """
+        self._maybe_clear_breaker_override(route)
+        state = self.route_state_overrides.get(route.key, route.state)
+        if turn.admitted_state == RouteState.MAINTENANCE and state != RouteState.MAINTENANCE:
+            current = next((r for r in self.config.routes if r.key == route.key), None)
+            cleared_by_reload = (
+                turn.admitted_config_generation is not None
+                and self._reload_cleared_overrides.get(route.key, -1)
+                > turn.admitted_config_generation
+            )
+            if current is None or current.state != RouteState.ACTIVE or cleared_by_reload:
+                state = RouteState.MAINTENANCE
+        return state
+
     async def _run_turn(self, turn: RoutedTurnInput) -> TurnOutcome:
         route = turn.route
         dedupe_identities = self._turn_dedupe_identities(turn)
         claimed_dedupe: list[tuple[str, int]] = []
         handled = False
-        rate_token_reserved = False
+        rate_bucket: TokenBucket | None = None
         prompt_attempted = False
+        session_acquisition_attempted = False
         live_manifest_paths: list[Path] = []
         try:
             # The claim loop runs inside the try so a cancellation delivered
@@ -924,8 +1387,7 @@ class SignalHermesRouter:
                     )
                 claimed_dedupe.append((dedupe_sender_id, dedupe_timestamp))
 
-            self._maybe_clear_breaker_override(route)
-            state = self.route_state_overrides.get(route.key, route.state)
+            state = self._effective_turn_state(turn, route)
             LOGGER.info("route %s in state %s", self.redactor.ref("route", route.key), state)
             if state == RouteState.DISABLED:
                 handled = True
@@ -962,13 +1424,17 @@ class SignalHermesRouter:
             # storage and session acquisition, so over-limit turns shed
             # before consuming attachment I/O or ACP session work. The token
             # is refunded in the finally below if the turn fails before the
-            # prompt, keeping the cap a prompt cap.
+            # prompt, keeping the cap a prompt cap. The turn keeps the exact
+            # bucket object it reserved from: a reload may prune and replace
+            # the dict entry for this route key, and refunding the
+            # replacement would mint capacity it never lent.
             if (
                 turn.origin == TurnOrigin.SIGNAL
                 and route.inbound_rate_limit is not None
                 and state == RouteState.ACTIVE
             ):
-                if not self._reserve_inbound_rate_token(route):
+                rate_bucket = self._reserve_inbound_rate_token(route)
+                if rate_bucket is None:
                     handled = True
                     LOGGER.info(
                         "discarding rate_limited Signal event for route %s",
@@ -979,7 +1445,6 @@ class SignalHermesRouter:
                         route_state=state,
                         **self._synthetic_outcome_fields(turn),
                     )
-                rate_token_reserved = True
 
             manifests: list[MediaManifest] = []
             if turn.signal_event is not None:
@@ -1029,6 +1494,11 @@ class SignalHermesRouter:
                 if route.mcp_only:
                     permission_policy = permission_policy.with_mcp_only(True)
                 try:
+                    # sessions.get spawns/caches the profile subprocess
+                    # before session/new, so even a failed acquisition can
+                    # leave a cached profile for the finally-block self-heal
+                    # to reap; flag the attempt before the call.
+                    session_acquisition_attempted = True
                     session = await self.sessions.get(
                         route,
                         turn.session,
@@ -1209,12 +1679,48 @@ class SignalHermesRouter:
         finally:
             for manifest_path in live_manifest_paths:
                 self._release_live_media(manifest_path)
-            if rate_token_reserved and not prompt_attempted:
+            if rate_bucket is not None and not prompt_attempted:
                 # The turn was admitted but failed before the prompt (media
                 # storage, attachment freeze, or session acquisition), so it
-                # did not spend Hermes capacity; return the token.
-                self._refund_inbound_rate_token(route)
+                # did not spend Hermes capacity; return the token to the
+                # exact bucket it was reserved from.
+                rate_bucket.refund()
             await self._finalize_dedupe_claims(route.key, claimed_dedupe, handled=handled)
+            if session_acquisition_attempted and not self._closing:
+                current = next((r for r in self.config.routes if r.key == route.key), None)
+                if current is None or current.state != RouteState.ACTIVE:
+                    # Self-heal after a force-completed reap: this turn was
+                    # admitted while its route could still prompt, outlived
+                    # the reap chain (stuck in pre-lock work through the
+                    # bounded force escape), and then acquired a session —
+                    # but the route is now reloaded away or no longer ACTIVE,
+                    # so the fresh session and cached profile would linger
+                    # until the next reload or shutdown. The scheduled reap
+                    # re-validates liveness at run time: a no-op pass when a
+                    # later reload re-activated the route. Gated on
+                    # session_acquisition_attempted so steady-state
+                    # SHADOW/DISABLED turns (state-gated before session
+                    # acquisition) do not churn no-op reaps, while a failed
+                    # acquisition — which can still have cached the profile
+                    # subprocess before session/new raised — stays covered.
+                    self._track_reap_task(asyncio.ensure_future(self._reap_after_drain(set())))
+                elif current.session_policy != route.session_policy:
+                    # Same self-heal when a reload flipped the route's
+                    # session_policy mid-turn while keeping it ACTIVE: this
+                    # turn cached its session under the admission-time
+                    # policy, and the reload's policy-change reap may have
+                    # finished (drained, timed out, or force-completed)
+                    # before the session existed. The reload-side reap call
+                    # never carries a still-live key in its drain scope, so
+                    # without this the stale-policy session lingers until
+                    # the next reload or shutdown. Schedule the same reap
+                    # with the route key added, putting it in drain/evict
+                    # scope; the eviction compares per session against the
+                    # CURRENT config, so a policy flip-back or an
+                    # already-evicted session is a no-op pass.
+                    self._track_reap_task(
+                        asyncio.ensure_future(self._reap_after_drain({route.key}))
+                    )
 
     @staticmethod
     def _turn_dedupe_identities(turn: RoutedTurnInput) -> tuple[tuple[str, int], ...]:
@@ -1435,7 +1941,21 @@ class SignalHermesRouter:
         with suppress(OSError):
             outbound_root.rmdir()
 
-    def _signal_turn_input(self, route: Route, event: NormalizedEvent) -> RoutedTurnInput:
+    def _signal_turn_input(
+        self,
+        route: Route,
+        event: NormalizedEvent,
+        *,
+        admission_overrides: dict[str, RouteState] | None = None,
+        admission_generation: int | None = None,
+    ) -> RoutedTurnInput:
+        # When the caller pinned admission-time snapshots (the Signal
+        # consumer), the effective state and config generation come from
+        # those snapshots, not the live maps: the turn may have been built
+        # after a reload cleared the breaker override it was admitted under.
+        overrides = (
+            self.route_state_overrides if admission_overrides is None else admission_overrides
+        )
         return RoutedTurnInput(
             route=route,
             origin=TurnOrigin.SIGNAL,
@@ -1447,6 +1967,10 @@ class SignalHermesRouter:
             ),
             signal_event=event,
             permission_policy=route.permission_policy,
+            admitted_state=overrides.get(route.key, route.state),
+            admitted_config_generation=(
+                self._config_generation if admission_generation is None else admission_generation
+            ),
         )
 
     @staticmethod
@@ -1463,8 +1987,20 @@ class SignalHermesRouter:
             return False
         return self._clock_ms() - event.timestamp > route.max_event_age_seconds * 1000.0
 
-    def _reserve_inbound_rate_token(self, route: Route) -> bool:
-        bucket = self._inbound_rate_buckets.get(route.key)
+    @staticmethod
+    def _rate_limit_bucket_key(route: Route) -> tuple[str, float, float]:
+        limit = route.inbound_rate_limit
+        if limit is None:
+            return (route.key, 0.0, 0.0)
+        return (route.key, float(limit.max_turns), limit.window_seconds)
+
+    def _reserve_inbound_rate_token(self, route: Route) -> TokenBucket | None:
+        """Acquire one token from the route's bucket; returns the exact
+        bucket object on success (the caller refunds THAT object, so a reload
+        that pruned and replaced the dict entry cannot receive a refund for
+        capacity it never lent), or None when the cap is already spent."""
+        key = self._rate_limit_bucket_key(route)
+        bucket = self._inbound_rate_buckets.get(key)
         if bucket is None:
             limit = route.inbound_rate_limit
             assert limit is not None
@@ -1472,13 +2008,10 @@ class SignalHermesRouter:
                 capacity=float(limit.max_turns),
                 refill_per_second=limit.max_turns / limit.window_seconds,
             )
-            self._inbound_rate_buckets[route.key] = bucket
-        return bucket.try_acquire(self._clock_ms())
-
-    def _refund_inbound_rate_token(self, route: Route) -> None:
-        bucket = self._inbound_rate_buckets.get(route.key)
-        if bucket is not None:
-            bucket.refund()
+            self._inbound_rate_buckets[key] = bucket
+        if not bucket.try_acquire(self._clock_ms()):
+            return None
+        return bucket
 
     async def _mark_signal_turn_skipped(self, turn: RoutedTurnInput, *, reason: str) -> None:
         route = turn.route
@@ -1512,7 +2045,16 @@ class SignalHermesRouter:
         idempotency_key: str | None,
         payload: CanonicalNotificationPayload | None = None,
         outbound_attachments: Any = (),
+        admission_overrides: dict[str, RouteState] | None = None,
+        admission_generation: int | None = None,
     ) -> RoutedTurnInput:
+        # Like the Signal path, admission-time snapshots pinned by the
+        # control-socket acceptor win over the live maps: a reload may have
+        # cleared the breaker override this turn was admitted under while the
+        # request task queued or awaited its idempotency dedupe check.
+        overrides = (
+            self.route_state_overrides if admission_overrides is None else admission_overrides
+        )
         triggered_at_ms = self._clock_ms()
         dedupe_sender_id, dedupe_timestamp = self._synthetic_dedupe_identity(
             synthetic.namespace,
@@ -1540,6 +2082,10 @@ class SignalHermesRouter:
             scheduled_at_ms=scheduled_at,
             triggered_at_ms=triggered_at_ms,
             permission_policy=synthetic.permission_policy or route.permission_policy,
+            admitted_state=overrides.get(route.key, route.state),
+            admitted_config_generation=(
+                self._config_generation if admission_generation is None else admission_generation
+            ),
         )
 
     def _synthetic_dedupe_identity(
@@ -1644,15 +2190,32 @@ class SignalHermesRouter:
         # breaker still moves; recovery is best-effort for the next event.
         last_failure_at_ms = self._record_route_failure(route, failure)
         trip = self.circuit.record_failure(route.key)
+        # This turn was admitted under a possibly-stale config: a reload may
+        # have since disabled, shadowed, or removed the route. Only an ACTIVE
+        # route in the CURRENT config can still prompt, so both the breaker
+        # mask and the recovery below key off it.
+        current = next((r for r in self.config.routes if r.key == route.key), None)
+        route_active = current is not None and current.state == RouteState.ACTIVE
         if trip:
-            self.route_state_overrides[route.key] = RouteState.MAINTENANCE
-            self._trip_times[route.key] = time.monotonic()
-            self._trip_times_ms[route.key] = self._clock_ms()
-            LOGGER.error(
-                "route %s tripped circuit breaker after %s failures",
-                self.redactor.ref("route", route.key),
-                trip.failures,
-            )
+            # The maintenance override exists to mask an ACTIVE route whose
+            # profile keeps failing — never let a late trip mask the
+            # operator's reloaded state (the swap's override-clearing loop
+            # has already run).
+            if not route_active:
+                LOGGER.info(
+                    "route %s tripped circuit breaker but is not active in the "
+                    "current config; not masking the reloaded state",
+                    self.redactor.ref("route", route.key),
+                )
+            else:
+                self.route_state_overrides[route.key] = RouteState.MAINTENANCE
+                self._trip_times[route.key] = time.monotonic()
+                self._trip_times_ms[route.key] = self._clock_ms()
+                LOGGER.error(
+                    "route %s tripped circuit breaker after %s failures",
+                    self.redactor.ref("route", route.key),
+                    trip.failures,
+                )
             reply_text = route.maintenance_reply or self.config.router.maintenance_reply
         else:
             reply_text = self._failure_reply_for(route, failure)
@@ -1664,30 +2227,40 @@ class SignalHermesRouter:
                     "failure reply delivery failed for %s; preserving original route failure",
                     self.redactor.ref("route", route.key),
                 )
-        try:
-            await self.supervisor.restart_profile(route.profile)
-            if session is not None:
-                if route.session_policy != SessionPolicy.EPHEMERAL:
-                    replacement = await self.sessions.replace_after_restart(
-                        route,
-                        turn.session,
-                        session,
-                        permission_policy=permission_policy,
-                    )
-                    if turn.synthetic is not None and turn.synthetic.permission_policy is not None:
-                        replacement.profile.set_permission_policy(
-                            replacement.session_id,
-                            route.permission_policy,
+        # Recovery exists to give THIS route's next prompt a working profile
+        # and session. A route a reload retired never prompts again:
+        # restarting its profile would respawn a subprocess no active route
+        # can use (with no reaper guaranteed to clean it up), and
+        # replace_after_restart would cache a session under a dead route key.
+        # The reload's reaper owns that profile's lifecycle instead.
+        if route_active:
+            try:
+                await self.supervisor.restart_profile(route.profile)
+                if session is not None:
+                    if route.session_policy != SessionPolicy.EPHEMERAL:
+                        replacement = await self.sessions.replace_after_restart(
+                            route,
+                            turn.session,
+                            session,
+                            permission_policy=permission_policy,
                         )
-        except asyncio.CancelledError:
-            raise
-        except Exception as recovery_exc:
-            LOGGER.warning(
-                "Hermes recovery failed for %s: %s; route will retry on next event",
-                self.redactor.ref("route", route.key),
-                self.redactor.redact(recovery_exc.__class__.__name__),
-            )
-            LOGGER.debug("Hermes recovery failure details", exc_info=True)
+                        if (
+                            turn.synthetic is not None
+                            and turn.synthetic.permission_policy is not None
+                        ):
+                            replacement.profile.set_permission_policy(
+                                replacement.session_id,
+                                route.permission_policy,
+                            )
+            except asyncio.CancelledError:
+                raise
+            except Exception as recovery_exc:
+                LOGGER.warning(
+                    "Hermes recovery failed for %s: %s; route will retry on next event",
+                    self.redactor.ref("route", route.key),
+                    self.redactor.redact(recovery_exc.__class__.__name__),
+                )
+                LOGGER.debug("Hermes recovery failure details", exc_info=True)
         return TurnOutcome(
             TurnOutcomeStatus.ERROR,
             route_state=state,
@@ -1743,6 +2316,552 @@ class SignalHermesRouter:
             "routes": routes,
             "route_count": len(routes),
         }
+
+    async def _handle_reload_config_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # Serialize concurrent reloads: two control clients racing parse ->
+        # swap must apply in command order, or the slower parse could swap
+        # its older candidate over the newer config.
+        async with self._reload_lock:
+            return await self._reload_config_locked(payload)
+
+    async def _reload_config_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self._reload_parse_saturated:
+            # The abandoned-executor cap is already reached and the wedged
+            # executor stayed in place: submitting another parse would queue
+            # it behind the hung worker and burn the whole bounded wait for
+            # nothing. Fail fast until the wedge clears. Clearable only when
+            # no abandoned-executor worker is still alive AND the kept
+            # executor's hung item has completed (its worker future is the
+            # probe — the kept executor was never shut down, so its idle
+            # worker thread stays alive); the kept executor is then simply
+            # reused. Cleared under _reload_lock so the reset cannot race a
+            # concurrent reload's detach.
+            self._abandoned_reload_executors = [
+                abandoned
+                for abandoned in self._abandoned_reload_executors
+                if any(thread.is_alive() for thread in abandoned._threads)
+            ]
+            saturated_future = self._saturated_parse_future
+            if (
+                self._abandoned_reload_executors
+                or saturated_future is None
+                or not saturated_future.done()
+            ):
+                return {
+                    "status": TurnOutcomeStatus.ERROR.value,
+                    "error": "config_parse_saturated",
+                    "generation": self._config_generation,
+                }
+            self._reload_parse_saturated = False
+            self._saturated_parse_future = None
+        if self._config_paths is None:
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "error": "reload_paths_unknown",
+                "generation": self._config_generation,
+            }
+        config_path = self._config_paths[0]
+        raw_candidate_routes = payload.get("candidate_routes")
+        if raw_candidate_routes is not None and not isinstance(raw_candidate_routes, str):
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "error": "invalid_candidate_routes",
+                "generation": self._config_generation,
+            }
+        routes_path = Path(raw_candidate_routes) if raw_candidate_routes else self._config_paths[1]
+        if raw_candidate_routes and not routes_path.is_absolute():
+            # A relative override resolves against the long-lived router's
+            # cwd, not the operator's shell, so it could validate and apply
+            # a different file than the operator intended.
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "error": "candidate_routes_not_absolute",
+                "generation": self._config_generation,
+            }
+        try:
+            # Parse the candidate in a TRACKED worker thread on the DEDICATED
+            # reload executor: secret resolvers (op:// shells out via
+            # subprocess.run) and the filesystem are blocking, and a slow
+            # parse on the event loop would stall Signal event handling,
+            # control responses, and ACP timeouts for the whole process. The
+            # tracked dispatch lets close() observe the worker even when this
+            # control task is cancelled mid-parse (a bare asyncio.to_thread
+            # would leak the thread past the bounded shutdown path), and the
+            # shielded await keeps the cancellation from untracking the
+            # still-running worker. Only the validated swap happens on the
+            # loop. The wait is bounded so a hung resolver cannot hold the
+            # reload lock (and every later reload request) hostage; timing
+            # out fails this reload but leaves the tracked worker for close()
+            # to observe. The dedicated executor keeps an abandoned hung
+            # parse from consuming the shared default executor's finite
+            # workers that dedupe and media turn I/O depend on. The worker
+            # future is bound BEFORE the shielded await so a timeout can
+            # hand it to the detach path as the kept executor's busyness
+            # probe (the shield's outer future is cancelled by wait_for and
+            # cannot observe the still-running worker).
+            parse_worker = self._dispatch_reload_parse_worker(config_path, routes_path)
+            config_fingerprint, candidate = await asyncio.wait_for(
+                self._await_io_worker(parse_worker),
+                timeout=RELOAD_PARSE_TIMEOUT_SECONDS,
+            )
+        except _RouterConfigDrifted:
+            # The worker's pre-parse fingerprint check fired: config.yaml had
+            # already drifted from the startup baseline, so the parse was
+            # skipped and the reload must be rejected as a router-level
+            # change — not misreported as a routes parse/validation failure.
+            LOGGER.error(
+                "config reload rejected: router-level config.yaml changed before the parse"
+            )
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "error": "router_config_changed",
+                "generation": self._config_generation,
+            }
+        except TimeoutError:
+            LOGGER.error(
+                "config reload rejected: parse exceeded the %ds server-side bound",
+                RELOAD_PARSE_TIMEOUT_SECONDS,
+            )
+            # The abandoned worker still occupies the single-slot executor;
+            # detach it so the NEXT reload (after the operator fixes the
+            # routes file or secret ref) parses on a fresh worker instead of
+            # queueing behind the wedge and timing out again until restart.
+            self._detach_hung_reload_executor(parse_worker)
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "error": "config_parse_timeout",
+                "generation": self._config_generation,
+            }
+        except Exception as exc:
+            # Never log the traceback here (no exc_info): validation errors
+            # can embed raw candidate route identifiers (a duplicate-key
+            # error names signal:<group_id>) and the rejected candidate was
+            # never registered with the redactor, so it could not be masked.
+            LOGGER.error(
+                "config reload rejected: parse/validation failed: %s",
+                self.redactor.redact(exc.__class__.__name__),
+            )
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "error": "config_invalid",
+                "detail": self.redactor.redact(exc.__class__.__name__),
+                "generation": self._config_generation,
+            }
+        # Reject changes to router-level settings: reload is routes-only. The
+        # raw, unresolved config.yaml fingerprint stands in for a re-parsed
+        # RouterConfig comparison: it catches any structural/scalar edit
+        # without re-resolving startup-only secret refs.
+        baseline_fingerprint = self._config_fingerprint
+        if baseline_fingerprint is None:
+            # Paths registered without a startup fingerprint (direct
+            # _config_paths assignment in tests): the first reload
+            # establishes the baseline.
+            self._config_fingerprint = config_fingerprint
+        elif config_fingerprint != baseline_fingerprint:
+            return {
+                "status": TurnOutcomeStatus.ERROR.value,
+                "error": "router_config_changed",
+                "generation": self._config_generation,
+            }
+        # Reject profile changes on any route key ever seen: session and
+        # circuit state are keyed by route.key and survive route removal.
+        # Adding a brand-new route key with a new profile is allowed.
+        for route in candidate.routes:
+            tombstone = self._route_profile_tombstones.get(route.key)
+            if tombstone is not None and tombstone != route.profile:
+                return {
+                    "status": TurnOutcomeStatus.ERROR.value,
+                    "error": "profile_changed_for_existing_route",
+                    "generation": self._config_generation,
+                }
+        old_config = self._do_reload_config(candidate)
+        self._reap_retired_runtime_state(old_config, candidate)
+        old_counts = Counter(route.state.value for route in old_config.routes)
+        new_counts = Counter(route.state.value for route in candidate.routes)
+        LOGGER.info(
+            "config reloaded: generation=%d routes=%s -> routes=%s",
+            self._config_generation,
+            dict(old_counts),
+            dict(new_counts),
+        )
+        return {
+            "status": "ok",
+            "generation": self._config_generation,
+            "route_count": len(candidate.routes),
+        }
+
+    def _do_reload_config(self, new_config: AppConfig) -> AppConfig:
+        """Atomically replace the active route configuration.
+
+        Returns the old configuration so the caller can log deltas.
+        In-flight turns continue using their captured Route objects;
+        new turns see the updated config immediately.
+        """
+        old_config = self.config
+        self._config_generation += 1
+        self.config = new_config
+        # Additively register new route identifiers into the existing redactor
+        # so old identifiers remain redacted for in-flight turns.
+        for route in new_config.routes:
+            self.redactor.add(
+                route.key,
+                route.group_id,
+                route.sender_id,
+                route.sender_number,
+                route.profile,
+                route.friendly_name,
+            )
+        # Prune orphaned rate-limit buckets.  Buckets are keyed by
+        # (route.key, max_turns, window_seconds) so a reconfigured limit can
+        # never alias the old one, and in-flight turns refund into the exact
+        # bucket OBJECT they reserved from (never a dict lookup), so pruning
+        # a dict entry cannot strand a refund.  Drop every bucket whose
+        # (route key, limit) pair is not the route's CURRENT limit — a route
+        # removed outright, and a route whose limit was changed or removed:
+        # otherwise restoring the same max_turns/window_seconds later would
+        # resurrect the preserved bucket with its spent token state and drop
+        # fresh turns as rate_limited right after the operator reconfigured
+        # the limiter.  Reconfiguring the limiter resets it; an untouched
+        # limit keeps its bucket (and flood protection) across reloads.
+        new_keys = {route.key for route in new_config.routes}
+        current_bucket_keys = {
+            route.key: self._rate_limit_bucket_key(route) for route in new_config.routes
+        }
+        for key in list(self._inbound_rate_buckets.keys()):
+            if current_bucket_keys.get(key[0]) != key:
+                self._inbound_rate_buckets.pop(key, None)
+        # Update profile tombstones so a removed route cannot be re-added
+        # under a different profile in a later reload.
+        for route in new_config.routes:
+            self._route_profile_tombstones[route.key] = route.profile
+        # Clear breaker overrides for routes whose operator-configured state
+        # is now anything other than ACTIVE: a stale MAINTENANCE override must
+        # not mask a reloaded SHADOW/DISABLED/MAINTENANCE route, or new turns
+        # would keep sending maintenance replies instead of applying the
+        # reloaded state. An override on a still-ACTIVE route survives: a
+        # reload must not silently reset a tripped breaker — recovery clears
+        # it via _maybe_clear_breaker_override.
+        for route in new_config.routes:
+            if (
+                route.state != RouteState.ACTIVE
+                and self.route_state_overrides.get(route.key) == RouteState.MAINTENANCE
+            ):
+                self.route_state_overrides.pop(route.key, None)
+                self._trip_times.pop(route.key, None)
+                self._trip_times_ms.pop(route.key, None)
+                self._reload_cleared_overrides[route.key] = self._config_generation
+        # Routes absent from the new config never appear in the loop above;
+        # clear their overrides and trip state too, or a stale MAINTENANCE
+        # override would keep masking the route (maintenance replies instead
+        # of prompting) if it is re-added active before the cooldown expires.
+        for key in list(self.route_state_overrides):
+            if key not in new_keys:
+                popped = self.route_state_overrides.pop(key, None)
+                self._trip_times.pop(key, None)
+                self._trip_times_ms.pop(key, None)
+                if popped == RouteState.MAINTENANCE:
+                    self._reload_cleared_overrides[key] = self._config_generation
+        # Do NOT prune route locks: in-flight turns may hold them.
+        # Session registry entries and cached profile subprocesses for routes
+        # that can no longer prompt are reaped by the caller's
+        # _reap_retired_runtime_state after the swap.
+        return old_config
+
+    def _reap_retired_runtime_state(self, old_config: AppConfig, new_config: AppConfig) -> None:
+        """Schedule cleanup of runtime state a reload left without an active
+        route.
+
+        A tracked background task first waits (bounded) for in-flight turns
+        on every non-live route to drain, then evicts sessions cached for
+        routes that can no longer prompt (or whose session policy changed),
+        and retires cached Hermes profile subprocesses with no remaining
+        active route. Eviction must NOT happen synchronously here: an
+        in-flight turn on a just-reloaded route is still streaming its reply
+        through the cached session, and releasing that session mid-prompt
+        silently truncates the reply. The task is scheduled whenever any
+        route key ever seen is no longer active — even with nothing cached
+        yet — because a turn admitted just before the swap can still be in
+        its pre-lock awaits and will create its session/profile for a
+        no-longer-active route; only the post-drain re-validation catches it.
+        """
+        live_now = {route.key for route in new_config.routes if route.state == RouteState.ACTIVE}
+        old_by_key = {route.key: route for route in old_config.routes}
+        # A session_policy change on a still-active route leaves cached
+        # sessions unreachable under the new keying; the reap evicts them
+        # (compared per session, so a later flip-back keeps them). The keys
+        # are passed for DRAIN scope: the route stays live so it is not in
+        # the tombstone-derived drain set, but an in-flight turn on it must
+        # still be waited out before its old-policy session is evicted. The
+        # old-vs-new diff is unioned with a registry-level mismatch scan so
+        # two gap cases are still caught: a route REMOVED then re-added with
+        # a different policy (no old-config entry to compare), and a mismatch
+        # an earlier reaper left un-drained at its deadline (the stale
+        # sessions are still cached, so they are rediscovered here).
+        current_policies = {route.key: route.session_policy for route in new_config.routes}
+        policy_changed_keys = {
+            route.key
+            for route in new_config.routes
+            if route.key in old_by_key
+            and old_by_key[route.key].session_policy != route.session_policy
+        } | self.sessions.route_keys_with_mismatched_policy(current_policies)
+        has_retired_keys = any(key not in live_now for key in self._route_profile_tombstones)
+        if not policy_changed_keys and not has_retired_keys:
+            return
+        self._track_reap_task(asyncio.ensure_future(self._reap_after_drain(policy_changed_keys)))
+
+    def _track_reap_task(self, task: asyncio.Task[None]) -> None:
+        # Reapers are tracked in BOTH sets: _reap_tasks lets the drain logic
+        # exclude them from the in-flight turn snapshot; _signal_turn_tasks
+        # lets close() wait them out.
+        self._signal_turn_tasks.add(task)
+        self._reap_tasks.add(task)
+        task.add_done_callback(self._settle_tracked_task)
+
+    def _reap_drain_seconds(self) -> float:
+        # Wait out healthy turns, not just fast ones: a normal prompt may run
+        # up to the supervisor's prompt timeout (300s by default), so the
+        # drain bound tracks it plus a margin. The constant floor covers
+        # supervisors that do not expose a timeout (test doubles).
+        prompt_timeout = getattr(self.supervisor, "prompt_timeout_seconds", None)
+        if not prompt_timeout:
+            return RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS
+        return max(
+            RELOAD_RETIRE_DRAIN_TIMEOUT_SECONDS,
+            prompt_timeout + RELOAD_RETIRE_DRAIN_MARGIN_SECONDS,
+        )
+
+    def _profile_has_no_active_route(self, profile_name: str) -> bool:
+        """Liveness predicate for profile retirement, read from the CURRENT
+        config. Passed to retire_profile as should_retire so it is
+        re-evaluated under the profile's acquisition lock: the reaper's own
+        fast-path check runs outside that lock, and a reload re-activating a
+        route for this profile while retirement waits on it must win."""
+        return profile_name not in {
+            route.profile for route in self.config.routes if route.state == RouteState.ACTIVE
+        }
+
+    def _profile_retirable(self, profile_name: str) -> bool:
+        """Full retirement predicate: no active route AND no live preflight
+        tool-surface probe. A probe runs without the profile lock for most
+        of its life, so liveness alone is not enough — retiring the cached
+        subprocess mid-probe would break a healthy operator preflight whose
+        route was just reloaded away."""
+        return self._profile_has_no_active_route(profile_name) and not (
+            self._preflight_probes_inflight.get(profile_name)
+        )
+
+    async def _reap_after_drain(
+        self,
+        extra_drain_keys: set[str],
+        *,
+        followup_attempt: int = 0,
+        force_eligible: set[str] | None = None,
+    ) -> None:
+        # In-flight turns captured their Route (and its profile/session
+        # bindings) before the swap. Drain the route locks of EVERY route key
+        # ever seen that is not live right now — not just the keys this
+        # reload touched: the evict/retire below is global, so the drain must
+        # be global too, or a later reload's reap could cut down a session an
+        # earlier reload's reap was still waiting out. extra_drain_keys adds
+        # still-live routes whose session_policy changed: they are not in the
+        # tombstone-derived set, but evicting their old-policy sessions must
+        # still wait out any in-flight turn. The wait is bounded (see
+        # _reap_drain_seconds): a wedged turn must not pin retired runtime
+        # state forever; closing under it fails that turn through the normal
+        # broken-pipe path. force_eligible carries the previous pass's
+        # un-drained keys: only keys the chain has already failed to drain
+        # once may be force-completed when the follow-up budget runs out, so
+        # a route retired mid-chain gets its full grace from its own chain.
+        live_now = {route.key for route in self.config.routes if route.state == RouteState.ACTIVE}
+        drain_keys = sorted(
+            {key for key in self._route_profile_tombstones if key not in live_now}
+            | extra_drain_keys
+        )
+        deadline = time.monotonic() + self._reap_drain_seconds()
+        # Turns admitted before the swap are not necessarily holding their
+        # route lock yet (a notify-route turn with attachments does dedupe
+        # and attachment-freeze awaits first), but every spawned turn is in
+        # the tracked task sets. Wait for the pre-swap set before the lock
+        # drain and re-validation, or a turn still in its pre-lock awaits
+        # would create a session/profile for a retired route only after the
+        # reap had already finished.
+        pending_turns = {
+            task
+            for task in self._signal_turn_tasks | self._control_request_tasks
+            if not task.done()
+            and task is not asyncio.current_task()
+            and task not in self._reap_tasks
+        }
+        # Scope the pre-lock wait to turns that can still touch a drain key:
+        # a long or wedged turn on an unrelated LIVE route must not consume
+        # the deadline the affected route locks are then drained against.
+        # Tasks that have not resolved their route yet are unattributed and
+        # stay in scope conservatively.
+        relevant_turns = {
+            task
+            for task in pending_turns
+            if (key := self._turn_task_route_key(task)) is None or key in drain_keys
+        }
+        if relevant_turns:
+            await asyncio.wait(relevant_turns, timeout=max(0.0, deadline - time.monotonic()))
+        # A relevant task still pending after the wait can continue past this
+        # reaper while still in its pre-lock awaits and create a fresh
+        # session/profile for a route being reaped; its route keys must NOT
+        # be treated as drained. Attribution is re-read now: a task that
+        # started running during the wait may have resolved its route since.
+        contested: set[str] = set()
+        for task in relevant_turns:
+            if task.done():
+                continue
+            key = self._turn_task_route_key(task)
+            if key is None:
+                contested.update(drain_keys)
+            else:
+                contested.add(key)
+        drained: set[str] = set()
+        for key in drain_keys:
+            if key in contested:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                continue
+            lock = self._route_locks[key]
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=remaining)
+            except TimeoutError:
+                LOGGER.warning(
+                    "config reload reap timed out waiting for in-flight turn "
+                    "on route %s; a follow-up reap retries un-drained routes",
+                    self.redactor.ref("route", key),
+                )
+                continue
+            lock.release()
+            drained.add(key)
+        # Re-validate against the CURRENT config: a later reload may have
+        # re-activated routes while the drain was in flight; never evict a
+        # session or retire a profile that is live again.
+        live_keys = {route.key for route in self.config.routes if route.state == RouteState.ACTIVE}
+        # Tombstoned keys still absent from the live config and still-live
+        # policy-mismatch keys this pass did not drain are retried by a
+        # follow-up reap (below) — but only up to REAP_MAX_FOLLOWUP_ATTEMPTS
+        # times. Past that bound the cleanup is completed under the wedged
+        # turn: its cached session is evicted and its profile retired, which
+        # fails the turn through the broken-pipe path, instead of retrying
+        # forever and pinning retired runtime state for the process's life.
+        leftover_policy_keys = {key for key in extra_drain_keys if key in live_keys} - drained
+        leftover_tombstone_keys = {
+            key for key in self._route_profile_tombstones if key not in live_keys
+        } - drained
+        leftover_keys = leftover_policy_keys | leftover_tombstone_keys
+        # A force may complete ONLY keys this CHAIN has already failed to
+        # drain in an earlier pass: the follow-up budget is a property of
+        # this reaper chain, and a key that left the active set during THIS
+        # pass's wait (its own reload scheduled a fresh reaper chain for it)
+        # must not inherit this chain's exhausted budget and be force-evicted
+        # on its first appearance — its healthy in-flight turn deserves the
+        # full drain grace. drain_keys alone is too wide: it is recomputed
+        # from the tombstones on every pass, so a route retired by a LATER
+        # reload shows up here on the firing pass without this chain ever
+        # having waited it out. force_eligible carries the previous pass's
+        # un-drained set; the first pass of a chain force-eligible nothing.
+        carried = set(force_eligible) if force_eligible is not None else set()
+        force_keys = leftover_keys & set(drain_keys) & carried
+        force = (
+            bool(force_keys)
+            and followup_attempt >= REAP_MAX_FOLLOWUP_ATTEMPTS
+            and not self._closing
+        )
+        if force:
+            LOGGER.warning(
+                "config reload reap completing cleanup under %d wedged route(s) "
+                "after %d follow-up attempt(s); their turns fail through the "
+                "broken-pipe path",
+                len(force_keys),
+                followup_attempt,
+            )
+        evict_scope = drained | force_keys if force else drained
+        # Evict only the route keys this reaper actually drained. A later
+        # reload may have disabled ANOTHER route while this reaper waited,
+        # and this reaper never waited out that route's in-flight turn —
+        # evicting its session here would truncate the reply mid-prompt. The
+        # later reload's own reaper drains and evicts it. The same holds when
+        # the drain timed out: keys past the wedged one stay un-drained, and
+        # evicting them here would punish a healthy turn for an unrelated
+        # wedge; a later reload re-drains them. The only exception is the
+        # bounded follow-up escape above: after REAP_MAX_FOLLOWUP_ATTEMPTS
+        # retries the wedged keys themselves are included.
+        evicted = self.sessions.drop_sessions_not_in(live_keys, only_route_keys=evict_scope)
+        # Sessions whose creation-time policy no longer matches their route's
+        # current policy are unreachable under the new keying. Compared per
+        # session against the CURRENT config, so a flip-flop reload that
+        # restored the original policy keeps the still-reachable session.
+        evicted += self.sessions.drop_sessions_with_mismatched_policy(
+            {route.key: route.session_policy for route in self.config.routes},
+            only_route_keys=evict_scope,
+        )
+        if evicted:
+            LOGGER.info(
+                "config reload evicted %d cached session(s) for routes no longer "
+                "active or whose session policy changed",
+                evicted,
+            )
+        for profile_name in self.supervisor.cached_profile_names():
+            # Re-check the retirement predicate immediately before retiring:
+            # a later reload may have re-activated a route for this profile
+            # while this reaper was draining or retiring another profile, and
+            # retiring a live profile breaks a turn that already acquired it;
+            # a live preflight probe must also keep its subprocess. This is
+            # the fast path; should_retire re-validates the same predicate
+            # under the profile's acquisition lock so a liveness change
+            # landing while retire_profile waits on the lock cannot close a
+            # subprocess that is live again.
+            if not self._profile_retirable(profile_name):
+                continue
+            # Retire only when EVERY route key that could still have an
+            # in-flight turn on this profile is in the eviction scope — the
+            # same scope as the session eviction above. A route disabled by a
+            # LATER reload is drained by that reload's own reaper; closing
+            # the shared subprocess here would truncate its in-flight reply.
+            if any(
+                profile == profile_name and key not in evict_scope
+                for key, profile in self._route_profile_tombstones.items()
+            ):
+                continue
+            if await self.supervisor.retire_profile(
+                profile_name,
+                should_retire=partial(self._profile_retirable, profile_name),
+            ):
+                LOGGER.info(
+                    "config reload retired Hermes profile %s: no remaining active routes",
+                    self.redactor.ref("profile", profile_name),
+                )
+        # Anything still un-drained — a contested pre-lock turn or a lock
+        # held past the deadline — keeps its sessions/profile cached, and no
+        # later reload is guaranteed to schedule another reaper. Retry with a
+        # follow-up reap: it re-waits the full drain bound (asyncio.wait
+        # returns as soon as the pending turns finish, so a healthy
+        # completion is noticed immediately), while a genuinely wedged turn
+        # is retried at that cadence — up to REAP_MAX_FOLLOWUP_ATTEMPTS
+        # times, after which the pass above force-completes the cleanup under
+        # the wedge. Tombstoned keys still absent from the live config are
+        # recomputed by the follow-up itself; still-live policy-mismatch keys
+        # must be passed along explicitly. This pass's un-drained set is
+        # carried as the next pass's force_eligible, so only keys the chain
+        # has already failed to drain can ever be force-completed.
+        if leftover_keys and not force and not self._closing:
+            LOGGER.info(
+                "config reload scheduling a follow-up reap for %d un-drained route(s)",
+                len(leftover_keys),
+            )
+            self._track_reap_task(
+                asyncio.ensure_future(
+                    self._reap_after_drain(
+                        leftover_policy_keys,
+                        followup_attempt=followup_attempt + 1,
+                        force_eligible=leftover_keys,
+                    )
+                )
+            )
 
     def _route_health(self, index: int, route: Route) -> RouteHealth:
         return RouteHealth(
@@ -2009,13 +3128,50 @@ class SignalHermesRouter:
                     break
                 if not line:
                     break
-                response = await self._handle_control_line(line)
+                response = await self._run_control_request(line)
                 if not await self._write_control_response(writer, response):
                     break
         finally:
             writer.close()
             with suppress(Exception):
                 await writer.wait_closed()
+
+    async def _run_control_request(self, line: bytes) -> dict[str, Any]:
+        # Track each REQUEST as its own task, separate from the connection
+        # loop: the reload reaper and close() must wait out in-flight control
+        # turns, but an idle keep-alive connection is not in-flight work and
+        # must not delay either one. The config is pinned here, at admission:
+        # the request task may not run until after a reload swapped
+        # self.config, and an admitted turn must still resolve its route or
+        # job against the config it was admitted under. The breaker override
+        # map and config generation are pinned for the same reason: a reload
+        # can clear a MAINTENANCE override while the request task queues or
+        # awaits its idempotency dedupe check, and a turn admitted under an
+        # open breaker must keep its admission-time maintenance gate. The
+        # shutdown admission decision is pinned the same way: a request
+        # accepted from the socket before begin_shutdown() must still run
+        # (and drain via close()), not be bounced as busy when its task
+        # first runs.
+        task = asyncio.ensure_future(
+            self._handle_control_line(
+                line,
+                config=self.config,
+                admitted=not self._closing,
+                admission_overrides=dict(self.route_state_overrides),
+                admission_generation=self._config_generation,
+            )
+        )
+        if _is_non_turn_control_command(line):
+            # Mark known non-turn commands BEFORE the task is tracked: the
+            # reload reaper can snapshot the tracked set before the task
+            # first runs, and an unattributed snapshot would contest every
+            # drain key with a request that can never touch a route (for the
+            # whole drain budget, e.g. a queued reload's bounded parse).
+            # _handle_control_line re-sets the same sentinel when it runs.
+            task.signal_hermes_route_key = _NON_TURN_TASK_SENTINEL
+        self._control_request_tasks.add(task)
+        task.add_done_callback(self._settle_tracked_task)
+        return await task
 
     async def _write_control_response(
         self,
@@ -2039,11 +3195,21 @@ class SignalHermesRouter:
             return False
         return True
 
-    async def _handle_control_line(self, line: bytes) -> dict[str, Any]:
-        if self._closing:
+    async def _handle_control_line(
+        self,
+        line: bytes,
+        *,
+        config: AppConfig | None = None,
+        admitted: bool = False,
+        admission_overrides: dict[str, RouteState] | None = None,
+        admission_generation: int | None = None,
+    ) -> dict[str, Any]:
+        if self._closing and not admitted:
             # Admission gate: busy is the success-class "retry later" status,
-            # so the caller's retry lands on the replacement router. Turns
-            # admitted before shutdown are unaffected; they drain via close().
+            # so the caller's retry lands on the replacement router. Requests
+            # admitted before shutdown (admitted=True, pinned by
+            # _run_control_request) are unaffected even when their task first
+            # runs after begin_shutdown(); they drain via close().
             return {
                 "status": TurnOutcomeStatus.BUSY.value,
                 "error": "router_shutting_down",
@@ -2056,16 +3222,41 @@ class SignalHermesRouter:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": "malformed_request"}
         command = payload.get("command")
         if command == "trigger_job":
-            return await self._handle_trigger_job_control(payload)
+            return await self._handle_trigger_job_control(
+                payload,
+                config=config,
+                admission_overrides=admission_overrides,
+                admission_generation=admission_generation,
+            )
         if command == "notify_route":
-            return await self._handle_notify_route_control(payload)
+            return await self._handle_notify_route_control(
+                payload,
+                config=config,
+                admission_overrides=admission_overrides,
+                admission_generation=admission_generation,
+            )
         if command == "preflight_permissions":
+            self._attribute_non_turn_task()
             return await self._handle_preflight_permissions_control(payload)
         if command == "route_status":
+            self._attribute_non_turn_task()
             return self._route_status_response(payload)
+        if command == "reload_config":
+            # A reload request never resolves a route either: while it waits
+            # on the reload lock or its bounded parse, it must not contest
+            # another reload's reap drain as an unattributed task.
+            self._attribute_non_turn_task()
+            return await self._handle_reload_config_control(payload)
         return {"status": TurnOutcomeStatus.ERROR.value, "error": "unknown_command"}
 
-    async def _handle_trigger_job_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _handle_trigger_job_control(
+        self,
+        payload: dict[str, Any],
+        *,
+        config: AppConfig | None = None,
+        admission_overrides: dict[str, RouteState] | None = None,
+        admission_generation: int | None = None,
+    ) -> dict[str, Any]:
         job_id = payload.get("job_id")
         if not isinstance(job_id, str) or not job_id:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": "missing_job_id"}
@@ -2084,6 +3275,9 @@ class SignalHermesRouter:
                 scheduled_at=scheduled_at,
                 idempotency_key=idempotency_key,
                 route_lock_timeout=timeout,
+                config=config,
+                admission_overrides=admission_overrides,
+                admission_generation=admission_generation,
             )
         except Exception as exc:
             LOGGER.error(
@@ -2107,7 +3301,14 @@ class SignalHermesRouter:
             }
         return outcome.to_control_response()
 
-    async def _handle_notify_route_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _handle_notify_route_control(
+        self,
+        payload: dict[str, Any],
+        *,
+        config: AppConfig | None = None,
+        admission_overrides: dict[str, RouteState] | None = None,
+        admission_generation: int | None = None,
+    ) -> dict[str, Any]:
         notification_id = payload.get("notification_id")
         if not isinstance(notification_id, str) or not notification_id:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": "missing_notification_id"}
@@ -2127,9 +3328,18 @@ class SignalHermesRouter:
         timeout, error = _parse_control_timeout(payload.get("timeout"))
         if error is not None:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": error}
+        # Capture the config BEFORE the first await: the dedupe claim below
+        # reads the notification/route, and a reload landing mid-request must
+        # not make an admitted notification run against a different
+        # definition (or fail as unknown_notification after being admitted) —
+        # the same in-flight preservation guarantee Signal turns get. When
+        # the request was admitted through _run_control_request the snapshot
+        # was pinned even earlier, at acceptance.
+        config = self.config if config is None else config
         deduped_response = await self._deduped_notification_control_response(
             notification_id,
             idempotency_key,
+            config=config,
         )
         if deduped_response is not None:
             return deduped_response
@@ -2140,6 +3350,9 @@ class SignalHermesRouter:
                 outbound_attachments=payload.get("attachments", []),
                 idempotency_key=idempotency_key,
                 route_lock_timeout=timeout,
+                config=config,
+                admission_overrides=admission_overrides,
+                admission_generation=admission_generation,
             )
         except Exception as exc:
             LOGGER.error(
@@ -2166,15 +3379,23 @@ class SignalHermesRouter:
         self,
         notification_id: str,
         idempotency_key: str | None,
+        *,
+        config: AppConfig,
     ) -> dict[str, Any] | None:
         if not idempotency_key:
             return None
-        notification = self.config.find_notification(notification_id)
+        notification = config.find_notification(notification_id)
         if notification is None:
             return None
-        route = self.config.find_route_by_name(notification.route_name)
+        route = config.find_route_by_name(notification.route_name)
         if route is None:
             return None
+        # Attribute BEFORE the dedupe await: a slow or wedged dedupe check
+        # would otherwise leave this request unattributed for the whole
+        # await, and a concurrent reload reaper would conservatively contest
+        # every drain key with it. _handle_synthetic_definition re-attributes
+        # the same key when the notification actually runs.
+        self._attribute_turn_task(route.key)
         dedupe_sender_id, dedupe_timestamp = self._synthetic_dedupe_identity(
             notification.namespace,
             scheduled_at=None,
@@ -2199,9 +3420,15 @@ class SignalHermesRouter:
             scope = parse_preflight_scope(payload.get("scope"))
         except ValueError:
             return {"status": TurnOutcomeStatus.ERROR.value, "error": "invalid_preflight_scope"}
+        # Pin the config snapshot for the WHOLE preflight: the report is
+        # computed from it, so every per-profile probe must resolve its
+        # representative route from the same snapshot — a reload swapping
+        # self.config mid-preflight must not make later probes miss their
+        # route (probe_profile_missing) or probe the wrong one.
+        config = self.config
         report = await run_permission_preflight(
-            self.config,
-            self._probe_profile_tool_surface,
+            config,
+            partial(self._probe_profile_tool_surface, config),
             scope=scope,
         )
         response = report.to_dict()
@@ -2210,30 +3437,58 @@ class SignalHermesRouter:
             response["failure"] = failure.to_dict()
         return response
 
-    async def _probe_profile_tool_surface(self, profile: str) -> ToolSurface:
-        route = self._representative_route_for_profile(profile)
-        if route is None:
-            raise PreflightProbeUnavailable("probe_profile_missing")
-        profile_lock = self._profile_lock(profile)
-        if not await self._acquire_route_lock(
-            profile_lock,
-            PREFLIGHT_PROFILE_LOCK_TIMEOUT_SECONDS,
-        ):
-            raise PreflightProbeUnavailable("probe_profile_busy")
+    async def _probe_profile_tool_surface(self, config: AppConfig, profile: str) -> ToolSurface:
+        # Track the in-flight probe for the reload reaper: the probe runs
+        # WITHOUT the profile lock for most of its life (see below), so the
+        # reaper's retire predicate skips profiles with an active probe —
+        # otherwise a healthy operator preflight could have the cached
+        # subprocess retired underneath it mid-probe when its route was
+        # just reloaded away.
+        self._preflight_probes_inflight[profile] = (
+            self._preflight_probes_inflight.get(profile, 0) + 1
+        )
         try:
-            managed_profile = await self.supervisor.get_profile(route)
+            route = self._representative_route_for_profile(config, profile)
+            if route is None:
+                raise PreflightProbeUnavailable("probe_profile_missing")
+            profile_lock = self._profile_lock(profile)
+            if not await self._acquire_route_lock(
+                profile_lock,
+                PREFLIGHT_PROFILE_LOCK_TIMEOUT_SECONDS,
+            ):
+                raise PreflightProbeUnavailable("probe_profile_busy")
+            try:
+                managed_profile = await self.supervisor.get_profile(route)
+            finally:
+                profile_lock.release()
+            # ACP request IDs let this read-only probe run alongside later turns without
+            # holding the profile lock for the full tool-surface timeout.
+            probe = getattr(managed_profile, "tool_surface", None)
+            if not callable(probe):
+                raise PreflightProbeUnavailable("probe_unsupported")
+            return await probe()
         finally:
-            profile_lock.release()
-        # ACP request IDs let this read-only probe run alongside later turns without
-        # holding the profile lock for the full tool-surface timeout.
-        probe = getattr(managed_profile, "tool_surface", None)
-        if not callable(probe):
-            raise PreflightProbeUnavailable("probe_unsupported")
-        return await probe()
+            count = self._preflight_probes_inflight.get(profile, 0)
+            if count <= 1:
+                self._preflight_probes_inflight.pop(profile, None)
+                # A reaper that skipped retiring this profile because of
+                # THIS probe scheduled no follow-up of its own (its drain
+                # set was already empty), so the last probe to finish
+                # re-triggers retirement when the profile's routes were
+                # reloaded away underneath it; otherwise the cached
+                # subprocess would linger until the next reload or shutdown.
+                if (
+                    not self._closing
+                    and self._profile_has_no_active_route(profile)
+                    and profile in self.supervisor.cached_profile_names()
+                ):
+                    self._track_reap_task(asyncio.ensure_future(self._reap_after_drain(set())))
+            else:
+                self._preflight_probes_inflight[profile] = count - 1
 
-    def _representative_route_for_profile(self, profile: str) -> Route | None:
+    def _representative_route_for_profile(self, config: AppConfig, profile: str) -> Route | None:
         fallback = None
-        for route in self.config.routes:
+        for route in config.routes:
             if route.profile != profile:
                 continue
             if route.state == RouteState.ACTIVE:

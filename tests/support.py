@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import stat
 import sys
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -253,12 +253,31 @@ class FakeSupervisor:
     def __init__(self, profile: FakeProfile) -> None:
         self.profile = profile
         self.restarts = 0
+        self.cached: list[str] = []
+        self.retired: list[str] = []
 
     async def get_profile(self, route: Route) -> FakeProfile:
         return self.profile
 
     async def restart_profile(self, profile_name: str) -> None:
         self.restarts += 1
+
+    def cached_profile_names(self) -> list[str]:
+        return list(self.cached)
+
+    async def retire_profile(
+        self,
+        profile_name: str,
+        *,
+        should_retire: Callable[[], bool] | None = None,
+    ) -> bool:
+        if should_retire is not None and not should_retire():
+            return False
+        if profile_name not in self.cached:
+            return False
+        self.cached.remove(profile_name)
+        self.retired.append(profile_name)
+        return True
 
     async def close(self) -> None:
         return None
