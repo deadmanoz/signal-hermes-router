@@ -104,25 +104,9 @@ signal-hermes-router --config /path/to/private/config.yaml notify-route camera-p
 ```
 
 `--attachment` is control metadata, not part of the canonical notification
-payload JSON. The path must be absolute after `~` expansion, must resolve under
-`router.media_root`, must point to a regular readable private image file, and
-must fit within `router.max_attachment_bytes`. Relative paths are rejected
-instead of being resolved against the router daemon's current working
-directory. The producer must stage images with `0700` parent directories and
-`0600` file modes because the router-managed media tree is private.
-
-Only one outbound notification attachment is supported. It is delivered with
-the first Signal reply chunk only; later chunks are text-only. If Hermes returns
-empty reply text for an attachment-bearing notification, the router sends the
-fallback text `Image attached.` with the image. Unit tests verify the router's
-request shape; live delivery is only proven after a smoke send through a real
-signal-cli daemon to an operator-approved target.
-
-The router freezes accepted images into a private `.outbound` send artifact
-before the ACP turn runs, so producers may rotate their original staged file
-after the control request is accepted. Attachment sends require a loopback
-signal-cli daemon sharing the same filesystem path. Remote signal-cli base URLs
-are supported only for text-only notifications.
+payload JSON. See [docs/media.md](media.md#outbound-notification-images) for the
+full staging contract, validation rules, `.outbound` artifact behavior, and
+remote-signal-cli restrictions.
 
 ## Prompt Shape
 
@@ -141,75 +125,60 @@ text, configured synthetic prompt text, and notification payload text. A
 configured prompt or payload cannot inject fake router metadata by including
 delimiter-looking text.
 
-## Route States
+## Route States and Session Policy
 
-Scheduled turns use the same route state gate as inbound Signal turns:
+Scheduled turns use the same route state gate and session policy as inbound
+Signal turns. See [docs/configuration.md](configuration.md) for the definitions
+of `shadow`, `active`, `maintenance`, `disabled`, `persistent_route`,
+`persistent_sender`, and `ephemeral`.
 
-- `active`: call Hermes and deliver the assistant reply through Signal.
-- `shadow`: do not call Hermes and do not send Signal output.
-- `maintenance`: send the route's maintenance reply through Signal.
-- `disabled`: do not call Hermes and do not send Signal output.
+With `persistent_sender`, synthetic turns use a definition-specific sender
+identity: `scheduled:<job-id>` for scheduled jobs and
+`synthetic:notification:<notification-id>` for notifications, so different
+definitions receive distinct persistent-sender sessions.
 
-Scheduled-job turns are text-only. Notification payloads are JSON data, not
-media attachments; an optional `notify-route --attachment` image is carried as
-separate control metadata and is never included in the prompt payload JSON.
+## Idempotency and Failure Handling
 
-## Session Policy
+Use `--scheduled-at` for timer fires with a natural scheduled instant (epoch
+milliseconds or timezone-aware ISO 8601). Use `--idempotency-key` when the
+scheduler has a stable fire identifier; the router hashes the key before storing
+it, so the raw key never enters the dedupe database.
 
-Scheduled turns use the selected route's session policy:
+Repeated scheduled triggers with the same job and `--scheduled-at`, or the same
+`--idempotency-key`, are deduped. Notification triggers dedupe by
+`--idempotency-key` when supplied. Bare manual triggers without stable identity
+fields are treated as fresh attempts.
 
-- `persistent_route`: reuse the route session. Later human Signal messages can
-  discuss the scheduled report in the same ACP session.
-- `persistent_sender`: use a synthetic sender identity for the definition,
-  such as `scheduled:daily-agenda` for scheduled jobs or
-  `synthetic:notification:backup-report` for notifications.
-- `ephemeral`: create a fresh session for each synthetic turn.
+Crash-reclaim and at-least-once behavior differ by origin:
+- **Synthetic turns:** a claim left `processing` by a crash is reclaimed at the
+  next router startup, so the caller's retry with the same stable identity
+  delivers instead of reporting `deduped`. A crash between the Signal send and
+  the identity being marked `handled` can duplicate output on retry. This
+  guarantee is scoped to externally retried synthetic work. Reclaim is safe
+  because the router owns the state DB exclusively: the dedupe store holds an
+  exclusive sqlite lock for the router's lifetime, so an overlapping second
+  router fails at startup instead of sharing the DB, and no turn is in flight
+  when the lock is first taken.
+- **Signal-origin turns:** have no router-owned replay path. A crash or shutdown
+  during a Signal turn is redelivered only if upstream `signal-cli` happens to
+  replay the event.
 
-## Idempotency
-
-Use `--scheduled-at` for timer fires with a natural scheduled instant. It can
-be an epoch millisecond integer or a timezone-aware ISO 8601 timestamp.
-
-Use `--idempotency-key` when the scheduler has a stable fire identifier. The
-router hashes the key before using it in the dedupe identity, so the raw key is
-not stored in the dedupe database.
-
-Repeated scheduled triggers with the same job and `--scheduled-at`, or the
-same `--idempotency-key`, are deduped. Notification triggers dedupe by
-`--idempotency-key` when one is supplied. Bare manual triggers without stable
-identity fields are treated as fresh attempts, even when two invocations land
-in the same millisecond.
-
-Dedupe holds for identities the router marked `handled`, and for claims still
-`processing` in a live router. A claim left `processing` by a crash mid-turn
-is reclaimed at the next router startup, so retrying the same stable identity
-after a crash delivers instead of reporting `deduped`. Reclaim is safe because
-the router owns the state DB exclusively: the dedupe store holds an exclusive
-sqlite lock for the router's lifetime, so an overlapping second router fails
-at startup instead of sharing the DB, and no turn is in flight when the lock
-is first taken.
-Crash-interrupted synthetic turns are therefore at-least-once when the caller
-retries with the same stable identity: a crash between the Signal send and the
-identity being marked `handled` can duplicate output on retry. This guarantee
-is scoped to externally retried synthetic work; Signal-origin turns have no
-router-owned replay path.
-
-If a synthetic turn reaches Hermes and then fails during ACP session setup,
-ACP prompt execution, model/provider work, or profile recovery, the router
-returns an `error` response, sends the configured failure or maintenance reply
-when the route state allows a reply, and releases the synthetic dedupe claim.
-Route-owned failure responses include safe observability fields for scheduler
+If a synthetic turn fails during ACP session setup, prompt execution, or profile
+recovery, the router returns an `error` response, sends the configured failure or
+maintenance reply when the route state allows it, and releases the synthetic
+dedupe claim so the scheduler can retry after the operator fixes the underlying
+issue. Route-owned failure responses include safe observability fields for scheduler
 logs: `route_ref`, `profile`, `last_failure_at_ms`, `reply_sent`, and the
 sanitized `failure` object with stable `code`, `message`, `provider_class`,
 and bounded detail fields. ACP session-acquisition model/provider failures use
 model/provider codes only when Hermes supplies structured JSON-RPC
 `error.data.code`; text-only quota or rate-limit wording remains
-`acp_session_failed`.
-The same `--scheduled-at` or `--idempotency-key` can then be retried
-deliberately after the operator fixes the underlying issue. Successful
-synthetic turns still mark the dedupe identity handled, and Signal send
-failures still mark it handled because Hermes work already completed and a
-retry would run the profile work again.
+`acp_session_failed`. Successful synthetic turns still mark the dedupe identity
+handled, and Signal send failures still mark it handled because Hermes work
+already completed.
+
+For route-lock semantics (lock coverage, busy behavior, retry rules), see the
+Route Lock Contention section below.
 
 ## Route Lock Contention
 
@@ -283,4 +252,4 @@ WantedBy=timers.target
 Keep real Signal group IDs, sender UUIDs, phone numbers, hostnames, private
 route names, profile names, credential names, real prompts, and real payload
 examples in the private deployment repo. The public examples in this repo use
-synthetic identifiers only.
+synthetic identifiers only. See [AGENTS.md](../AGENTS.md#publicprivate-boundary).
