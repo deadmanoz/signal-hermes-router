@@ -25,7 +25,29 @@ def prepare_outgoing_message(route: Route, message: str, *, max_reply_chars: int
 
 
 def chunk_for_signal_bytes(message: str, *, max_bytes: int) -> list[str]:
-    return _chunk_for_signal_bytes(message, max_bytes=max_bytes)
+    if len(message.encode("utf-8")) <= max_bytes:
+        return [message]
+
+    chunks = _split_greedy_bytes(message, limit=max_bytes)
+    if len(chunks) == 1:
+        return chunks
+
+    m = len(chunks)
+    for _ in range(5):
+        marker_width = len(f"[{m}/{m}] ")
+        effective = max_bytes - marker_width
+        if effective < 4:
+            return _hard_byte_cut(message, max_bytes)
+        new_chunks = _split_greedy_bytes(message, limit=effective)
+        if len(new_chunks) == m:
+            chunks = new_chunks
+            break
+        chunks = new_chunks
+        m = len(new_chunks)
+    else:
+        return _hard_byte_cut(message, max_bytes)
+
+    return [f"[{i + 1}/{m}] {c}" for i, c in enumerate(chunks)]
 
 
 def _apply_canary_prefix(route: Route, message: str) -> str:
@@ -96,29 +118,3 @@ def _hard_byte_cut(message: str, max_bytes: int) -> list[str]:
         else:
             remaining = remaining[1:]
     return out
-
-
-def _chunk_for_signal_bytes(message: str, *, max_bytes: int) -> list[str]:
-    if len(message.encode("utf-8")) <= max_bytes:
-        return [message]
-
-    chunks = _split_greedy_bytes(message, limit=max_bytes)
-    if len(chunks) == 1:
-        return chunks
-
-    m = len(chunks)
-    for _ in range(5):
-        marker_width = len(f"[{m}/{m}] ")
-        effective = max_bytes - marker_width
-        if effective < 4:
-            return _hard_byte_cut(message, max_bytes)
-        new_chunks = _split_greedy_bytes(message, limit=effective)
-        if len(new_chunks) == m:
-            chunks = new_chunks
-            break
-        chunks = new_chunks
-        m = len(chunks)
-    else:
-        return _hard_byte_cut(message, max_bytes)
-
-    return [f"[{i + 1}/{m}] {c}" for i, c in enumerate(chunks)]

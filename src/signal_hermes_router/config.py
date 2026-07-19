@@ -6,7 +6,6 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field, replace
-from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urlparse
@@ -14,6 +13,7 @@ from urllib.parse import urlparse
 from .models import ChatType, NormalizedEvent, RouteState, SessionPolicy, SyntheticTurnKind
 from .payloads import compact_json_dumps
 from .permissions import StaticPermissionPolicy
+from .private_fs import _is_loopback_host
 from .secrets import resolve_secret_refs
 
 LOGGER = logging.getLogger(__name__)
@@ -205,8 +205,11 @@ class AppConfig:
     scheduled_jobs: tuple[SyntheticRouteJob, ...] = ()
     notifications: tuple[SyntheticRouteNotification, ...] = ()
 
-    def find_route(self, platform: str, group_id: str) -> Route | None:
-        return self.find_group_route(platform, group_id)
+    def find_route_by_key(self, route_key: str) -> Route | None:
+        for route in self.routes:
+            if route.key == route_key:
+                return route
+        return None
 
     def find_route_by_name(self, name: str) -> Route | None:
         for route in self.routes:
@@ -440,10 +443,13 @@ def parse_router_config(raw: dict[str, Any]) -> RouterConfig:
         "router.control.max_notification_payload_bytes",
     )
     socket_path = control.get("socket_path")
+    state_db = Path(raw.get("state_db", defaults.state_db))
+    if str(state_db) == ":memory:":
+        raise ValueError("router.state_db must not be :memory:")
     return RouterConfig(
         signal_base_url=signal_base_url,
         allow_remote_signal_base_url=allow_remote_signal_base_url,
-        state_db=Path(raw.get("state_db", defaults.state_db)),
+        state_db=state_db,
         media_root=Path(raw.get("media_root", defaults.media_root)),
         signal_attachment_root=Path(
             raw.get("signal_attachment_root", defaults.signal_attachment_root)
@@ -812,13 +818,7 @@ def _validate_signal_base_url(base_url: str, allow_remote: bool) -> None:
     )
 
 
-def _is_loopback_host(hostname: str) -> bool:
-    if hostname.lower() == "localhost":
-        return True
-    try:
-        return ip_address(hostname).is_loopback
-    except ValueError:
-        return False
+# Removed: _is_loopback_host now lives in private_fs.py for shared use.
 
 
 def _as_bool(value: Any) -> bool:

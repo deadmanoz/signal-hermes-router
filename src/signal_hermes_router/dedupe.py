@@ -6,7 +6,9 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 from .private_fs import PRIVATE_FILE_MODE, ensure_private_dir, ensure_private_file
 
@@ -224,8 +226,7 @@ class DedupeStore:
         return cursor.fetchone() is not None
 
     def claim(self, route_key: str, source_uuid: str, timestamp: int) -> bool:
-        self._begin_turn_operation()
-        try:
+        with self._turn_operation():
             with self._lock:
                 try:
                     self._db.execute(
@@ -238,12 +239,9 @@ class DedupeStore:
                     return True
                 except sqlite3.IntegrityError:
                     return False
-        finally:
-            self._end_operation()
 
     def is_handled(self, route_key: str, source_uuid: str, timestamp: int) -> bool:
-        self._begin_turn_operation()
-        try:
+        with self._turn_operation():
             with self._lock:
                 cursor = self._db.execute(
                     "SELECT 1 FROM dedupe_events "
@@ -252,12 +250,9 @@ class DedupeStore:
                     (route_key, source_uuid, int(timestamp)),
                 )
                 return cursor.fetchone() is not None
-        finally:
-            self._end_operation()
 
     def status(self, route_key: str, source_uuid: str, timestamp: int) -> str | None:
-        self._begin_turn_operation()
-        try:
+        with self._turn_operation():
             with self._lock:
                 cursor = self._db.execute(
                     "SELECT status FROM dedupe_events "
@@ -268,12 +263,9 @@ class DedupeStore:
                 if row is None:
                     return None
                 return str(row[0])
-        finally:
-            self._end_operation()
 
     def mark_handled(self, route_key: str, source_uuid: str, timestamp: int) -> None:
-        self._begin_turn_operation()
-        try:
+        with self._turn_operation():
             with self._lock:
                 self._db.execute(
                     "INSERT INTO dedupe_events "
@@ -284,12 +276,9 @@ class DedupeStore:
                     (route_key, source_uuid, int(timestamp), self._clock_ms()),
                 )
                 self._db.commit()
-        finally:
-            self._end_operation()
 
     def release(self, route_key: str, source_uuid: str, timestamp: int) -> None:
-        self._begin_turn_operation()
-        try:
+        with self._turn_operation():
             with self._lock:
                 self._db.execute(
                     "DELETE FROM dedupe_events "
@@ -298,14 +287,6 @@ class DedupeStore:
                     (route_key, source_uuid, int(timestamp)),
                 )
                 self._db.commit()
-        finally:
-            self._end_operation()
-
-    def seen_or_record(self, source_uuid: str, timestamp: int, route_key: str = "") -> bool:
-        if not self.claim(route_key, source_uuid, timestamp):
-            return True
-        self.mark_handled(route_key, source_uuid, timestamp)
-        return False
 
     def prune_handled_before(self, cutoff_ms: int) -> int:
         """Delete handled rows with a retention clock older than ``cutoff_ms``.
@@ -314,10 +295,10 @@ class DedupeStore:
         size; 'processing' claims are never pruned. Safe to call from a sweep
         worker thread; stops early when a close was requested.
         """
-        if not self._begin_sweep_operation():
-            return 0
-        total = 0
-        try:
+        with self._sweep_operation() as started:
+            if not started:
+                return 0
+            total = 0
             while True:
                 with self._state_lock:
                     if self._close_requested:
@@ -333,14 +314,12 @@ class DedupeStore:
                 if cursor.rowcount <= 0:
                     return total
                 total += cursor.rowcount
-        finally:
-            self._end_operation()
 
     def incremental_vacuum(self) -> None:
         """Drain the freelist in bounded chunks (requires INCREMENTAL mode)."""
-        if not self._begin_sweep_operation():
-            return
-        try:
+        with self._sweep_operation() as started:
+            if not started:
+                return
             previous_freelist: int | None = None
             while True:
                 with self._state_lock:
@@ -357,8 +336,23 @@ class DedupeStore:
                     # auto-vacuum mode); never spin.
                     return
                 previous_freelist = freelist
+
+    @contextmanager
+    def _turn_operation(self) -> Any:
+        self._begin_turn_operation()
+        try:
+            yield
         finally:
             self._end_operation()
+
+    @contextmanager
+    def _sweep_operation(self) -> Any:
+        started = self._begin_sweep_operation()
+        try:
+            yield started
+        finally:
+            if started:
+                self._end_operation()
 
     def _begin_turn_operation(self) -> None:
         # Turn operations run in event-loop worker threads. Once a close was

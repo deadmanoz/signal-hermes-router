@@ -10,11 +10,8 @@ import httpx
 
 from signal_hermes_router import signal as signal_module
 from signal_hermes_router.events import (
-    inspect_signal_event,
     parse_signal_event,
     probe_signal_route,
-    probe_routeability,
-    summarize_signal_event,
 )
 from signal_hermes_router.models import ChatType
 from signal_hermes_router.signal import SignalHttpClient, _iter_sse_json
@@ -201,7 +198,7 @@ class EventTests(unittest.TestCase):
             },
             "account": "synthetic-account-number",
         }
-        summary = summarize_signal_event(raw)
+        summary = str(probe_signal_route(raw).summary)
         self.assertEqual(summary, "shape=direct message_type=typingMessage has_group=false")
         self.assertNotIn("synthetic-source-number", summary)
         self.assertNotIn("sender-uuid", summary)
@@ -216,7 +213,7 @@ class EventTests(unittest.TestCase):
             },
             "account": "synthetic-account-number",
         }
-        summary = inspect_signal_event(raw)
+        summary = probe_signal_route(raw).summary
         self.assertEqual(summary.shape, "direct")
         self.assertEqual(summary.message_type, "receiptMessage")
         self.assertFalse(summary.has_group)
@@ -239,12 +236,12 @@ class EventTests(unittest.TestCase):
                 }
             },
         }
-        group_id, summary = probe_routeability(raw)
-        self.assertEqual(group_id, "group-id")
-        self.assertEqual(summary.shape, "jsonrpc")
-        self.assertEqual(summary.message_type, "dataMessage")
-        self.assertTrue(summary.has_group)
-        summary_str = str(summary)
+        probe = probe_signal_route(raw)
+        self.assertEqual(probe.group_id, "group-id")
+        self.assertEqual(probe.summary.shape, "jsonrpc")
+        self.assertEqual(probe.summary.message_type, "dataMessage")
+        self.assertTrue(probe.summary.has_group)
+        summary_str = str(probe.summary)
         self.assertNotIn("group-id", summary_str)
         self.assertNotIn("secret", summary_str)
         self.assertNotIn("sender-uuid", summary_str)
@@ -267,12 +264,12 @@ class EventTests(unittest.TestCase):
                 }
             },
         }
-        group_id, summary = probe_routeability(raw)
-        self.assertEqual(group_id, "group-id=")
-        self.assertEqual(summary.shape, "jsonrpc")
-        self.assertEqual(summary.message_type, "syncMessage")
-        self.assertTrue(summary.has_group)
-        summary_str = str(summary)
+        probe = probe_signal_route(raw)
+        self.assertEqual(probe.group_id, "group-id=")
+        self.assertEqual(probe.summary.shape, "jsonrpc")
+        self.assertEqual(probe.summary.message_type, "syncMessage")
+        self.assertTrue(probe.summary.has_group)
+        summary_str = str(probe.summary)
         self.assertNotIn("group-id=", summary_str)
         self.assertNotIn("secret", summary_str)
         self.assertNotIn("sender-uuid", summary_str)
@@ -292,13 +289,13 @@ class EventTests(unittest.TestCase):
             },
             "account": "account",
         }
-        group_id, summary = probe_routeability(raw)
-        self.assertEqual(group_id, "group-id=")
-        self.assertEqual(summary.shape, "direct")
-        self.assertEqual(summary.message_type, "editMessage")
-        self.assertTrue(summary.has_group)
-        self.assertNotIn("group-id=", str(summary))
-        self.assertNotIn("edited secret", str(summary))
+        probe = probe_signal_route(raw)
+        self.assertEqual(probe.group_id, "group-id=")
+        self.assertEqual(probe.summary.shape, "direct")
+        self.assertEqual(probe.summary.message_type, "editMessage")
+        self.assertTrue(probe.summary.has_group)
+        self.assertNotIn("group-id=", str(probe.summary))
+        self.assertNotIn("edited secret", str(probe.summary))
 
     def test_probe_routeability_returns_sync_edit_message_group_id(self) -> None:
         raw = {
@@ -320,13 +317,13 @@ class EventTests(unittest.TestCase):
             },
             "account": "account",
         }
-        group_id, summary = probe_routeability(raw)
-        self.assertEqual(group_id, "group-id=")
-        self.assertEqual(summary.shape, "direct")
-        self.assertEqual(summary.message_type, "syncMessage")
-        self.assertTrue(summary.has_group)
-        self.assertNotIn("group-id=", str(summary))
-        self.assertNotIn("linked-device edited secret", str(summary))
+        probe = probe_signal_route(raw)
+        self.assertEqual(probe.group_id, "group-id=")
+        self.assertEqual(probe.summary.shape, "direct")
+        self.assertEqual(probe.summary.message_type, "syncMessage")
+        self.assertTrue(probe.summary.has_group)
+        self.assertNotIn("group-id=", str(probe.summary))
+        self.assertNotIn("linked-device edited secret", str(probe.summary))
 
     def test_probe_routeability_marks_receive_exception_without_payload(self) -> None:
         raw = {
@@ -340,14 +337,16 @@ class EventTests(unittest.TestCase):
             },
             "account": "account",
         }
-        group_id, summary = probe_routeability(raw)
-        self.assertIsNone(group_id)
-        self.assertEqual(summary.shape, "direct")
-        self.assertEqual(summary.message_type, "unknown")
-        self.assertFalse(summary.has_group)
-        self.assertTrue(summary.has_exception)
-        summary_str = str(summary)
+        probe = probe_signal_route(raw)
+        self.assertIsNone(probe.group_id)
+        self.assertEqual(probe.summary.shape, "direct")
+        self.assertEqual(probe.summary.message_type, "unknown")
+        self.assertFalse(probe.summary.has_group)
+        self.assertTrue(probe.summary.has_exception)
+        self.assertEqual(probe.summary.exception_type, "RuntimeException")
+        summary_str = str(probe.summary)
         self.assertIn("has_exception=true", summary_str)
+        self.assertIn("exception_type=RuntimeException", summary_str)
         self.assertNotIn("private exception detail", summary_str)
         self.assertNotIn("sender-uuid", summary_str)
 
@@ -360,11 +359,11 @@ class EventTests(unittest.TestCase):
             },
             "account": "account",
         }
-        group_id, summary = probe_routeability(raw)
-        self.assertIsNone(group_id)
-        self.assertEqual(summary.shape, "direct")
-        self.assertEqual(summary.message_type, "dataMessage")
-        self.assertFalse(summary.has_group)
+        probe = probe_signal_route(raw)
+        self.assertIsNone(probe.group_id)
+        self.assertEqual(probe.summary.shape, "direct")
+        self.assertEqual(probe.summary.message_type, "dataMessage")
+        self.assertFalse(probe.summary.has_group)
 
     def test_probe_signal_route_returns_direct_facts_without_leaking_summary(self) -> None:
         raw = {
@@ -392,11 +391,11 @@ class EventTests(unittest.TestCase):
 
     def test_probe_routeability_returns_none_for_unknown_shape(self) -> None:
         raw = {"not": "a signal envelope"}
-        group_id, summary = probe_routeability(raw)
-        self.assertIsNone(group_id)
-        self.assertEqual(summary.shape, "unknown")
-        self.assertEqual(summary.message_type, "none")
-        self.assertFalse(summary.has_group)
+        probe = probe_signal_route(raw)
+        self.assertIsNone(probe.group_id)
+        self.assertEqual(probe.summary.shape, "unknown")
+        self.assertEqual(probe.summary.message_type, "none")
+        self.assertFalse(probe.summary.has_group)
 
 
 class SignalHttpTests(unittest.IsolatedAsyncioTestCase):

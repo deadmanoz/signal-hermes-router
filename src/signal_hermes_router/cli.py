@@ -35,6 +35,26 @@ DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS = 300.0
 DEFAULT_CONTROL_RESPONSE_LIMIT_BYTES = 8 * 1024 * 1024
 
 
+def _control_socket_parent() -> argparse.ArgumentParser:
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument(
+        "--client-timeout",
+        type=float,
+        default=DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
+        help="local control socket round-trip timeout in seconds",
+    )
+    parent.add_argument("--control-socket", type=Path)
+    return parent
+
+
+def _resolve_socket_path(
+    args: argparse.Namespace, *, resolve_payload_cap: bool = False
+) -> tuple[Path, int | None]:
+    if args.control_socket is not None:
+        return args.control_socket.expanduser(), None
+    return load_control_discovery(args.config, resolve_payload_cap=resolve_payload_cap)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="signal-hermes-router")
     parser.add_argument("--config", type=Path, default=Path("config.yaml"))
@@ -42,34 +62,26 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--log-level", default="INFO")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("serve", help="run the long-lived Signal router")
-    trigger = subparsers.add_parser("trigger-job", help="trigger a configured scheduled job")
+    control_parent = _control_socket_parent()
+    trigger = subparsers.add_parser(
+        "trigger-job", help="trigger a configured scheduled job", parents=[control_parent]
+    )
     trigger.add_argument("job_id")
     trigger.add_argument("--scheduled-at")
     trigger.add_argument("--idempotency-key")
     trigger.add_argument("--timeout", type=float, help="router route-lock timeout in seconds")
-    trigger.add_argument(
-        "--client-timeout",
-        type=float,
-        default=DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
-        help="local control socket round-trip timeout in seconds",
+    notify = subparsers.add_parser(
+        "notify-route", help="send a configured route notification", parents=[control_parent]
     )
-    trigger.add_argument("--control-socket", type=Path)
-    notify = subparsers.add_parser("notify-route", help="send a configured route notification")
     notify.add_argument("notification_id")
     notify.add_argument("--payload-file", type=Path, required=True)
     notify.add_argument("--attachment", type=Path, action="append", default=[])
     notify.add_argument("--idempotency-key")
     notify.add_argument("--timeout", type=float, help="router route-lock timeout in seconds")
-    notify.add_argument(
-        "--client-timeout",
-        type=float,
-        default=DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
-        help="local control socket round-trip timeout in seconds",
-    )
-    notify.add_argument("--control-socket", type=Path)
     preflight = subparsers.add_parser(
         "preflight-permissions",
         help="compare route permission allowlists with ACP tool surfaces",
+        parents=[control_parent],
     )
     preflight.add_argument("--active-only", action="store_true")
     preflight.add_argument("--route", action="append", default=[])
@@ -81,40 +93,23 @@ def main(argv: list[str] | None = None) -> None:
         help="version 1 full_callable ACP tool-surface contract",
     )
     preflight.add_argument("--json", action="store_true")
-    preflight.add_argument(
-        "--client-timeout",
-        type=float,
-        default=DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
-        help="local control socket round-trip timeout in seconds",
+    status = subparsers.add_parser(
+        "route-status", help="inspect route health and recovery state", parents=[control_parent]
     )
-    preflight.add_argument("--control-socket", type=Path)
-    status = subparsers.add_parser("route-status", help="inspect route health and recovery state")
     status.add_argument("--route", action="append", default=[])
     status.add_argument("--route-index", action="append", type=int, default=[])
     status.add_argument("--profile", action="append", default=[])
     status.add_argument("--json", action="store_true")
-    status.add_argument(
-        "--client-timeout",
-        type=float,
-        default=DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
-        help="local control socket round-trip timeout in seconds",
-    )
-    status.add_argument("--control-socket", type=Path)
     reload_cfg = subparsers.add_parser(
-        "reload-config", help="atomically reload router routes configuration from disk"
+        "reload-config",
+        help="atomically reload router routes configuration from disk",
+        parents=[control_parent],
     )
     reload_cfg.add_argument(
         "--candidate-routes",
         type=Path,
         help="override routes.yaml path (defaults to router startup path)",
     )
-    reload_cfg.add_argument(
-        "--client-timeout",
-        type=float,
-        default=DEFAULT_CONTROL_CLIENT_TIMEOUT_SECONDS,
-        help="local control socket round-trip timeout in seconds",
-    )
-    reload_cfg.add_argument("--control-socket", type=Path)
     args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
     exit_code = asyncio.run(_main_async(args))
@@ -229,7 +224,8 @@ def _resolve_client_timeout(args: argparse.Namespace) -> float | None:
 
 async def _trigger_job(args: argparse.Namespace) -> int:
     try:
-        socket_path = (args.control_socket or load_control_discovery(args.config)[0]).expanduser()
+        socket_path, _ = _resolve_socket_path(args)
+        socket_path = socket_path.expanduser()
         scheduled_at = parse_scheduled_at(args.scheduled_at) if args.scheduled_at else None
         client_timeout = _resolve_client_timeout(args)
         response = await trigger_job_via_control_socket(
@@ -250,14 +246,8 @@ async def _trigger_job(args: argparse.Namespace) -> int:
 
 async def _notify_route(args: argparse.Namespace) -> int:
     try:
-        if args.control_socket is not None:
-            socket_path = args.control_socket.expanduser()
-            max_payload_bytes = None
-        else:
-            discovered_socket, max_payload_bytes = load_control_discovery(
-                args.config, resolve_payload_cap=True
-            )
-            socket_path = discovered_socket.expanduser()
+        socket_path, max_payload_bytes = _resolve_socket_path(args, resolve_payload_cap=True)
+        socket_path = socket_path.expanduser()
         client_timeout = _resolve_client_timeout(args)
         raw_payload = json.loads(args.payload_file.read_text(encoding="utf-8"))
         payload = canonicalize_notification_payload(
@@ -326,7 +316,8 @@ async def _preflight_permissions(args: argparse.Namespace) -> int:
 
 async def _route_status(args: argparse.Namespace) -> int:
     try:
-        socket_path = (args.control_socket or load_control_discovery(args.config)[0]).expanduser()
+        socket_path, _ = _resolve_socket_path(args)
+        socket_path = socket_path.expanduser()
         client_timeout = _resolve_client_timeout(args)
         response = await route_status_via_control_socket(
             socket_path,
@@ -348,7 +339,8 @@ async def _route_status(args: argparse.Namespace) -> int:
 
 async def _reload_config(args: argparse.Namespace) -> int:
     try:
-        socket_path = (args.control_socket or load_control_discovery(args.config)[0]).expanduser()
+        socket_path, _ = _resolve_socket_path(args)
+        socket_path = socket_path.expanduser()
         client_timeout = _resolve_client_timeout(args)
         response = await reload_config_via_control_socket(
             socket_path,

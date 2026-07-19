@@ -254,7 +254,7 @@ router:
             self.assertEqual(socket_path, socket_file)
             self.assertIsNone(cap)
 
-    def test_app_config_find_route_returns_none_for_missing_route(self) -> None:
+    def test_app_config_find_group_route_returns_none_for_missing_route(self) -> None:
         app = AppConfig(
             router=RouterConfig(),
             routes=(
@@ -268,7 +268,7 @@ router:
             ),
         )
 
-        self.assertIsNone(app.find_route("signal", "OTHER"))
+        self.assertIsNone(app.find_group_route("signal", "OTHER"))
 
     def test_load_yaml_rejects_non_mapping_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

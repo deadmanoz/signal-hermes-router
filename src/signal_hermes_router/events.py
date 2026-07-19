@@ -32,6 +32,7 @@ class SignalEventSummary:
     message_type: str
     has_group: bool
     has_exception: bool = False
+    exception_type: str | None = None
 
     def __str__(self) -> str:
         summary = (
@@ -40,6 +41,8 @@ class SignalEventSummary:
         )
         if self.has_exception:
             summary += " has_exception=true"
+        if self.exception_type:
+            summary += f" exception_type={self.exception_type}"
         return summary
 
 
@@ -52,28 +55,12 @@ class SignalRouteProbe:
     summary: SignalEventSummary
 
 
-def inspect_signal_event(raw: dict[str, Any]) -> SignalEventSummary:
-    return probe_signal_route(raw).summary
-
-
-def summarize_signal_event(raw: dict[str, Any]) -> str:
-    return str(inspect_signal_event(raw))
-
-
-def probe_routeability(raw: dict[str, Any]) -> tuple[str | None, SignalEventSummary]:
-    """Lightweight probe: return the group_id (if any) and a content-free summary.
-
-    Does not parse message text or attachments.
-    """
-    probe = probe_signal_route(raw)
-    return probe.group_id, probe.summary
-
-
 def probe_signal_route(raw: dict[str, Any]) -> SignalRouteProbe:
     """Lightweight probe for route matching without parsing content or attachments."""
     params = unwrap_signal_event(raw)
     envelope = params.get("envelope") if isinstance(params, dict) else None
     has_exception = _has_exception(params)
+    exception_type = _exception_type(params)
     if not isinstance(envelope, dict):
         return SignalRouteProbe(
             group_id=None,
@@ -85,6 +72,7 @@ def probe_signal_route(raw: dict[str, Any]) -> SignalRouteProbe:
                 message_type="none",
                 has_group=False,
                 has_exception=has_exception,
+                exception_type=exception_type,
             ),
         )
     shape = "direct" if raw is params else "jsonrpc"
@@ -110,6 +98,7 @@ def probe_signal_route(raw: dict[str, Any]) -> SignalRouteProbe:
             message_type=message_type,
             has_group=has_group,
             has_exception=has_exception,
+            exception_type=exception_type,
         ),
     )
 
@@ -126,11 +115,7 @@ def parse_signal_event(
     data_message = _data_message_from_envelope(envelope)
     group_id = _group_id(data_message)
     if group_id:
-        sender_id = str(
-            _first_present(envelope, "sourceUuid", "sourceNumber", "source")
-            or _first_present(params, "account")
-            or "unknown"
-        )
+        sender_id = _sender_id_from_envelope(envelope, params)
         source_uuid = str(_first_present(envelope, "sourceUuid", "source") or sender_id)
         source_number = _optional_str(_first_present(envelope, "sourceNumber", "source"))
         return _normalized_event(
@@ -165,6 +150,14 @@ def parse_signal_event(
         group_id=None,
         raw=raw,
         max_attachment_bytes=max_attachment_bytes,
+    )
+
+
+def _sender_id_from_envelope(envelope: dict[str, Any], params: dict[str, Any]) -> str:
+    return str(
+        _first_present(envelope, "sourceUuid", "sourceNumber", "source")
+        or _first_present(params, "account")
+        or "unknown"
     )
 
 
@@ -232,6 +225,17 @@ def _data_message_from_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
 
 def _has_exception(params: Any) -> bool:
     return isinstance(params, dict) and params.get("exception") is not None
+
+
+def _exception_type(params: Any) -> str | None:
+    if not isinstance(params, dict):
+        return None
+    exception = params.get("exception")
+    if isinstance(exception, dict):
+        exc_type = exception.get("type")
+        if isinstance(exc_type, str) and exc_type:
+            return exc_type
+    return None
 
 
 def _optional_str(value: Any) -> str | None:

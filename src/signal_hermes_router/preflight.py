@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -424,11 +424,109 @@ def parse_preflight_scope(value: dict[str, Any] | None = None) -> PreflightScope
     if not isinstance(raw, dict):
         raise ValueError("preflight scope must be a mapping")
     return PreflightScope(
-        active_only=_as_bool(raw.get("active_only", False)),
+        active_only=_preflight_as_bool(raw.get("active_only", False)),
         route_names=_string_tuple(raw, "route_names", aliases=("routes",)),
         route_indexes=_non_negative_int_tuple(raw, "route_indexes", aliases=("route_indices",)),
         profiles=_string_tuple(raw, "profiles"),
     )
+
+
+def _iter_expected_synthetic_tools(
+    config: AppConfig,
+    route_positions: dict[int, tuple[int, str]],
+) -> Iterable[ExpectedPermissionTool]:
+    for job in config.scheduled_jobs:
+        route = config.find_route_by_name(job.route_name)
+        if route is not None and id(route) in route_positions and job.permission_policy is not None:
+            _index, ref = route_positions[id(route)]
+            yield from _policy_expected_tools(
+                route,
+                ref,
+                job.permission_policy,
+                source_kind="scheduled_job",
+                source_id=job.id,
+            )
+    for notification in config.notifications:
+        route = config.find_route_by_name(notification.route_name)
+        if (
+            route is not None
+            and id(route) in route_positions
+            and notification.permission_policy is not None
+        ):
+            _index, ref = route_positions[id(route)]
+            yield from _policy_expected_tools(
+                route,
+                ref,
+                notification.permission_policy,
+                source_kind="notification",
+                source_id=notification.id,
+            )
+
+
+def _iter_local_tool_issues(
+    config: AppConfig,
+    route_ref_by_id: dict[int, str],
+    effective_scope: PreflightScope,
+    surfaces: dict[str, ToolSurface],
+) -> Iterable[LocalToolExposedIssue]:
+    for index, route in enumerate(config.routes):
+        if not effective_scope.matches_route(index, route):
+            continue
+        if not route.mcp_only:
+            continue
+        checked_surface = surfaces.get(route.profile)
+        ref = route_ref(index, route)
+        if checked_surface is not None:
+            for tool_name in sorted(checked_surface.tool_names):
+                if is_local_tool(tool_name):
+                    yield LocalToolExposedIssue(
+                        route_ref=ref,
+                        profile=route.profile,
+                        tool_name=tool_name,
+                        source_kind="profile_surface",
+                    )
+        for rule in route.permission_policy.rules:
+            if is_local_tool(rule.tool_name):
+                yield LocalToolExposedIssue(
+                    route_ref=ref,
+                    profile=route.profile,
+                    tool_name=rule.tool_name,
+                    source_kind="route",
+                )
+    for job in config.scheduled_jobs:
+        route = config.find_route_by_name(job.route_name)
+        if route is None or id(route) not in route_ref_by_id:
+            continue
+        if not route.mcp_only:
+            continue
+        if job.permission_policy is not None:
+            ref = route_ref_by_id[id(route)]
+            for rule in job.permission_policy.rules:
+                if is_local_tool(rule.tool_name):
+                    yield LocalToolExposedIssue(
+                        route_ref=ref,
+                        profile=route.profile,
+                        tool_name=rule.tool_name,
+                        source_kind="scheduled_job",
+                        source_id=job.id,
+                    )
+    for notification in config.notifications:
+        route = config.find_route_by_name(notification.route_name)
+        if route is None or id(route) not in route_ref_by_id:
+            continue
+        if not route.mcp_only:
+            continue
+        if notification.permission_policy is not None:
+            ref = route_ref_by_id[id(route)]
+            for rule in notification.permission_policy.rules:
+                if is_local_tool(rule.tool_name):
+                    yield LocalToolExposedIssue(
+                        route_ref=ref,
+                        profile=route.profile,
+                        tool_name=rule.tool_name,
+                        source_kind="notification",
+                        source_id=notification.id,
+                    )
 
 
 def collect_expected_permission_tools(
@@ -454,36 +552,7 @@ def collect_expected_permission_tools(
                 source_kind="route",
             )
         )
-    for job in config.scheduled_jobs:
-        route = config.find_route_by_name(job.route_name)
-        if route is not None and id(route) in route_positions and job.permission_policy is not None:
-            _index, ref = route_positions[id(route)]
-            expected.extend(
-                _policy_expected_tools(
-                    route,
-                    ref,
-                    job.permission_policy,
-                    source_kind="scheduled_job",
-                    source_id=job.id,
-                )
-            )
-    for notification in config.notifications:
-        route = config.find_route_by_name(notification.route_name)
-        if (
-            route is not None
-            and id(route) in route_positions
-            and notification.permission_policy is not None
-        ):
-            _index, ref = route_positions[id(route)]
-            expected.extend(
-                _policy_expected_tools(
-                    route,
-                    ref,
-                    notification.permission_policy,
-                    source_kind="notification",
-                    source_id=notification.id,
-                )
-            )
+    expected.extend(_iter_expected_synthetic_tools(config, route_positions))
     return tuple(expected)
 
 
@@ -595,76 +664,9 @@ async def run_permission_preflight(
     # report does not emit findings derived from a scope it has just declared
     # uncheckable.
     if not scope_errors:
-        for index, route in enumerate(config.routes):
-            if not effective_scope.matches_route(index, route):
-                continue
-            if not route.mcp_only:
-                continue
-            checked_surface = surfaces.get(route.profile)
-            ref = route_ref(index, route)
-            if checked_surface is not None:
-                for tool_name in sorted(checked_surface.tool_names):
-                    if is_local_tool(tool_name):
-                        local_tools.append(
-                            LocalToolExposedIssue(
-                                route_ref=ref,
-                                profile=route.profile,
-                                tool_name=tool_name,
-                                source_kind="profile_surface",
-                            )
-                        )
-            # Also flag local tools in the route's own allowlist — the runtime
-            # backstop rejects these, so preflight should surface the config mistake.
-            for rule in route.permission_policy.rules:
-                if is_local_tool(rule.tool_name):
-                    local_tools.append(
-                        LocalToolExposedIssue(
-                            route_ref=ref,
-                            profile=route.profile,
-                            tool_name=rule.tool_name,
-                            source_kind="route",
-                        )
-                    )
-        # Also scan synthetic definitions (jobs/notifications) for local tools
-        # on mcp_only routes, but only when the route is in scope.
-        for job in config.scheduled_jobs:
-            route = config.find_route_by_name(job.route_name)
-            if route is None or id(route) not in route_ref_by_id:
-                continue
-            if not route.mcp_only:
-                continue
-            if job.permission_policy is not None:
-                ref = route_ref_by_id[id(route)]
-                for rule in job.permission_policy.rules:
-                    if is_local_tool(rule.tool_name):
-                        local_tools.append(
-                            LocalToolExposedIssue(
-                                route_ref=ref,
-                                profile=route.profile,
-                                tool_name=rule.tool_name,
-                                source_kind="scheduled_job",
-                                source_id=job.id,
-                            )
-                        )
-        for notification in config.notifications:
-            route = config.find_route_by_name(notification.route_name)
-            if route is None or id(route) not in route_ref_by_id:
-                continue
-            if not route.mcp_only:
-                continue
-            if notification.permission_policy is not None:
-                ref = route_ref_by_id[id(route)]
-                for rule in notification.permission_policy.rules:
-                    if is_local_tool(rule.tool_name):
-                        local_tools.append(
-                            LocalToolExposedIssue(
-                                route_ref=ref,
-                                profile=route.profile,
-                                tool_name=rule.tool_name,
-                                source_kind="notification",
-                                source_id=notification.id,
-                            )
-                        )
+        local_tools.extend(
+            _iter_local_tool_issues(config, route_ref_by_id, effective_scope, surfaces)
+        )
     # Deduplicate within each source so distinct same-source tools are preserved.
     seen_local_tools: set[tuple[str, str, str, str, str | None]] = set()
     deduped: list[LocalToolExposedIssue] = []
@@ -842,7 +844,7 @@ def _string_tuple(
     *,
     aliases: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
-    value = _first_present(raw, key, aliases)
+    value = _preflight_first_present(raw, key, aliases)
     if value is None:
         return ()
     if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
@@ -856,7 +858,7 @@ def _non_negative_int_tuple(
     *,
     aliases: tuple[str, ...] = (),
 ) -> tuple[int, ...]:
-    value = _first_present(raw, key, aliases)
+    value = _preflight_first_present(raw, key, aliases)
     if value is None:
         return ()
     if not isinstance(value, list) or any(
@@ -866,14 +868,14 @@ def _non_negative_int_tuple(
     return tuple(value)
 
 
-def _first_present(raw: dict[str, Any], key: str, aliases: tuple[str, ...]) -> Any:
+def _preflight_first_present(raw: dict[str, Any], key: str, aliases: tuple[str, ...]) -> Any:
     for candidate in (key, *aliases):
         if candidate in raw:
             return raw[candidate]
     return None
 
 
-def _as_bool(value: Any) -> bool:
+def _preflight_as_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     raise ValueError("preflight scope active_only must be a boolean")

@@ -307,13 +307,7 @@ def _is_sweepable_dir(relative: Path) -> bool:
         return True
     if len(parts) == 2:
         return _YEAR_RE.fullmatch(parts[1]) is not None
-    if len(parts) >= 3:
-        return (
-            parts[0] != _OUTBOUND_DIR
-            and _YEAR_RE.fullmatch(parts[1]) is not None
-            and _MONTH_RE.fullmatch(parts[2]) is not None
-        )
-    return False
+    return _is_archive_dir(relative)
 
 
 def _group_directory_entries(

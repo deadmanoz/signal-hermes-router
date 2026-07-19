@@ -4,9 +4,10 @@ import asyncio
 import json
 import logging
 import random
+import time
 import uuid
 from collections.abc import AsyncIterator, Sequence
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -75,10 +76,7 @@ class SignalHttpClient:
         *,
         attachments: Sequence[str] = (),
     ) -> dict[str, Any]:
-        params: dict[str, Any] = {"groupId": group_id, "message": message}
-        if attachments:
-            params["attachments"] = list(attachments)
-        return await self._send(params)
+        return await self._send("groupId", group_id, message, attachments)
 
     async def send_direct(
         self,
@@ -87,12 +85,18 @@ class SignalHttpClient:
         *,
         attachments: Sequence[str] = (),
     ) -> dict[str, Any]:
-        params: dict[str, Any] = {"recipient": [recipient], "message": message}
+        return await self._send("recipient", [recipient], message, attachments)
+
+    async def _send(
+        self,
+        recipient_key: str,
+        recipient_value: str | list[str],
+        message: str,
+        attachments: Sequence[str],
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {recipient_key: recipient_value, "message": message}
         if attachments:
             params["attachments"] = list(attachments)
-        return await self._send(params)
-
-    async def _send(self, params: dict[str, Any]) -> dict[str, Any]:
         try:
             return await self.rpc("send", params)
         except _RETRYABLE_SEND_ERRORS as exc:
@@ -135,12 +139,13 @@ class SignalHttpClient:
         max_reconnect_delay: float = 60.0,
     ) -> AsyncIterator[dict[str, Any]]:
         delay = reconnect_delay
+        limiter = MalformedFrameLimiter()
         while True:
             try:
                 async with self._events_client.stream("GET", "/api/v1/events") as response:
                     response.raise_for_status()
                     async for event in _iter_sse_json(
-                        response, max_event_bytes=self.max_event_bytes
+                        response, max_event_bytes=self.max_event_bytes, limiter=limiter
                     ):
                         delay = reconnect_delay
                         yield event
@@ -158,8 +163,47 @@ class SignalHttpClient:
             delay = min(delay * 2, max_reconnect_delay)
 
 
+class MalformedFrameLimiter:
+    def __init__(
+        self,
+        *,
+        max_logs: int = 3,
+        window_seconds: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.max_logs = max_logs
+        self.window_seconds = window_seconds
+        self._clock = clock
+        self._count = 0
+        self._suppressed = 0
+        self._window_start: float | None = None
+
+    def log_malformed(self, frame_size: int) -> bool:
+        now = self._clock()
+        if self._window_start is None:
+            self._window_start = now
+        if now - self._window_start > self.window_seconds:
+            if self._suppressed > 0:
+                LOGGER.warning(
+                    "%d malformed SSE frames suppressed in last %.0fs",
+                    self._suppressed,
+                    self.window_seconds,
+                )
+            self._count = 0
+            self._suppressed = 0
+            self._window_start = now
+        if self._count < self.max_logs:
+            self._count += 1
+            return True
+        self._suppressed += 1
+        return False
+
+
 async def _iter_sse_json(
-    response: httpx.Response, *, max_event_bytes: int | None = None
+    response: httpx.Response,
+    *,
+    max_event_bytes: int | None = None,
+    limiter: MalformedFrameLimiter | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     data_lines: list[str] = []
     event_bytes = 0
@@ -170,7 +214,7 @@ async def _iter_sse_json(
                 frame_bytes = event_bytes
                 data_lines.clear()
                 event_bytes = 0
-                event = _decode_sse_frame(data, frame_bytes)
+                event = _decode_sse_frame(data, frame_bytes, limiter=limiter)
                 if event is not None:
                     yield event
             continue
@@ -179,12 +223,14 @@ async def _iter_sse_json(
             event_bytes = _next_sse_event_size(event_bytes, data_line, max_event_bytes)
             data_lines.append(data_line)
     if data_lines:
-        event = _decode_sse_frame("\n".join(data_lines), event_bytes)
+        event = _decode_sse_frame("\n".join(data_lines), event_bytes, limiter=limiter)
         if event is not None:
             yield event
 
 
-def _decode_sse_frame(data: str, size_bytes: int) -> dict[str, Any] | None:
+def _decode_sse_frame(
+    data: str, size_bytes: int, *, limiter: MalformedFrameLimiter | None = None
+) -> dict[str, Any] | None:
     # Mirror the ACP peer's log-and-continue handling of undecodable lines:
     # one malformed frame must not tear down the SSE stream, because a
     # reconnect can silently lose stream position (signal-cli has no replay).
@@ -198,7 +244,8 @@ def _decode_sse_frame(data: str, size_bytes: int) -> dict[str, Any] | None:
     except (ValueError, RecursionError):
         payload = None
     if not isinstance(payload, dict):
-        LOGGER.warning("Skipping malformed Signal SSE frame (%d bytes)", size_bytes)
+        if limiter is None or limiter.log_malformed(size_bytes):
+            LOGGER.warning("Skipping malformed Signal SSE frame (%d bytes)", size_bytes)
         return None
     return payload
 
