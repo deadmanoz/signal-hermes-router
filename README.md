@@ -11,12 +11,13 @@ Hermes profiles own behaviour, skills, app access, and media interpretation. The
 ```text
 signal-cli events  ------> signal-hermes-router -----> hermes -p A acp
 local scheduler    --+             |            \-----> hermes -p B acp
-  trigger-job        |             \------------------> hermes -p C acp
-local script       --+
-  notify-route       |
-operator CLI      --+
-  route-status       |
-  control.sock       |
+  trigger-job        |             |             \-----> hermes -p C acp
+local script       --+             |
+  notify-route       |             |
+operator CLI      --+              |
+  route-status       |             |
+  reload-config      |             |
+  control.sock       |             |
                      \-------- Signal replies --------> signal-cli
 ```
 
@@ -113,11 +114,20 @@ Trusted local automation can attach one staged image to a notification:
 signal-hermes-router --config /path/to/private/config.yaml notify-route camera-person --payload-file /path/to/private/payload.json --attachment /path/to/private/media/camera/person.png --idempotency-key camera-person-1714521600000
 ```
 
+See [docs/media.md](docs/media.md#outbound-notification-images) for the staging
+contract and validation rules.
+
 Operators can inspect route health, circuit state, cached-session state, and
 last failure metadata through the same local control socket:
 
 ```bash
 signal-hermes-router --config /path/to/private/config.yaml route-status --json
+```
+
+Operators can reload `routes.yaml` without restarting the router:
+
+```bash
+signal-hermes-router --config /path/to/private/config.yaml reload-config
 ```
 
 Before activating routes or changing allowlists, run a permission preflight
@@ -128,19 +138,12 @@ signal-hermes-router --config /path/to/private/config.yaml --routes /path/to/pri
 signal-hermes-router --config /path/to/private/config.yaml preflight-permissions --active-only --control-socket /path/to/private/control.sock --json
 ```
 
-Both probe sources must provide a version 1 `full_callable` catalog. See
-[docs/permissions.md](docs/permissions.md#permission-preflight) for the contract
-and transition checklist.
-
-The control-socket form uses the running router's normal ACP supervisor. Probing
-an idle profile can start that profile's ACP subprocess, and supervisor
-cooldowns or startup failures are reported as probe errors. If a profile is
-already handling a turn when preflight starts probing it, live preflight reports
-that profile as busy instead of waiting behind the turn.
+See [docs/permissions.md](docs/permissions.md#permission-preflight) for the v1
+contract, transition checklist, and live-probe behavior.
 
 ## Documentation
 
-- [docs/configuration.md](docs/configuration.md) - config schema, secret resolvers, route states, session policies
+- [docs/configuration.md](docs/configuration.md) - config schema, secret resolvers, route states, session policies, live reload
 - [docs/deployment.md](docs/deployment.md) - generic code sync procedure for private deployments
 - [docs/route-context.md](docs/route-context.md) - prompt-safe context keys, nonce delimiter, escaping
 - [docs/permissions.md](docs/permissions.md) - what the static ACP permission handler and permission preflight are (and aren't)

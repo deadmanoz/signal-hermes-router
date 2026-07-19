@@ -21,7 +21,7 @@ SKIP_DIRS = {
     "htmlcov",
     "private",
 }
-SKIP_FILES = {"uv.lock", "security_best_practices_report.md"}
+SKIP_FILES = {"uv.lock"}
 TEXT_SUFFIXES = {".md", ".py", ".toml", ".yaml", ".yml", ".txt", ".json"}
 FORBIDDEN_FILENAMES = {"config.yaml", "routes.yaml"}
 

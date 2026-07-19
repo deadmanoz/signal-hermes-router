@@ -18,16 +18,16 @@ Changing Hermes directly would mean teaching the gateway to load multiple profil
 
 ## What the router does not provide (that the Hermes Signal gateway does)
 
-### Outbound media of any kind
+### Outbound media
 
-The Hermes gateway can send native Signal attachments:
+The Hermes gateway can send native Signal attachments of many kinds:
 
 - `send_image_file` / `send_multiple_images` - PNG, JPEG, GIF, WebP
 - `send_voice` - OGG, MP3, WAV, M4A, AAC
 - `send_video` - MP4
 - `send_document` - any file type (PDF, ZIP, etc.)
 
-The router only sends text out today. A narrow router-owned outbound media contract (so a profile-side plugin can hand the router a validated local attachment reference to deliver alongside the reply) is planned future work, but not implemented - see the README intro for the shape.
+The router sends text for all replies, and may send **one outbound image per notification** via `notify-route --attachment`. The image is validated by the router, frozen into a private `.outbound` artifact, and delivered with the first Signal reply chunk. See [docs/media.md](media.md#outbound-notification-images) for the full staging contract. General outbound media (voice, video, documents, multiple images) is not supported.
 
 ### Rich text in replies
 
@@ -91,9 +91,11 @@ These are the reasons to choose the router in the first place, summarised here f
 - **Route-context preamble** injected into each prompt so a profile knows which route target the turn belongs to (prompt-safe keys only; see [docs/route-context.md](route-context.md)).
 - **Static ACP permission allowlist** that answers `session/request_permission` from config, so a long-running agent doesn't block on operator input mid-turn (see [docs/permissions.md](permissions.md)).
 - **Scheduled synthetic route events** through a local control socket, so host timers can trigger a route-owned turn without a second Signal gateway, direct `signal-cli` send, or profile-side ACP session split.
+- **Live `routes.yaml` reload** without process restart, via `signal-hermes-router reload-config` (see [docs/configuration.md](configuration.md#live-configuration-reload-routes-only)).
+- **Outbound notification images** for trusted local automation, staged under `router.media_root` and validated before delivery (see [docs/media.md](media.md#outbound-notification-images)).
 
 ## Summary
 
 If you run one Hermes profile against one Signal number and want every Signal feature out of the box (image/voice/video replies, native quotes, reactions, markdown formatting, voice transcription, DM support), use the **Hermes Signal gateway**.
 
-If you need more than one Hermes profile behind a single Signal number - at the cost of text-only replies for now, no reactions, no native quoting, and explicit-route-only ingest - use **`signal-hermes-router`**.
+If you need more than one Hermes profile behind a single Signal number - at the cost of text-only ordinary replies (single outbound notification images are supported), no reactions, no native quoting, and explicit-route-only ingest - use **`signal-hermes-router`**.

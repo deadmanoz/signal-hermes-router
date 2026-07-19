@@ -47,7 +47,7 @@ signal-cli daemon → signal.py (HTTP/SSE client)
                   → events.py (normalise to NormalizedEvent)
                   → dedupe.py (sqlite route-scoped event claims; retention-pruned)
                   → router.py (route-state gate → media → prompt → reply)
-local automation → cli.py/control socket (trigger-job, notify-route, preflight-permissions)
+local automation → cli.py/control socket (trigger-job, notify-route, route-status, reload-config, preflight-permissions)
                   → router.py (same route-state/session/reply path)
                        │
                        ├─ media.py       attachment fetch + per-route storage + retention sweep (write_attachment, MediaManifest, plan_media_sweep)

@@ -6,10 +6,10 @@ Thanks for considering a contribution. **Read [AGENTS.md](AGENTS.md) first** —
 
 The router does exactly four things:
 
-1. **Transport in** — consume Signal events from upstream `signal-cli`, normalise, dedupe, store attachments.
+1. **Transport in** — consume Signal events from upstream `signal-cli`, normalise, dedupe, store attachments, and accept configured local synthetic turns through the private control socket.
 2. **Route** — map a Signal group to a Hermes profile; supervise one ACP subprocess per active profile.
 3. **Speak ACP** — JSON-RPC over stdio with the Hermes profile (`initialize`, `session/new`/`resume`, `session/prompt`, `session/request_permission`).
-4. **Transport out** — send the reply text back to Signal.
+4. **Transport out** — send the agent's reply text and router-validated notification image attachments back to Signal.
 
 See [AGENTS.md](AGENTS.md#scope-discipline) for the full rationale, including what is *not* in scope (agent behaviour, model prompts, skills, media interpretation — those belong in Hermes profiles).
 
