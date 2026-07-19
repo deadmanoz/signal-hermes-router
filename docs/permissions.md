@@ -97,9 +97,8 @@ signal-hermes-router \
 
 The running-router probe is intentionally structured. It reads a tool-surface
 candidate from `agentCapabilities._meta`, including candidates nested under
-`signalHermesRouter`, `signal-hermes-router`, or `signal_hermes_router`. If no
-metadata surface is present, the router tries an optional JSON-RPC extension
-method named `_tool_surface/list`. The `_meta` source must return this envelope:
+`signalHermesRouter`, `signal-hermes-router`, or `signal_hermes_router`. The `_meta`
+source must return this envelope:
 
 ```json
 {
@@ -109,19 +108,16 @@ method named `_tool_surface/list`. The `_meta` source must return this envelope:
 }
 ```
 
-The `_tool_surface/list` source may return the Hermes-native dedicated response
-shape `{tools: [...]}`; the router normalizes this into the version-1
-`full_callable` contract internally. Hermes owns its extension response shape;
-the router owns normalization and validation. The same unversioned `{tools: [...]}`
-shape from `agentCapabilities` metadata or generic external input remains rejected
-unless explicitly wrapped in a versioned envelope.
+If no metadata surface is present, the router tries an optional JSON-RPC extension
+method named `_tool_surface/list`. That method may return the Hermes-native shape
+`{tools: [...]}`; the router normalizes it into the version-1 `full_callable`
+contract by injecting the required `schema_version` and `scope` fields, because
+the method name itself is the callable-catalog contract. The same unversioned
+`{tools: [...]}` shape from `agentCapabilities` metadata or generic external input
+remains rejected unless explicitly wrapped in a versioned envelope. The producer
+must assemble `tools` before Tool Search compression. The router does not import
+Hermes or inspect its private implementation; it validates only this producer contract.
 
-The producer must assemble `tools` before Tool Search compression. The router
-does not import Hermes or inspect its private implementation; it validates only
-this producer contract. For `_tool_surface/list`, the router accepts the Hermes
-native `{tools: [...]}` response and injects the required `schema_version` and
-`scope` fields because the dedicated extension method is semantically the
-complete callable catalog.
 Agents that do not expose either source report `probe_unsupported`; that means
 the agent needs a structured tool-surface integration before live preflight can
 validate it.
@@ -205,9 +201,9 @@ A route may be declared `mcp_only: true` in `routes.yaml`. When set, the router:
 
 1. **Preflight:** Reports `local_tool_exposed` issues for any tool whose name matches a known local-terminal/fs pattern (`terminal/*`, `fs/*`, `shell`, `bash`, `sh`, `zsh`, `python`, `exec`, `execute`, `run`, `run_command`, `run_shell_command`, `subprocess`, `code_interpreter`, `terminal`, `fs`, `read_file`, `write_file`, `edit_file`, `list_directory`, `create_directory`, `delete_file`, `move_file`, `copy_file`) when found in any of:
    - the profile's `full_callable` surface;
-   - the route's own `permission_policy.rules` allowlist;
-   - any `scheduled_jobs[*].permission_policy.rules` allowlist for the route;
-   - any `notifications[*].permission_policy.rules` allowlist for the route.
+   - the route's own `permissions` allowlist;
+   - any `scheduled_jobs[*].permissions` allowlist for the route;
+   - any `notifications[*].permissions` allowlist for the route.
    This is a wiring signal, not a capability policy — it tells the operator the profile surface (or an allowlist) contains tools that look like local execution primitives. The pattern set is intentionally conservative and will not catch every possible local-tool name; a clean report is not evidence of absence. Conversely, bare-name entries (`python`, `fs`, `terminal`) may flag legitimately remote MCP tools that happen to share those names. In that case the remedy is to rename the tool in the profile or, if the tool is genuinely local, to remove `mcp_only` from the route.
 2. **Runtime defense-in-depth:** Rejects `session/request_permission` for any tool call matching those patterns, regardless of whether the tool name appears in the route's allowlist. This is a config-mistake guard (an operator who explicitly allowlisted a local tool on an `mcp_only` route still gets a reject), not a containment boundary. It only covers tools the agent routes through the permission prompt; deny-by-default already handles non-allowlisted tools.
 
