@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.33](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.32...v0.1.33) (2026-07-19)
+
+
+### Features
+
+* **router:** add atomic live configuration reload over the private control socket ([#74](https://github.com/deadmanoz/signal-hermes-router/issues/74)) ([98443a9](https://github.com/deadmanoz/signal-hermes-router/commit/98443a95615e0006fc6bf49e73c699129703cdb0))
+
 ## [0.1.32](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.31...v0.1.32) (2026-07-17)
 
 
