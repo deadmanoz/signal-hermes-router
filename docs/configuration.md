@@ -722,6 +722,26 @@ is not full per-route flood fairness. The bound applies only to inbound Signal
 turns; synthetic turns (`trigger-job`, `notify-route`) keep their own
 `route_lock_timeout_seconds` admission control.
 
+The execution permit is the last resource an inbound turn takes: it is acquired
+inside the profile lock and released only when the turn finishes, so a turn
+queued behind its route or profile lock spends no global capacity and a slow
+shared-profile backlog cannot starve turns on idle profiles. While a turn waits
+for global capacity it holds no profile lock, so a synthetic turn on another
+route sharing that profile is admitted normally (no spurious `BUSY`) and runs
+ahead of the capacity-queued inbound turn.
+
+Known limitation: concurrent dispatch widens the crash-loss window compared with
+the old strictly serial consumer. Several accepted events can be in memory at
+once — dispatched but still queued behind route, profile, or execution capacity
+before their turn creates a dedupe claim — and signal-cli's event stream has no
+replay or acknowledgement, so a hard crash (or a shutdown drain timeout) loses
+those consumed-but-unclaimed events; previously at most one in-flight event was
+exposed. Accepted events are bounded by the in-flight buffer above, and a
+graceful shutdown drains them to completion, so the residual exposure is forced
+termination. Durable inbound admission (persisting accepted events before their
+turn runs) is deliberately out of scope for this change and may be addressed as
+a follow-up.
+
 ## Retention sweeps
 
 `router.retention` bounds the two router-owned stores that otherwise grow

@@ -443,13 +443,19 @@ class SignalHermesRouter:
         self._control_socket_path: Path | None = None
         self._closing = False
         self._shutdown_event = asyncio.Event()
-        # Global execution bound (the max_concurrent_turns knob): acquired inside a
-        # turn AFTER the route lock but BEFORE the profile lock, so a turn never
-        # holds the profile lock while merely waiting for global capacity (which
-        # would make a same-profile synthetic turn see a spurious BUSY). A same-route
-        # turn queued on its route lock still holds no execution permit, and the
-        # route lock caps a route at one running turn, so a route holds at most one
-        # permit.
+        # Global execution bound (the max_concurrent_turns knob): the LAST
+        # resource an inbound turn takes, acquired inside the profile lock
+        # (itself inside the route lock) so capacity is only ever spent on a
+        # turn that can enter its profile. A turn queued behind its profile
+        # lock holds no permit, so a slow shared-profile backlog cannot starve
+        # turns on idle profiles; a same-route turn queued on its route lock
+        # holds no permit either, and the route lock caps a route at one
+        # running turn, so a route holds at most one permit. When no permit is
+        # immediately available the profile lock is released for the capacity
+        # wait and re-acquired afterwards, so profile_lock.locked() stays
+        # synonymous with "a turn is executing on this profile" and a
+        # same-profile synthetic turn never sees a spurious BUSY from an
+        # inbound turn that is merely queued for global capacity.
         self._turn_execution_semaphore = asyncio.Semaphore(config.router.max_concurrent_turns)
         # In-flight dispatch buffer: the consumer holds one permit per dispatched
         # Signal turn task so a burst cannot grow an unbounded task set. Sized well
@@ -1330,34 +1336,71 @@ class SignalHermesRouter:
             if self._is_stale_signal_event(route, event):
                 await self._mark_signal_turn_skipped(turn, reason="stale")
                 return None
-            # Acquire the global execution permit BEFORE the profile lock so a
-            # turn never holds the profile lock while merely waiting for global
-            # execution capacity. If it did, a synthetic notify-route/trigger-job
-            # for another route sharing this profile would observe
-            # profile_lock.locked() and return a spurious BUSY even though no turn
-            # is actually running on the profile. The permit is still acquired
-            # inside the route lock, so a same-route turn queued on the route lock
-            # holds no permit; the route lock caps a route at one running turn, so
-            # a route holds at most one permit.
-            async with self._turn_execution_semaphore:
-                # Re-check freshness after the execution-permit wait: an event
-                # fresh at route-lock acquisition can age past max_event_age_seconds
-                # while parked on the permit, and the contract is that a stale
-                # event is skipped at the moment its turn would actually run.
-                if self._is_stale_signal_event(route, event):
-                    await self._mark_signal_turn_skipped(turn, reason="stale")
-                    return None
-                profile_lock = self._profile_lock(route.profile)
-                async with profile_lock:
-                    # Final freshness re-check at the profile admission point:
-                    # routes can share a profile, so an event fresh at permit
-                    # acquisition can age out waiting behind another route's turn
-                    # on the same profile.
-                    if self._is_stale_signal_event(route, event):
-                        await self._mark_signal_turn_skipped(turn, reason="stale")
-                        return None
-                    outcome = await self._run_turn(turn)
-        return outcome.result if outcome.status == TurnOutcomeStatus.DELIVERED else None
+            outcome = await self._run_signal_turn_gated(route, event, turn)
+        return (
+            outcome.result
+            if outcome is not None and outcome.status == TurnOutcomeStatus.DELIVERED
+            else None
+        )
+
+    async def _run_signal_turn_gated(
+        self,
+        route: Route,
+        event: NormalizedEvent,
+        turn: RoutedTurnInput,
+    ) -> TurnOutcome | None:
+        """Run one inbound Signal turn under the profile lock and the global
+        execution permit, returning None when the turn is skipped as stale.
+
+        Acquisition order is profile lock -> execution permit, so a permit is
+        only ever spent on a turn that can enter its profile: a turn queued
+        behind its profile lock holds no global capacity, and a slow
+        shared-profile backlog cannot starve turns on idle profiles. When no
+        permit is immediately available the profile lock is RELEASED for the
+        capacity wait and re-acquired afterwards, so a same-profile synthetic
+        turn observes the profile as idle (not BUSY) while an inbound turn is
+        merely queued for capacity; a synthetic that barges in this way simply
+        delays the queued inbound's profile re-entry, which is the intended
+        priority for operator-driven turns. asyncio.Semaphore.locked() also
+        reports queued waiters, and the fast-path acquire below never suspends
+        when locked() was False, so no task can take the last permit between
+        the check and the acquire, and the lock is never held across a
+        capacity wait.
+        """
+        profile_lock = self._profile_lock(route.profile)
+        await profile_lock.acquire()
+        lock_held = True
+        permit_held = False
+        try:
+            if self._turn_execution_semaphore.locked():
+                profile_lock.release()
+                lock_held = False
+                await self._turn_execution_semaphore.acquire()
+                permit_held = True
+                try:
+                    await profile_lock.acquire()
+                    lock_held = True
+                except BaseException:
+                    self._turn_execution_semaphore.release()
+                    permit_held = False
+                    raise
+            else:
+                await self._turn_execution_semaphore.acquire()
+                permit_held = True
+            # Freshness re-check at the point the turn actually runs: an event
+            # fresh at route-lock acquisition can age past max_event_age_seconds
+            # while parked on the profile lock, the capacity wait, or the
+            # profile re-entry, and the contract is that a stale event is
+            # skipped at the moment its turn would actually run.
+            if self._is_stale_signal_event(route, event):
+                await self._mark_signal_turn_skipped(turn, reason="stale")
+                return None
+            return await self._run_turn(turn)
+        finally:
+            if permit_held:
+                self._turn_execution_semaphore.release()
+            if lock_held:
+                profile_lock.release()
 
     async def handle_synthetic_job(
         self,

@@ -10,9 +10,11 @@ from signal_hermes_router import router as router_module
 from signal_hermes_router.config import (
     AppConfig,
     Route,
+    SyntheticRouteNotification,
 )
 from signal_hermes_router.dedupe import DedupeStore
-from signal_hermes_router.models import TurnResult
+from signal_hermes_router.models import TurnOutcomeStatus, TurnResult
+from signal_hermes_router.payloads import canonicalize_notification_payload
 from signal_hermes_router.router import SignalHermesRouter
 from tests.support import (
     ClosedAwareSignal,
@@ -295,14 +297,16 @@ class RouterConcurrencyTests(RouterTestCase):
                 dedupe=DedupeStore(),
             )
             run_task = asyncio.create_task(router.run_forever())
-            # A holds the single execution permit; B is dispatched and parks on the
-            # execution semaphore before touching its profile lock.
+            # A holds the single execution permit; B is dispatched and parks on
+            # the execution semaphore, releasing its profile lock for the wait.
             await asyncio.wait_for(started_a.wait(), timeout=1)
             await self._settle()
             self.assertFalse(started_b.is_set())
             # profile-b's lock must be free (unheld/uncreated) while B waits for
-            # global capacity: the execution permit is acquired before the profile
-            # lock. Inspect without creating a lock via the defaultdict.
+            # global capacity: the permit is the last resource a turn takes, and
+            # the capacity wait happens without the profile lock, so
+            # profile_lock.locked() stays synonymous with "turn executing".
+            # Inspect without creating a lock via the defaultdict.
             profile_b_lock = router._profile_locks.get("profile-b")
             self.assertFalse(profile_b_lock is not None and profile_b_lock.locked())
 
@@ -534,3 +538,131 @@ class RouterConcurrencyTests(RouterTestCase):
             self.assertEqual(incomplete, ())
             self.assertIn(("group-a", "reply"), signal.sends)
             self.assertIn(("group-b", "reply"), signal.sends)
+
+    async def test_synthetic_not_busy_while_inbound_waits_for_execution_slot(self) -> None:
+        # GitHub-round regression: with the execution permit nested inside the
+        # profile lock, an inbound turn queued for global capacity holds no
+        # profile lock, so a same-profile synthetic turn must run rather than
+        # return a spurious BUSY, even with a zero route-lock timeout.
+        started_a = asyncio.Event()
+        gate_a = asyncio.Event()
+        started_x = asyncio.Event()
+        profile_a = FakeProfile(gate_started=started_a, gate_wait=gate_a)
+        profile_p = FakeProfile(gate_started=started_x)
+
+        class TwoRouteSignal(ClosedAwareSignal):
+            async def events(self):
+                yield make_group_raw(group_id="group-a", timestamp=1)
+                yield make_group_raw(group_id="group-x", timestamp=2)
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = TwoRouteSignal()
+            app = AppConfig(
+                router=router_config_for_tmp(tmp, max_concurrent_turns=1),
+                routes=(
+                    _concurrent_route("route-a", "group-a", "profile-a"),
+                    _concurrent_route("route-x", "group-x", "profile-p"),
+                    _concurrent_route("route-y", "group-y", "profile-p"),
+                ),
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="ping-y",
+                        route_name="route-y",
+                        prompt="Ping route y.",
+                    ),
+                ),
+            )
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=MultiProfileSupervisor(  # type: ignore[arg-type]
+                    {"profile-a": profile_a, "profile-p": profile_p}
+                ),
+                dedupe=DedupeStore(),
+            )
+            run_task = asyncio.create_task(router.run_forever())
+            # A holds the only execution permit; X is dispatched and parked on
+            # the capacity wait, so it has not started on profile-p.
+            await asyncio.wait_for(started_a.wait(), timeout=1)
+            await self._settle()
+            self.assertFalse(started_x.is_set())
+
+            # The zero-timeout synthetic for another route sharing profile-p
+            # must be admitted and run immediately: X's capacity wait holds no
+            # profile lock, so the profile reads as idle rather than BUSY.
+            outcome = await router.handle_notification(
+                "ping-y",
+                canonicalize_notification_payload({"ping": "y"}, max_bytes=1024),
+                route_lock_timeout=0,
+            )
+            self.assertEqual(outcome.status, TurnOutcomeStatus.DELIVERED)
+            self.assertIn(("group-y", "reply"), signal.sends)
+
+            # X still runs once A frees the permit.
+            gate_a.set()
+            await asyncio.wait_for(started_x.wait(), timeout=1)
+            await self._await_condition(lambda: ("group-x", "reply") in signal.sends)
+            await self._shutdown(router, run_task)
+
+    async def test_shared_profile_backlog_does_not_starve_idle_profile(self) -> None:
+        # GitHub-round regression: with several routes sharing one slow profile,
+        # a turn queued behind the busy profile lock must hold no execution
+        # permit, so a turn on a different, idle profile still acquires global
+        # capacity and runs instead of starving behind the backlog.
+        started_s1 = asyncio.Event()
+        gate_s1 = asyncio.Event()
+        profile_slow = FakeProfile(gate_started=started_s1, gate_wait=gate_s1)
+        profile_fast = FakeProfile()
+
+        class StagedSignal(ClosedAwareSignal):
+            def __init__(self) -> None:
+                super().__init__()
+                self.release_s2 = asyncio.Event()
+                self.release_f = asyncio.Event()
+
+            async def events(self):
+                yield make_group_raw(group_id="group-s1", timestamp=1)
+                await self.release_s2.wait()
+                yield make_group_raw(group_id="group-s2", timestamp=2)
+                await self.release_f.wait()
+                yield make_group_raw(group_id="group-f", timestamp=3)
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = StagedSignal()
+            router = SignalHermesRouter(
+                _concurrent_app(
+                    tmp,
+                    (
+                        _concurrent_route("route-s1", "group-s1", "profile-slow"),
+                        _concurrent_route("route-s2", "group-s2", "profile-slow"),
+                        _concurrent_route("route-f", "group-f", "profile-fast"),
+                    ),
+                    max_concurrent_turns=2,
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=MultiProfileSupervisor(  # type: ignore[arg-type]
+                    {"profile-slow": profile_slow, "profile-fast": profile_fast}
+                ),
+                dedupe=DedupeStore(),
+            )
+            run_task = asyncio.create_task(router.run_forever())
+            await asyncio.wait_for(started_s1.wait(), timeout=1)
+            # Queue a second turn behind the busy shared profile; it parks on
+            # the profile lock holding no permit.
+            signal.release_s2.set()
+            await self._settle()
+            self.assertEqual(len(profile_slow.prompts), 1)
+
+            # The idle profile's turn must run NOW: if profile-lock waiters
+            # held permits, both slots would be spent on profile-slow and this
+            # turn could not start until gate_s1 fired.
+            signal.release_f.set()
+            await self._await_condition(lambda: ("group-f", "reply") in signal.sends)
+            self.assertFalse(gate_s1.is_set())
+
+            # The shared-profile backlog then drains in order.
+            gate_s1.set()
+            await self._await_condition(lambda: ("group-s2", "reply") in signal.sends)
+            await self._shutdown(router, run_task)
