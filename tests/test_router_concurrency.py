@@ -814,17 +814,17 @@ class RouterConcurrencyTests(RouterTestCase):
         gate_a = asyncio.Event()
         started_b = asyncio.Event()
         gate_b = asyncio.Event()
-        started_c = asyncio.Event()
-        gate_c = asyncio.Event()
+        started_3 = asyncio.Event()
+        gate_3 = asyncio.Event()
         profile_a = FakeProfile(gate_started=started_a, gate_wait=gate_a)
         profile_b = FakeProfile(gate_started=started_b, gate_wait=gate_b)
-        profile_c = FakeProfile(gate_started=started_c, gate_wait=gate_c)
+        profile_3 = FakeProfile(gate_started=started_3, gate_wait=gate_3)
 
         class ThreeRouteSignal(ClosedAwareSignal):
             async def events(self):
                 yield make_group_raw(group_id="group-a", timestamp=1)
                 yield make_group_raw(group_id="group-b", timestamp=2)
-                yield make_group_raw(group_id="group-c", timestamp=3)
+                yield make_group_raw(group_id="group-3", timestamp=3)
                 await asyncio.Event().wait()
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -835,7 +835,7 @@ class RouterConcurrencyTests(RouterTestCase):
                     (
                         _concurrent_route("route-a", "group-a", "profile-a"),
                         _concurrent_route("route-b", "group-b", "profile-b"),
-                        _concurrent_route("route-c", "group-c", "profile-c"),
+                        _concurrent_route("route-3", "group-3", "profile-3"),
                     ),
                     max_concurrent_turns=1,
                 ),
@@ -844,7 +844,7 @@ class RouterConcurrencyTests(RouterTestCase):
                     {
                         "profile-a": profile_a,
                         "profile-b": profile_b,
-                        "profile-c": profile_c,
+                        "profile-3": profile_3,
                     }
                 ),
                 dedupe=DedupeStore(),
@@ -854,25 +854,25 @@ class RouterConcurrencyTests(RouterTestCase):
             await asyncio.wait_for(started_a.wait(), timeout=1)
             await self._settle()
             self.assertFalse(started_b.is_set())
-            self.assertFalse(started_c.is_set())
+            self.assertFalse(started_3.is_set())
 
-            # Free A: one of B or C must start within a bounded time.
+            # Free A: one of B or 3 must start within a bounded time.
             # With the livelock bug, neither would ever start.
             gate_a.set()
-            # Wait for the first waiter (B or C) to start.
+
+            # Wait for the first waiter (B or 3) to start.
             async def _wait_first():
-                while not (started_b.is_set() or started_c.is_set()):
+                while not (started_b.is_set() or started_3.is_set()):
                     await asyncio.sleep(0.01)
+
             await asyncio.wait_for(_wait_first(), timeout=2)
             # Release both so they can complete in order.
             gate_b.set()
-            gate_c.set()
-            gate_c.set()
+            gate_3.set()
             # Wait for both to complete.
             await self._await_condition(
                 lambda: (
-                    ("group-b", "reply") in signal.sends
-                    and ("group-c", "reply") in signal.sends
+                    ("group-b", "reply") in signal.sends and ("group-3", "reply") in signal.sends
                 )
             )
             await self._shutdown(router, run_task)
