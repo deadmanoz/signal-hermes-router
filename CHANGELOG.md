@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.35](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.34...v0.1.35) (2026-07-20)
+
+
+### Features
+
+* **tests:** test-suite support helpers + test_router.py family split ([#79](https://github.com/deadmanoz/signal-hermes-router/issues/79)) ([d7c08d5](https://github.com/deadmanoz/signal-hermes-router/commit/d7c08d56f9327f21ecd11e35cb6b0043d6a949ac))
+
 ## [0.1.34](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.33...v0.1.34) (2026-07-19)
 
 
