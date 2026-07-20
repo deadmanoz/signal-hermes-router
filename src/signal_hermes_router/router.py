@@ -4,8 +4,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import math
-import socket
 import stat
 import threading
 import time
@@ -47,7 +45,6 @@ from .media import (
     execute_media_sweep_groups,
     plan_media_sweep,
     remove_empty_sweep_dirs,
-    write_attachment,
 )
 from .models import (
     ChatType,
@@ -89,10 +86,25 @@ from .private_fs import (
     ensure_private_dir,
     ensure_private_dir_tree,
     validate_path_component,
-    write_private_bytes,
 )
 from .ratelimit import TokenBucket
 from .redaction import Redactor
+from .router_helpers import (
+    _copy_outbound_attachment,
+    _direct_recipient,
+    _group_id,
+    _is_under_root,
+    _origin_for_synthetic_kind,
+    _parse_control_idempotency_key,
+    _parse_control_scheduled_at,
+    _parse_control_timeout,
+    _parse_route_status_filters,
+    _route_ref,
+    _routed_sender_id,
+    _session_sender_id,
+    _unix_socket_accepts_connections,
+    _write_attachments,
+)
 from .sessions import ProfileSupervisor, RoutedSession, SessionRegistry
 from .signal import SignalHttpClient
 
@@ -351,14 +363,7 @@ class SignalHermesRouter:
         }
         self.redactor = Redactor()
         for route in config.routes:
-            self.redactor.add(
-                route.key,
-                route.group_id,
-                route.sender_id,
-                route.sender_number,
-                route.profile,
-                route.friendly_name,
-            )
+            self._register_route_redactor(route)
         self.signal = signal_client or SignalHttpClient(
             config.router.signal_base_url,
             max_event_bytes=config.router.max_signal_event_bytes,
@@ -1350,7 +1355,7 @@ class SignalHermesRouter:
         self._maybe_clear_breaker_override(route)
         state = self.route_state_overrides.get(route.key, route.state)
         if turn.admitted_state == RouteState.MAINTENANCE and state != RouteState.MAINTENANCE:
-            current = next((r for r in self.config.routes if r.key == route.key), None)
+            current = self.config.find_route_by_key(route.key)
             cleared_by_reload = (
                 turn.admitted_config_generation is not None
                 and self._reload_cleared_overrides.get(route.key, -1)
@@ -1687,7 +1692,7 @@ class SignalHermesRouter:
                 rate_bucket.refund()
             await self._finalize_dedupe_claims(route.key, claimed_dedupe, handled=handled)
             if session_acquisition_attempted and not self._closing:
-                current = next((r for r in self.config.routes if r.key == route.key), None)
+                current = self.config.find_route_by_key(route.key)
                 if current is None or current.state != RouteState.ACTIVE:
                     # Self-heal after a force-completed reap: this turn was
                     # admitted while its route could still prompt, outlived
@@ -2194,7 +2199,7 @@ class SignalHermesRouter:
         # have since disabled, shadowed, or removed the route. Only an ACTIVE
         # route in the CURRENT config can still prompt, so both the breaker
         # mask and the recovery below key off it.
-        current = next((r for r in self.config.routes if r.key == route.key), None)
+        current = self.config.find_route_by_key(route.key)
         route_active = current is not None and current.state == RouteState.ACTIVE
         if trip:
             # The maintenance override exists to mask an ACTIVE route whose
@@ -2490,6 +2495,16 @@ class SignalHermesRouter:
             "route_count": len(candidate.routes),
         }
 
+    def _register_route_redactor(self, route: Route) -> None:
+        self.redactor.add(
+            route.key,
+            route.group_id,
+            route.sender_id,
+            route.sender_number,
+            route.profile,
+            route.friendly_name,
+        )
+
     def _do_reload_config(self, new_config: AppConfig) -> AppConfig:
         """Atomically replace the active route configuration.
 
@@ -2503,14 +2518,7 @@ class SignalHermesRouter:
         # Additively register new route identifiers into the existing redactor
         # so old identifiers remain redacted for in-flight turns.
         for route in new_config.routes:
-            self.redactor.add(
-                route.key,
-                route.group_id,
-                route.sender_id,
-                route.sender_number,
-                route.profile,
-                route.friendly_name,
-            )
+            self._register_route_redactor(route)
         # Prune orphaned rate-limit buckets.  Buckets are keyed by
         # (route.key, max_turns, window_seconds) so a reconfigured limit can
         # never alias the old one, and in-flight turns refund into the exact
@@ -2987,23 +2995,13 @@ class SignalHermesRouter:
             for index, chunk in enumerate(chunks, 1):
                 chunk_attachments = attachment_paths if index == 1 else ()
                 if route.chat_type == ChatType.DIRECT:
-                    if chunk_attachments:
-                        await self.signal.send_direct(
-                            _direct_recipient(route),
-                            chunk,
-                            attachments=chunk_attachments,
-                        )
-                    else:
-                        await self.signal.send_direct(_direct_recipient(route), chunk)
+                    await self.signal.send_direct(
+                        _direct_recipient(route), chunk, attachments=chunk_attachments
+                    )
                 else:
-                    if chunk_attachments:
-                        await self.signal.send_group(
-                            _group_id(route),
-                            chunk,
-                            attachments=chunk_attachments,
-                        )
-                    else:
-                        await self.signal.send_group(_group_id(route), chunk)
+                    await self.signal.send_group(
+                        _group_id(route), chunk, attachments=chunk_attachments
+                    )
         except Exception as exc:
             LOGGER.error(
                 "failed Signal reply chunk %d/%d for %s: %s",
@@ -3093,7 +3091,7 @@ class SignalHermesRouter:
     def _prepare_control_socket(self, path: Path) -> None:
         if path.parent == Path("."):
             raise RuntimeError("router control socket path must include a private parent directory")
-        if not _is_relative_to(path.parent, self.config.router.work_root):
+        if not _is_under_root(path.parent, self.config.router.work_root):
             raise RuntimeError("router control socket path must be under router.work_root")
         ensure_private_dir(path.parent)
         if not path.exists():
@@ -3550,65 +3548,6 @@ class SignalHermesRouter:
             await notice_task
 
 
-def _write_attachments(
-    *,
-    media_root: Path,
-    platform: str,
-    timestamp: int,
-    attachments: Sequence[SignalAttachment],
-    group_ref: str,
-    sender_ref: str,
-    max_bytes: int | None,
-) -> list[MediaManifest]:
-    # Blocking read/hash/write; runs in a media I/O worker thread
-    # (_run_media_io_worker), never on the event loop.
-    return [
-        write_attachment(
-            media_root=media_root,
-            platform=platform,
-            timestamp=timestamp,
-            attachment=attachment,
-            group_ref=group_ref,
-            sender_ref=sender_ref,
-            max_bytes=max_bytes,
-        )
-        for attachment in attachments
-    ]
-
-
-def _copy_outbound_attachment(source: Path, destination: Path, max_bytes: int) -> int:
-    """Blocking outbound-attachment copy; runs in a media I/O worker thread.
-
-    Returns the byte size written. The destination is written only after the
-    size check passes, so a failed copy never leaves a partial file.
-    """
-    try:
-        with source.open("rb") as handle:
-            body = handle.read(max_bytes + 1)
-    except FileNotFoundError as exc:
-        raise OutboundAttachmentError(
-            "attachment_not_found",
-            "attachment path does not exist",
-        ) from exc
-    except PermissionError as exc:
-        raise OutboundAttachmentError(
-            "attachment_not_readable",
-            "attachment path is not readable",
-        ) from exc
-    except OSError as exc:
-        raise OutboundAttachmentError(
-            "attachment_not_found",
-            "attachment path could not be read",
-        ) from exc
-    if len(body) > max_bytes:
-        raise OutboundAttachmentError(
-            "attachment_too_large",
-            f"attachment exceeds {max_bytes} bytes",
-        )
-    write_private_bytes(destination, body)
-    return len(body)
-
-
 def _discard_event(summary: SignalEventSummary) -> None:
     if summary.has_exception:
         LOGGER.warning("discarding Signal event with receive exception %s", summary)
@@ -3616,146 +3555,3 @@ def _discard_event(summary: SignalEventSummary) -> None:
         LOGGER.info("discarding unrouted Signal event %s", summary)
     else:
         LOGGER.debug("discarding unrouted Signal event %s", summary)
-
-
-def _group_id(route: Route) -> str:
-    if not route.group_id:
-        raise ValueError("group route requires group_id")
-    return route.group_id
-
-
-def _direct_recipient(route: Route) -> str:
-    if not route.sender_id:
-        raise ValueError("direct route requires sender_id")
-    return route.sender_id
-
-
-def _routed_sender_id(route: Route, event: NormalizedEvent) -> str:
-    if route.chat_type == ChatType.DIRECT:
-        return _direct_recipient(route)
-    return event.dedupe_sender_id
-
-
-def _session_sender_id(route: Route, event: NormalizedEvent) -> str:
-    if route.chat_type == ChatType.DIRECT:
-        return _direct_recipient(route)
-    return event.sender_id
-
-
-def _origin_for_synthetic_kind(kind: SyntheticTurnKind) -> TurnOrigin:
-    if kind == SyntheticTurnKind.SCHEDULED_JOB:
-        return TurnOrigin.SCHEDULED_JOB
-    if kind == SyntheticTurnKind.NOTIFICATION:
-        return TurnOrigin.NOTIFICATION
-    raise ValueError(f"unknown synthetic turn kind {kind!r}")
-
-
-def _parse_control_scheduled_at(value: Any) -> tuple[int | None, str | None]:
-    if value is None:
-        return None, None
-    if isinstance(value, bool):
-        return None, "invalid_scheduled_at"
-    if isinstance(value, int):
-        parsed = value
-    elif isinstance(value, str) and value.isdecimal():
-        parsed = int(value)
-    else:
-        return None, "invalid_scheduled_at"
-    if parsed < 0:
-        return None, "invalid_scheduled_at"
-    return parsed, None
-
-
-def _parse_control_idempotency_key(value: Any) -> tuple[str | None, str | None]:
-    if value is None:
-        return None, None
-    if not isinstance(value, str) or not value:
-        return None, "invalid_idempotency_key"
-    return value, None
-
-
-def _parse_control_timeout(value: Any) -> tuple[float | None, str | None]:
-    if value is None:
-        return None, None
-    try:
-        timeout = float(value)
-    except (TypeError, ValueError):
-        return None, "invalid_timeout"
-    if not math.isfinite(timeout) or timeout < 0:
-        return None, "invalid_timeout"
-    return timeout, None
-
-
-def _parse_route_status_filters(
-    payload: dict[str, Any],
-) -> tuple[tuple[str, ...], tuple[int, ...], tuple[str, ...]]:
-    route_names = _string_filter_values(payload, "route", "routes", "route_names")
-    profiles = _string_filter_values(payload, "profile", "profiles")
-    route_indexes = _index_filter_values(payload, "route_index", "route_indexes")
-    return route_names, route_indexes, profiles
-
-
-def _string_filter_values(payload: dict[str, Any], *keys: str) -> tuple[str, ...]:
-    values: list[str] = []
-    for key in keys:
-        if key not in payload:
-            continue
-        raw = payload[key]
-        if isinstance(raw, str):
-            if not raw:
-                raise ValueError(f"{key} must not be empty")
-            values.append(raw)
-            continue
-        if isinstance(raw, list) and all(isinstance(item, str) and item for item in raw):
-            values.extend(raw)
-            continue
-        raise ValueError(f"{key} must be a string or string list")
-    return tuple(dict.fromkeys(values))
-
-
-def _index_filter_values(payload: dict[str, Any], *keys: str) -> tuple[int, ...]:
-    values: list[int] = []
-    for key in keys:
-        if key not in payload:
-            continue
-        raw = payload[key]
-        if isinstance(raw, bool):
-            raise ValueError(f"{key} must be a non-negative integer")
-        if isinstance(raw, int) and raw >= 0:
-            values.append(raw)
-            continue
-        if isinstance(raw, list) and all(
-            not isinstance(item, bool) and isinstance(item, int) and item >= 0 for item in raw
-        ):
-            values.extend(raw)
-            continue
-        raise ValueError(f"{key} must be a non-negative integer or integer list")
-    return tuple(dict.fromkeys(values))
-
-
-def _route_ref(index: int, route: Route) -> str:
-    if route.name:
-        return f"route:{route.name}"
-    return f"routes[{index}]"
-
-
-def _unix_socket_accepts_connections(path: Path) -> bool:
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        sock.settimeout(0.2)
-        sock.connect(str(path))
-        return True
-    except OSError:
-        return False
-    finally:
-        sock.close()
-
-
-def _is_relative_to(path: Path, parent: Path) -> bool:
-    try:
-        path.expanduser().resolve(strict=False).relative_to(
-            parent.expanduser().resolve(strict=False)
-        )
-    except ValueError:
-        return False
-    return True

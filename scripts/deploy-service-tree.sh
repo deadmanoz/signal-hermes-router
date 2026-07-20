@@ -46,6 +46,7 @@ rsync "${rsync_args[@]}" \
   --exclude='/private/' \
   --exclude='/.venv/' \
   --exclude='/.git/' \
+  --exclude='/.git' \
   --exclude='/.claude/' \
   --exclude='/.beads/' \
   "$repo_root"/ "$host:$remote_dir"/

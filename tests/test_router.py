@@ -2204,13 +2204,13 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             loop_thread = threading.get_ident()
             media_write_threads: list[int] = []
             dedupe_calls = record_dedupe_call_threads(harness.dedupe)
-            original_write = router_module.write_attachment
+            from signal_hermes_router.media import write_attachment as original_write
 
             def recording_write(**kwargs: Any) -> Any:
                 media_write_threads.append(threading.get_ident())
                 return original_write(**kwargs)
 
-            with patch("signal_hermes_router.router.write_attachment", recording_write):
+            with patch("signal_hermes_router.media.write_attachment", recording_write):
                 result = await router.handle_event(
                     make_event(
                         timestamp=10,
@@ -2609,7 +2609,9 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_synthetic_maintenance_send_failure_reports_metadata(self) -> None:
         class FlakySignal(FakeSignal):
-            async def send_group(self, group_id: str, message: str) -> dict[str, int]:
+            async def send_group(
+                self, group_id: str, message: str, *, attachments: Sequence[str] = ()
+            ) -> dict[str, int]:
                 raise RuntimeError("send failed")
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -3347,7 +3349,9 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 super().__init__()
                 self.fail_send = True
 
-            async def send_group(self, group_id: str, message: str) -> dict[str, int]:
+            async def send_group(
+                self, group_id: str, message: str, *, attachments: Sequence[str] = ()
+            ) -> dict[str, int]:
                 if self.fail_send:
                     raise RuntimeError("send failed")
                 return await super().send_group(group_id, message)
@@ -3389,7 +3393,9 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_synthetic_failure_reply_send_failure_preserves_root_failure(self) -> None:
         class FlakySignal(FakeSignal):
-            async def send_group(self, group_id: str, message: str) -> dict[str, int]:
+            async def send_group(
+                self, group_id: str, message: str, *, attachments: Sequence[str] = ()
+            ) -> dict[str, int]:
                 raise RuntimeError("send failed")
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -10238,7 +10244,9 @@ scheduled_jobs:
         notice_sent = asyncio.Event()
 
         class SyncSignal(FakeSignal):
-            async def send_direct(self, recipient: str, message: str) -> dict[str, int]:
+            async def send_direct(
+                self, recipient: str, message: str, *, attachments: Sequence[str] = ()
+            ) -> dict[str, int]:
                 result = await super().send_direct(recipient, message)
                 if message == "still working":
                     notice_sent.set()
@@ -10364,7 +10372,9 @@ scheduled_jobs:
 
     async def test_synthetic_blank_reply_send_failure_preserves_acp_failure(self) -> None:
         class FlakySignal(FakeSignal):
-            async def send_group(self, group_id: str, message: str) -> dict[str, int]:
+            async def send_group(
+                self, group_id: str, message: str, *, attachments: Sequence[str] = ()
+            ) -> dict[str, int]:
                 raise RuntimeError("send failed")
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -11314,7 +11324,9 @@ scheduled_jobs:
 
     async def test_send_and_typing_failures_are_logged_without_raising(self) -> None:
         class BrokenSignal:
-            async def send_group(self, group_id: str, message: str) -> dict:
+            async def send_group(
+                self, group_id: str, message: str, *, attachments: Sequence[str] = ()
+            ) -> dict:
                 raise RuntimeError("send failed")
 
             async def send_typing(self, group_id: str, enabled: bool) -> dict:
@@ -11338,7 +11350,9 @@ scheduled_jobs:
 
     async def test_typing_is_optional_and_long_running_notice_skips_when_done(self) -> None:
         class SignalWithoutTyping:
-            async def send_group(self, group_id: str, message: str) -> dict:
+            async def send_group(
+                self, group_id: str, message: str, *, attachments: Sequence[str] = ()
+            ) -> dict:
                 return {"timestamp": 1}
 
             async def close(self) -> None:
@@ -11427,7 +11441,9 @@ scheduled_jobs:
                 super().__init__()
                 self.fail = True
 
-            async def send_group(self, group_id: str, message: str) -> dict:
+            async def send_group(
+                self, group_id: str, message: str, *, attachments: Sequence[str] = ()
+            ) -> dict:
                 if self.fail:
                     raise RuntimeError("send failed")
                 return await super().send_group(group_id, message)
@@ -11491,7 +11507,9 @@ scheduled_jobs:
         notice_sent = asyncio.Event()
 
         class SyncSignal(FakeSignal):
-            async def send_group(self, group_id: str, message: str) -> dict:
+            async def send_group(
+                self, group_id: str, message: str, *, attachments: Sequence[str] = ()
+            ) -> dict:
                 result = await super().send_group(group_id, message)
                 if message == "still working":
                     notice_sent.set()
@@ -11961,7 +11979,9 @@ scheduled_jobs:
         # mid-reply. Use a slow FakeSignal to simulate a chunk send taking
         # measurable time.
         class SlowSignal(FakeSignal):
-            async def send_group(self, group_id: str, message: str) -> dict:
+            async def send_group(
+                self, group_id: str, message: str, *, attachments: Sequence[str] = ()
+            ) -> dict:
                 await asyncio.sleep(0.02)
                 return await super().send_group(group_id, message)
 
@@ -12090,7 +12110,9 @@ scheduled_jobs:
 
     async def test_partial_send_failure_aborts_remaining_chunks(self) -> None:
         class FailingOnSecondSignal(FakeSignal):
-            async def send_group(self, group_id: str, message: str) -> dict:
+            async def send_group(
+                self, group_id: str, message: str, *, attachments: Sequence[str] = ()
+            ) -> dict:
                 self.sends.append((group_id, message))
                 if len(self.sends) == 2:
                     raise RuntimeError("synthetic send failure")
@@ -12172,7 +12194,9 @@ scheduled_jobs:
         notice_sent = asyncio.Event()
 
         class SyncSignal(FakeSignal):
-            async def send_group(self, group_id: str, message: str) -> dict:
+            async def send_group(
+                self, group_id: str, message: str, *, attachments: Sequence[str] = ()
+            ) -> dict:
                 result = await super().send_group(group_id, message)
                 if message == "still working":
                     notice_sent.set()
@@ -13320,14 +13344,14 @@ class RetentionSweepRouterTests(unittest.IsolatedAsyncioTestCase):
             router = harness.router
             started = threading.Event()
             release = threading.Event()
-            original_write = router_module.write_attachment
+            from signal_hermes_router.media import write_attachment as original_write
 
             def gated_write(**kwargs: Any) -> Any:
                 started.set()
                 release.wait(timeout=30)
                 return original_write(**kwargs)
 
-            with patch("signal_hermes_router.router.write_attachment", gated_write):
+            with patch("signal_hermes_router.media.write_attachment", gated_write):
                 turn = asyncio.create_task(
                     router.handle_event(
                         make_event(

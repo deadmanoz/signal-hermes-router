@@ -25,9 +25,10 @@ def _impatient_connect(path: str, **kwargs: object) -> sqlite3.Connection:
 class DedupeTests(unittest.TestCase):
     def test_seen_or_record(self) -> None:
         store = DedupeStore()
-        self.assertFalse(store.seen_or_record("uuid", 1))
-        self.assertTrue(store.seen_or_record("uuid", 1))
-        self.assertFalse(store.seen_or_record("uuid", 2))
+        self.assertTrue(store.claim("", "uuid", 1))
+        store.mark_handled("", "uuid", 1)
+        self.assertFalse(store.claim("", "uuid", 1))
+        self.assertTrue(store.claim("", "uuid", 2))
 
     def test_claim_is_route_scoped_and_retryable_until_handled(self) -> None:
         store = DedupeStore()

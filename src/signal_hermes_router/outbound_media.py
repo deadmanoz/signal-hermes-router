@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import os
 import stat
-from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from .mime import content_type_for_path
 from .models import OutboundAttachment
-from .private_fs import PRIVATE_FILE_MODE, resolve_under_root
+from .private_fs import PRIVATE_FILE_MODE, _is_loopback_host, resolve_under_root
 
 ALLOWED_OUTBOUND_IMAGE_CONTENT_TYPES = frozenset(
     {
@@ -31,13 +30,7 @@ def signal_base_url_supports_local_attachment_paths(base_url: str) -> bool:
     parsed = urlparse(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return False
-    hostname = parsed.hostname.lower()
-    if hostname == "localhost":
-        return True
-    try:
-        return ip_address(hostname).is_loopback
-    except ValueError:
-        return False
+    return _is_loopback_host(parsed.hostname)
 
 
 def validate_outbound_attachments(
@@ -129,13 +122,7 @@ def _validate_private_attachment_modes(
     file_stat: os.stat_result,
 ) -> None:
     root = media_root.resolve(strict=False)
-    try:
-        relative_parent = resolved.parent.relative_to(root)
-    except ValueError as exc:  # pragma: no cover - resolve_under_root guards this first
-        raise OutboundAttachmentError(
-            "attachment_path_escaped_root",
-            "attachment path must be under media_root",
-        ) from exc
+    relative_parent = resolved.parent.relative_to(root)
 
     checked_dirs: list[Path] = []
     current = root

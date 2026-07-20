@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 import os
+from ipaddress import ip_address
 from pathlib import Path
 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 def resolve_under_root(root: Path, leaf: Path, *, error_message: str) -> Path:

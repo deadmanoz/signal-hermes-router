@@ -10,11 +10,8 @@ import httpx
 
 from signal_hermes_router import signal as signal_module
 from signal_hermes_router.events import (
-    inspect_signal_event,
     parse_signal_event,
     probe_signal_route,
-    probe_routeability,
-    summarize_signal_event,
 )
 from signal_hermes_router.models import ChatType
 from signal_hermes_router.signal import SignalHttpClient, _iter_sse_json
@@ -201,7 +198,7 @@ class EventTests(unittest.TestCase):
             },
             "account": "synthetic-account-number",
         }
-        summary = summarize_signal_event(raw)
+        summary = str(probe_signal_route(raw).summary)
         self.assertEqual(summary, "shape=direct message_type=typingMessage has_group=false")
         self.assertNotIn("synthetic-source-number", summary)
         self.assertNotIn("sender-uuid", summary)
@@ -216,7 +213,7 @@ class EventTests(unittest.TestCase):
             },
             "account": "synthetic-account-number",
         }
-        summary = inspect_signal_event(raw)
+        summary = probe_signal_route(raw).summary
         self.assertEqual(summary.shape, "direct")
         self.assertEqual(summary.message_type, "receiptMessage")
         self.assertFalse(summary.has_group)
@@ -239,12 +236,12 @@ class EventTests(unittest.TestCase):
                 }
             },
         }
-        group_id, summary = probe_routeability(raw)
-        self.assertEqual(group_id, "group-id")
-        self.assertEqual(summary.shape, "jsonrpc")
-        self.assertEqual(summary.message_type, "dataMessage")
-        self.assertTrue(summary.has_group)
-        summary_str = str(summary)
+        probe = probe_signal_route(raw)
+        self.assertEqual(probe.group_id, "group-id")
+        self.assertEqual(probe.summary.shape, "jsonrpc")
+        self.assertEqual(probe.summary.message_type, "dataMessage")
+        self.assertTrue(probe.summary.has_group)
+        summary_str = str(probe.summary)
         self.assertNotIn("group-id", summary_str)
         self.assertNotIn("secret", summary_str)
         self.assertNotIn("sender-uuid", summary_str)
@@ -267,12 +264,12 @@ class EventTests(unittest.TestCase):
                 }
             },
         }
-        group_id, summary = probe_routeability(raw)
-        self.assertEqual(group_id, "group-id=")
-        self.assertEqual(summary.shape, "jsonrpc")
-        self.assertEqual(summary.message_type, "syncMessage")
-        self.assertTrue(summary.has_group)
-        summary_str = str(summary)
+        probe = probe_signal_route(raw)
+        self.assertEqual(probe.group_id, "group-id=")
+        self.assertEqual(probe.summary.shape, "jsonrpc")
+        self.assertEqual(probe.summary.message_type, "syncMessage")
+        self.assertTrue(probe.summary.has_group)
+        summary_str = str(probe.summary)
         self.assertNotIn("group-id=", summary_str)
         self.assertNotIn("secret", summary_str)
         self.assertNotIn("sender-uuid", summary_str)
@@ -292,13 +289,13 @@ class EventTests(unittest.TestCase):
             },
             "account": "account",
         }
-        group_id, summary = probe_routeability(raw)
-        self.assertEqual(group_id, "group-id=")
-        self.assertEqual(summary.shape, "direct")
-        self.assertEqual(summary.message_type, "editMessage")
-        self.assertTrue(summary.has_group)
-        self.assertNotIn("group-id=", str(summary))
-        self.assertNotIn("edited secret", str(summary))
+        probe = probe_signal_route(raw)
+        self.assertEqual(probe.group_id, "group-id=")
+        self.assertEqual(probe.summary.shape, "direct")
+        self.assertEqual(probe.summary.message_type, "editMessage")
+        self.assertTrue(probe.summary.has_group)
+        self.assertNotIn("group-id=", str(probe.summary))
+        self.assertNotIn("edited secret", str(probe.summary))
 
     def test_probe_routeability_returns_sync_edit_message_group_id(self) -> None:
         raw = {
@@ -320,13 +317,13 @@ class EventTests(unittest.TestCase):
             },
             "account": "account",
         }
-        group_id, summary = probe_routeability(raw)
-        self.assertEqual(group_id, "group-id=")
-        self.assertEqual(summary.shape, "direct")
-        self.assertEqual(summary.message_type, "syncMessage")
-        self.assertTrue(summary.has_group)
-        self.assertNotIn("group-id=", str(summary))
-        self.assertNotIn("linked-device edited secret", str(summary))
+        probe = probe_signal_route(raw)
+        self.assertEqual(probe.group_id, "group-id=")
+        self.assertEqual(probe.summary.shape, "direct")
+        self.assertEqual(probe.summary.message_type, "syncMessage")
+        self.assertTrue(probe.summary.has_group)
+        self.assertNotIn("group-id=", str(probe.summary))
+        self.assertNotIn("linked-device edited secret", str(probe.summary))
 
     def test_probe_routeability_marks_receive_exception_without_payload(self) -> None:
         raw = {
@@ -340,13 +337,13 @@ class EventTests(unittest.TestCase):
             },
             "account": "account",
         }
-        group_id, summary = probe_routeability(raw)
-        self.assertIsNone(group_id)
-        self.assertEqual(summary.shape, "direct")
-        self.assertEqual(summary.message_type, "unknown")
-        self.assertFalse(summary.has_group)
-        self.assertTrue(summary.has_exception)
-        summary_str = str(summary)
+        probe = probe_signal_route(raw)
+        self.assertIsNone(probe.group_id)
+        self.assertEqual(probe.summary.shape, "direct")
+        self.assertEqual(probe.summary.message_type, "unknown")
+        self.assertFalse(probe.summary.has_group)
+        self.assertTrue(probe.summary.has_exception)
+        summary_str = str(probe.summary)
         self.assertIn("has_exception=true", summary_str)
         self.assertNotIn("private exception detail", summary_str)
         self.assertNotIn("sender-uuid", summary_str)
@@ -360,11 +357,11 @@ class EventTests(unittest.TestCase):
             },
             "account": "account",
         }
-        group_id, summary = probe_routeability(raw)
-        self.assertIsNone(group_id)
-        self.assertEqual(summary.shape, "direct")
-        self.assertEqual(summary.message_type, "dataMessage")
-        self.assertFalse(summary.has_group)
+        probe = probe_signal_route(raw)
+        self.assertIsNone(probe.group_id)
+        self.assertEqual(probe.summary.shape, "direct")
+        self.assertEqual(probe.summary.message_type, "dataMessage")
+        self.assertFalse(probe.summary.has_group)
 
     def test_probe_signal_route_returns_direct_facts_without_leaking_summary(self) -> None:
         raw = {
@@ -392,11 +389,11 @@ class EventTests(unittest.TestCase):
 
     def test_probe_routeability_returns_none_for_unknown_shape(self) -> None:
         raw = {"not": "a signal envelope"}
-        group_id, summary = probe_routeability(raw)
-        self.assertIsNone(group_id)
-        self.assertEqual(summary.shape, "unknown")
-        self.assertEqual(summary.message_type, "none")
-        self.assertFalse(summary.has_group)
+        probe = probe_signal_route(raw)
+        self.assertIsNone(probe.group_id)
+        self.assertEqual(probe.summary.shape, "unknown")
+        self.assertEqual(probe.summary.message_type, "none")
+        self.assertFalse(probe.summary.has_group)
 
 
 class SignalHttpTests(unittest.IsolatedAsyncioTestCase):
@@ -483,6 +480,99 @@ class SignalHttpTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(events, [{"message": "valid"}])
         self.assertIn("Skipping malformed Signal SSE frame", "\n".join(logs.output))
+
+
+class MalformedFrameLimiterTests(unittest.IsolatedAsyncioTestCase):
+    def test_limiter_allows_first_n_logs(self) -> None:
+        limiter = signal_module.MalformedFrameLimiter(
+            max_logs=3, window_seconds=60.0, clock=lambda: 0.0
+        )
+        self.assertTrue(limiter.log_malformed(10))
+        self.assertTrue(limiter.log_malformed(20))
+        self.assertTrue(limiter.log_malformed(30))
+
+    def test_limiter_suppresses_beyond_max(self) -> None:
+        limiter = signal_module.MalformedFrameLimiter(
+            max_logs=2, window_seconds=60.0, clock=lambda: 0.0
+        )
+        self.assertTrue(limiter.log_malformed(10))
+        self.assertTrue(limiter.log_malformed(20))
+        self.assertFalse(limiter.log_malformed(30))
+        self.assertFalse(limiter.log_malformed(40))
+        self.assertEqual(limiter._suppressed, 2)
+
+    def test_limiter_resets_after_window(self) -> None:
+        clock = [0.0]
+        limiter = signal_module.MalformedFrameLimiter(
+            max_logs=2, window_seconds=60.0, clock=lambda: clock[0]
+        )
+        self.assertTrue(limiter.log_malformed(10))
+        self.assertTrue(limiter.log_malformed(20))
+        self.assertFalse(limiter.log_malformed(30))
+        clock[0] = 61.0
+        self.assertTrue(limiter.log_malformed(40))
+
+    def test_limiter_reports_suppression_on_window_rollover(self) -> None:
+        clock = [0.0]
+        limiter = signal_module.MalformedFrameLimiter(
+            max_logs=2, window_seconds=60.0, clock=lambda: clock[0]
+        )
+        self.assertTrue(limiter.log_malformed(10))
+        self.assertTrue(limiter.log_malformed(20))
+        self.assertFalse(limiter.log_malformed(30))
+        self.assertFalse(limiter.log_malformed(40))
+        clock[0] = 61.0
+        with self.assertLogs("signal_hermes_router.signal", level="WARNING") as logs:
+            self.assertTrue(limiter.log_malformed(50))
+        output = "\n".join(logs.output)
+        self.assertIn("2 malformed SSE frames suppressed", output)
+
+    def test_limiter_no_suppression_report_when_none_suppressed(self) -> None:
+        clock = [0.0]
+        limiter = signal_module.MalformedFrameLimiter(
+            max_logs=2, window_seconds=60.0, clock=lambda: clock[0]
+        )
+        self.assertTrue(limiter.log_malformed(10))
+        clock[0] = 61.0
+        # No suppression to report, so no warning should be emitted.
+        # Use assertLogs with a dummy log to satisfy the context manager,
+        # then verify the suppression message is absent.
+        import logging
+
+        logger = logging.getLogger("signal_hermes_router.signal")
+        with self.assertLogs("signal_hermes_router.signal", level="WARNING") as logs:
+            logger.warning("dummy")
+            self.assertTrue(limiter.log_malformed(20))
+        output = "\n".join(logs.output)
+        self.assertNotIn("suppressed", output)
+
+    async def test_iter_sse_json_uses_limiter(self) -> None:
+        response = FakeSseResponse(
+            [
+                'data: {"message": "valid"}',
+                "",
+                "data: not-json-1",
+                "",
+                "data: not-json-2",
+                "",
+                "data: not-json-3",
+                "",
+                "data: not-json-4",
+                "",
+            ]
+        )
+        limiter = signal_module.MalformedFrameLimiter(
+            max_logs=2, window_seconds=60.0, clock=lambda: 0.0
+        )
+        with self.assertLogs("signal_hermes_router.signal", level="WARNING") as logs:
+            events = [event async for event in _iter_sse_json(response, limiter=limiter)]  # type: ignore[arg-type]
+        self.assertEqual(events, [{"message": "valid"}])
+        output = "\n".join(logs.output)
+        self.assertEqual(len([line for line in logs.output if "Skipping malformed" in line]), 2)
+        self.assertNotIn("not-json-1", output)
+        self.assertNotIn("not-json-2", output)
+        self.assertNotIn("not-json-3", output)
+        self.assertNotIn("not-json-4", output)
 
     async def test_check_and_send_group_rpc_shape(self) -> None:
         requests: list[dict] = []

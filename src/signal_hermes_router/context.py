@@ -22,19 +22,17 @@ def context_for_prompt(route_context: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in route_context.items() if key in PROMPT_SAFE_CONTEXT_KEYS}
 
 
-def render_route_context(route_context: dict[str, Any], nonce: str | None = None) -> dict[str, str]:
+def _render_tagged_block(tag: str, body: str, nonce: str | None = None) -> dict[str, str]:
     nonce = nonce or new_context_nonce()
-    body = compact_json_dumps(route_context)
-    return {"type": "text", "text": f"[route_context:{nonce}]{body}[/route_context:{nonce}]"}
+    return {"type": "text", "text": f"[{tag}:{nonce}]{body}[/{tag}:{nonce}]"}
+
+
+def render_route_context(route_context: dict[str, Any], nonce: str | None = None) -> dict[str, str]:
+    return _render_tagged_block("route_context", compact_json_dumps(route_context), nonce=nonce)
 
 
 def render_scheduled_event(metadata: dict[str, Any], nonce: str | None = None) -> dict[str, str]:
-    nonce = nonce or new_context_nonce()
-    body = compact_json_dumps(metadata)
-    return {
-        "type": "text",
-        "text": f"[scheduled_event:{nonce}]{body}[/scheduled_event:{nonce}]",
-    }
+    return _render_tagged_block("scheduled_event", compact_json_dumps(metadata), nonce=nonce)
 
 
 def escape_prompt_text(text: str) -> str:
@@ -94,19 +92,6 @@ def build_prompt_blocks(
                 manifest_block(manifest, include_tool_path=include_tool_path and file_exists)
             )
     return blocks
-
-
-def build_scheduled_prompt_blocks(
-    *,
-    route_context: dict[str, Any],
-    scheduled_metadata: dict[str, Any],
-    scheduled_prompt: str,
-) -> list[dict[str, str]]:
-    return build_synthetic_prompt_blocks(
-        route_context=route_context,
-        synthetic_metadata=scheduled_metadata,
-        synthetic_prompt=scheduled_prompt,
-    )
 
 
 def build_synthetic_prompt_blocks(

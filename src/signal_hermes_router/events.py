@@ -52,23 +52,6 @@ class SignalRouteProbe:
     summary: SignalEventSummary
 
 
-def inspect_signal_event(raw: dict[str, Any]) -> SignalEventSummary:
-    return probe_signal_route(raw).summary
-
-
-def summarize_signal_event(raw: dict[str, Any]) -> str:
-    return str(inspect_signal_event(raw))
-
-
-def probe_routeability(raw: dict[str, Any]) -> tuple[str | None, SignalEventSummary]:
-    """Lightweight probe: return the group_id (if any) and a content-free summary.
-
-    Does not parse message text or attachments.
-    """
-    probe = probe_signal_route(raw)
-    return probe.group_id, probe.summary
-
-
 def probe_signal_route(raw: dict[str, Any]) -> SignalRouteProbe:
     """Lightweight probe for route matching without parsing content or attachments."""
     params = unwrap_signal_event(raw)
@@ -126,11 +109,7 @@ def parse_signal_event(
     data_message = _data_message_from_envelope(envelope)
     group_id = _group_id(data_message)
     if group_id:
-        sender_id = str(
-            _first_present(envelope, "sourceUuid", "sourceNumber", "source")
-            or _first_present(params, "account")
-            or "unknown"
-        )
+        sender_id = _sender_id_from_envelope(envelope, params)
         source_uuid = str(_first_present(envelope, "sourceUuid", "source") or sender_id)
         source_number = _optional_str(_first_present(envelope, "sourceNumber", "source"))
         return _normalized_event(
@@ -165,6 +144,14 @@ def parse_signal_event(
         group_id=None,
         raw=raw,
         max_attachment_bytes=max_attachment_bytes,
+    )
+
+
+def _sender_id_from_envelope(envelope: dict[str, Any], params: dict[str, Any]) -> str:
+    return str(
+        _first_present(envelope, "sourceUuid", "sourceNumber", "source")
+        or _first_present(params, "account")
+        or "unknown"
     )
 
 
