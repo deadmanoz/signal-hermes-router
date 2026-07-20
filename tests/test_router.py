@@ -1905,52 +1905,55 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signal.send_attachments, [("group", ())])
         self.assertEqual(profile.prompts, [])
 
+    async def _check_notify_rejects_attachment(self, raw_attachments: Any) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            route = Route(
+                platform="signal",
+                name="camera-route",
+                group_id="group",
+                profile="profile",
+                session_policy=SessionPolicy.PERSISTENT_ROUTE,
+                state=RouteState.ACTIVE,
+            )
+            signal = FakeSignal()
+            profile = FakeProfile()
+            router = SignalHermesRouter(
+                make_synthetic_app(
+                    tmp,
+                    route,
+                    notifications=(
+                        SyntheticRouteNotification(
+                            id="camera-person",
+                            route_name="camera-route",
+                            prompt="Summarize the camera alert.",
+                        ),
+                    ),
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+
+            response = await router._handle_control_line(
+                encode_control_message(
+                    {
+                        "command": "notify_route",
+                        "notification_id": "camera-person",
+                        "payload": {"camera": "front"},
+                        "attachments": raw_attachments,
+                    }
+                )
+            )
+
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["error"], "invalid_attachment")
+        self.assertEqual(profile.prompts, [])
+        self.assertEqual(signal.sends, [])
+
     async def test_notify_route_rejects_falsey_malformed_attachments(self) -> None:
         for raw_attachments in (None, "", {}):
             with self.subTest(raw_attachments=raw_attachments):
-                with tempfile.TemporaryDirectory() as tmp:
-                    route = Route(
-                        platform="signal",
-                        name="camera-route",
-                        group_id="group",
-                        profile="profile",
-                        session_policy=SessionPolicy.PERSISTENT_ROUTE,
-                        state=RouteState.ACTIVE,
-                    )
-                    signal = FakeSignal()
-                    profile = FakeProfile()
-                    router = SignalHermesRouter(
-                        make_synthetic_app(
-                            tmp,
-                            route,
-                            notifications=(
-                                SyntheticRouteNotification(
-                                    id="camera-person",
-                                    route_name="camera-route",
-                                    prompt="Summarize the camera alert.",
-                                ),
-                            ),
-                        ),
-                        signal_client=signal,  # type: ignore[arg-type]
-                        supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                        dedupe=DedupeStore(),
-                    )
-
-                    response = await router._handle_control_line(
-                        encode_control_message(
-                            {
-                                "command": "notify_route",
-                                "notification_id": "camera-person",
-                                "payload": {"camera": "front"},
-                                "attachments": raw_attachments,
-                            }
-                        )
-                    )
-
-                self.assertEqual(response["status"], "error")
-                self.assertEqual(response["error"], "invalid_attachment")
-                self.assertEqual(profile.prompts, [])
-                self.assertEqual(signal.sends, [])
+                await self._check_notify_rejects_attachment(raw_attachments)
 
     async def test_notify_route_rejects_attachment_with_remote_signal_daemon(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -10384,26 +10387,30 @@ scheduled_jobs:
             self.assertEqual(len(profile.prompts), 1)
             self.assertEqual(signal.sends, [("group", "reply")])
 
-    async def test_canary_reply_prefix_is_idempotent(self) -> None:
+    async def _check_canary_prefix(self, reply_text: str, expected: str) -> None:
         route_context = {"label": "synthetic", "canary_reply_prefix": "[router-canary]"}
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = FakeSignal()
+            profile = FakeProfile()
+            profile.reply_text = reply_text
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE, route_context=route_context),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            await router.handle_event(make_event())
+            self.assertEqual(signal.sends, [("group", expected)])
+
+    async def test_canary_reply_prefix_is_idempotent(self) -> None:
         for reply_text, expected in (
             ("reply", "[router-canary] reply"),
             ("   reply", "[router-canary] reply"),
             ("[router-canary] reply", "[router-canary] reply"),
             ("   [router-canary] reply", "[router-canary] reply"),
         ):
-            with self.subTest(reply_text=reply_text), tempfile.TemporaryDirectory() as tmp:
-                signal = FakeSignal()
-                profile = FakeProfile()
-                profile.reply_text = reply_text
-                router = SignalHermesRouter(
-                    make_app(tmp, RouteState.ACTIVE, route_context=route_context),
-                    signal_client=signal,  # type: ignore[arg-type]
-                    supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                    dedupe=DedupeStore(),
-                )
-                await router.handle_event(make_event())
-                self.assertEqual(signal.sends, [("group", expected)])
+            with self.subTest(reply_text=reply_text):
+                await self._check_canary_prefix(reply_text, expected)
 
     async def test_canary_reply_prefix_applies_to_maintenance_reply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -10815,6 +10822,21 @@ scheduled_jobs:
                     }
                 )
 
+    async def _check_discard_event(self, raw: dict[str, Any], expected: str) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            router = SignalHermesRouter(
+                make_app(tmp, RouteState.ACTIVE),
+                signal_client=FakeSignal(),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
+                dedupe=DedupeStore(),
+            )
+            with self.assertLogs("signal_hermes_router.router", level="DEBUG") as logs:
+                await router.handle_raw_event(raw)
+            output = "\n".join(logs.output)
+            self.assertIn("discarding unrouted Signal event", output)
+            self.assertIn(expected, output)
+            self.assertNotIn("synthetic direct message without group", output)
+
     async def test_non_group_data_and_unknown_events_are_discarded_at_debug(self) -> None:
         for raw, expected in (
             (
@@ -10830,19 +10852,8 @@ scheduled_jobs:
             ),
             ({"not": "a signal envelope"}, "shape=unknown message_type=none"),
         ):
-            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
-                router = SignalHermesRouter(
-                    make_app(tmp, RouteState.ACTIVE),
-                    signal_client=FakeSignal(),  # type: ignore[arg-type]
-                    supervisor=FakeSupervisor(FakeProfile()),  # type: ignore[arg-type]
-                    dedupe=DedupeStore(),
-                )
-                with self.assertLogs("signal_hermes_router.router", level="DEBUG") as logs:
-                    await router.handle_raw_event(raw)
-                output = "\n".join(logs.output)
-                self.assertIn("discarding unrouted Signal event", output)
-                self.assertIn(expected, output)
-                self.assertNotIn("synthetic direct message without group", output)
+            with self.subTest(expected=expected):
+                await self._check_discard_event(raw, expected)
 
     async def test_non_group_debug_discard_does_not_emit_private_payloads(self) -> None:
         private_payload = base64.b64encode(b"x" * 1024).decode("ascii")
