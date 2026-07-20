@@ -1373,18 +1373,11 @@ class SignalHermesRouter:
         profile_lock.locked() stays synonymous with "a turn is executing on
         this profile" and a same-profile synthetic never sees a spurious BUSY
         from an inbound that is merely queued for capacity). When the capacity
-        wait ends the permit is released again before looping back to the
-        profile re-entry: a synthetic may have barged in during the wait, and
-        holding the permit across the re-entry would park global capacity
-        behind that synthetic's whole turn, starving other profiles. With the
-        profile lock free, the loop-top re-acquire completes in the same task
-        step as the semaphore release, and the fast-path semaphore acquire
-        then re-takes a permit without suspending (asyncio reports queued
-        waiters via locked(), and neither acquire suspends when locked() was
-        False), so no task can take the last permit between the check and the
-        acquire. A barging synthetic simply delays the queued inbound's next
-        loop iteration, which is the intended priority for operator-driven
-        turns.
+        wait ends the permit is KEPT while looping back to the profile-lock
+        re-entry: releasing it would let another waiter take the permit and
+        immediately re-release it, causing livelock with two or more waiters.
+        A barging synthetic simply delays the queued inbound's next loop
+        iteration, which is the intended priority for operator-driven turns.
         """
         profile_lock = self._profile_lock(route.profile)
         semaphore = self._turn_execution_semaphore
@@ -1394,18 +1387,25 @@ class SignalHermesRouter:
             while True:
                 await profile_lock.acquire()
                 lock_held = True
-                if not semaphore.locked():
+                if not permit_held:
+                    # Fast path: try to take a permit without waiting.
+                    # The check-and-decrement is synchronous (no await), so
+                    # no other task can interleave and steal the permit.
+                    if semaphore._value > 0:
+                        semaphore._value -= 1
+                        permit_held = True
+                        break
+                    # Capacity wait: hold NOTHING while parked (see docstring).
+                    profile_lock.release()
+                    lock_held = False
                     await semaphore.acquire()
                     permit_held = True
-                    break
-                # Capacity wait: hold NOTHING while parked (see docstring).
-                profile_lock.release()
-                lock_held = False
-                await semaphore.acquire()
-                # Do not hold the freshly-won permit across the profile
-                # re-entry wait; release it and loop back to queue on the
-                # profile lock holding nothing.
-                semaphore.release()
+                    # Loop back to re-acquire the profile lock while holding
+                    # the permit.  Releasing the permit here would livelock
+                    # with multiple waiters (each wakes, releases, and
+                    # re-queues indefinitely).
+                    continue
+                break
             # Freshness re-check at the point the turn actually runs: an event
             # fresh at route-lock acquisition can age past max_event_age_seconds
             # while parked on the profile lock, the capacity wait, or the

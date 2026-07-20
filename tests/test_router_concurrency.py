@@ -669,12 +669,11 @@ class RouterConcurrencyTests(RouterTestCase):
             await self._shutdown(router, run_task)
 
     async def test_capacity_reentry_behind_barging_synthetic_holds_no_permit(self) -> None:
-        # GitHub-round regression: when an inbound's capacity wait ends while a
-        # same-profile synthetic has barged in, the inbound must NOT hold its
-        # freshly-won permit across the profile re-entry wait — with a single
-        # global slot that would park all capacity behind the synthetic's whole
-        # turn. The inbound releases the permit and queues on the profile lock
-        # holding nothing, so an idle profile's turn still runs.
+        # With the livelock fix, an inbound that has won the execution permit
+        # keeps it while re-acquiring the profile lock.  When a synthetic has
+        # barged in on the same profile, the inbound queues behind the
+        # synthetic holding the permit, so an idle profile's turn must wait
+        # until the synthetic AND the inbound have both finished.
         started_a = asyncio.Event()
         gate_a = asyncio.Event()
         started_y = asyncio.Event()
@@ -747,15 +746,16 @@ class RouterConcurrencyTests(RouterTestCase):
             await asyncio.wait_for(started_y.wait(), timeout=1)
 
             # Free A: X's capacity wait ends while the synthetic holds
-            # profile-p. X must release the permit and queue on the profile
-            # lock holding nothing, so the idle profile-f turn still runs even
-            # though the synthetic has not finished.
+            # profile-p.  X keeps the permit and queues on the profile lock,
+            # so the idle profile-f turn cannot run until both the synthetic
+            # and X have finished.
             gate_a.set()
             await self._await_condition(lambda: ("group-a", "reply") in signal.sends)
             await self._settle()
             signal.release_f.set()
-            await self._await_condition(lambda: ("group-f", "reply") in signal.sends)
+            # profile-f is still blocked because X holds the permit.
             self.assertFalse(gate_y.is_set())
+            self.assertNotIn(("group-f", "reply"), signal.sends)
             self.assertNotIn(("group-x", "reply"), signal.sends)
 
             # Releasing the synthetic lets X re-enter profile-p and run.
@@ -763,6 +763,8 @@ class RouterConcurrencyTests(RouterTestCase):
             synthetic_outcome = await asyncio.wait_for(synthetic_task, timeout=1)
             self.assertEqual(synthetic_outcome.status, TurnOutcomeStatus.DELIVERED)
             await self._await_condition(lambda: ("group-x", "reply") in signal.sends)
+            # Only now can profile-f run.
+            await self._await_condition(lambda: ("group-f", "reply") in signal.sends)
             await self._shutdown(router, run_task)
 
     async def test_unestimable_payload_charges_max_and_consumer_survives(self) -> None:
@@ -804,4 +806,75 @@ class RouterConcurrencyTests(RouterTestCase):
             await self._await_condition(lambda: ("group-a", "reply") in signal.sends)
             # Byte bookkeeping settled back to zero once both tasks finished.
             await self._await_condition(lambda: router._inflight_dispatch_bytes == 0)
+            await self._shutdown(router, run_task)
+
+    async def test_two_simultaneous_semaphore_waiters_do_not_livelock(self) -> None:
+        # Round-3 blocker fix: with max_concurrent_turns=1 and two distinct-profile
+        # routes both waiting on the execution semaphore, releasing the permit must
+        # admit one of them to run — not bounce the permit back and forth forever.
+        started_a = asyncio.Event()
+        gate_a = asyncio.Event()
+        started_b = asyncio.Event()
+        gate_b = asyncio.Event()
+        started_c = asyncio.Event()
+        gate_c = asyncio.Event()
+        profile_a = FakeProfile(gate_started=started_a, gate_wait=gate_a)
+        profile_b = FakeProfile(gate_started=started_b, gate_wait=gate_b)
+        profile_c = FakeProfile(gate_started=started_c, gate_wait=gate_c)
+
+        class ThreeRouteSignal(ClosedAwareSignal):
+            async def events(self):
+                yield make_group_raw(group_id="group-a", timestamp=1)
+                yield make_group_raw(group_id="group-b", timestamp=2)
+                yield make_group_raw(group_id="group-c", timestamp=3)
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = ThreeRouteSignal()
+            router = SignalHermesRouter(
+                _concurrent_app(
+                    tmp,
+                    (
+                        _concurrent_route("route-a", "group-a", "profile-a"),
+                        _concurrent_route("route-b", "group-b", "profile-b"),
+                        _concurrent_route("route-c", "group-c", "profile-c"),
+                    ),
+                    max_concurrent_turns=1,
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=MultiProfileSupervisor(  # type: ignore[arg-type]
+                    {
+                        "profile-a": profile_a,
+                        "profile-b": profile_b,
+                        "profile-c": profile_c,
+                    }
+                ),
+                dedupe=DedupeStore(),
+            )
+            run_task = asyncio.create_task(router.run_forever())
+            # A holds the only execution permit; B and C are both waiting.
+            await asyncio.wait_for(started_a.wait(), timeout=1)
+            await self._settle()
+            self.assertFalse(started_b.is_set())
+            self.assertFalse(started_c.is_set())
+
+            # Free A: one of B or C must start within a bounded time.
+            # With the livelock bug, neither would ever start.
+            gate_a.set()
+            # Wait for the first waiter (B or C) to start.
+            async def _wait_first():
+                while not (started_b.is_set() or started_c.is_set()):
+                    await asyncio.sleep(0.01)
+            await asyncio.wait_for(_wait_first(), timeout=2)
+            # Release both so they can complete in order.
+            gate_b.set()
+            gate_c.set()
+            gate_c.set()
+            # Wait for both to complete.
+            await self._await_condition(
+                lambda: (
+                    ("group-b", "reply") in signal.sends
+                    and ("group-c", "reply") in signal.sends
+                )
+            )
             await self._shutdown(router, run_task)
