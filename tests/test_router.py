@@ -287,12 +287,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             signal = FakeSignal()
             profile = FakeProfile()
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=DedupeStore(),
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile)
+            router = harness.router
             result = await router.handle_event(make_event())
             self.assertEqual(result, TurnResult("reply"))
             self.assertEqual(signal.sends, [("group", "reply")])
@@ -335,12 +331,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             signal = FakeSignal()
             profile = FakeProfile()
             dedupe = DedupeStore()
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=dedupe,
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile, dedupe=dedupe)
+            router = harness.router
 
             result = await router.handle_raw_event(make_group_raw(text="", timestamp=1))
 
@@ -356,12 +348,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             signal = FakeSignal()
             profile = FakeProfile()
             dedupe = DedupeStore()
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=dedupe,
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile, dedupe=dedupe)
+            router = harness.router
 
             result = await router.handle_raw_event(make_group_raw(text=" \n\t ", timestamp=2))
 
@@ -375,12 +363,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             signal = FakeSignal()
             profile = FakeProfile()
             dedupe = DedupeStore()
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=dedupe,
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile, dedupe=dedupe)
+            router = harness.router
             raw = make_group_raw(text="", timestamp=3)
 
             await router.handle_raw_event(raw)
@@ -432,12 +416,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             signal = FakeSignal()
             profile = FakeProfile()
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=DedupeStore(),
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile)
+            router = harness.router
             attachment = {
                 "contentType": "text/plain",
                 "filename": "note.txt",
@@ -460,12 +440,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             signal = FakeSignal()
             profile = FakeProfile()
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=DedupeStore(),
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile)
+            router = harness.router
 
             result = await router.handle_raw_event(make_group_raw(text="hello", timestamp=6))
 
@@ -862,12 +838,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             signal = FakeSignal()
             profile = FakeProfile()
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=DedupeStore(),
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile)
+            router = harness.router
 
             for timestamp in range(1, 6):
                 result = await router.handle_event(make_event(timestamp=timestamp))
@@ -3215,12 +3187,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
             profile = FakeProfile()
             profile.fail = True
             dedupe = DedupeStore()
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=dedupe,
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile, dedupe=dedupe)
+            router = harness.router
 
             with self.assertLogs("signal_hermes_router.router", level="ERROR"):
                 first = await router.handle_event(make_event())
@@ -10293,12 +10261,8 @@ scheduled_jobs:
             profile = FakeProfile()
             profile.reply_text = NO_REPLY_SENTINEL
             dedupe = DedupeStore()
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=dedupe,
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile, dedupe=dedupe)
+            router = harness.router
 
             with self.assertLogs("signal_hermes_router.router", level="INFO") as logs:
                 result = await router.handle_event(make_event())
@@ -10320,12 +10284,8 @@ scheduled_jobs:
             profile = FakeProfile()
             profile.reply_text = f"  \n{NO_REPLY_SENTINEL}\t\n "
             dedupe = DedupeStore()
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=dedupe,
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile, dedupe=dedupe)
+            router = harness.router
 
             await router.handle_event(make_event())
 
@@ -10337,12 +10297,8 @@ scheduled_jobs:
             signal = FakeSignal()
             profile = FakeProfile()
             profile.reply_text = f"Quiet day so far. {NO_REPLY_SENTINEL}"
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=DedupeStore(),
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile)
+            router = harness.router
 
             result = await router.handle_event(make_event())
 
@@ -10407,12 +10363,8 @@ scheduled_jobs:
         with tempfile.TemporaryDirectory() as tmp:
             signal = FakeSignal()
             profile = FakeProfile()
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=DedupeStore(),
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile)
+            router = harness.router
 
             self.assertIsNone(
                 await router.handle_event(
@@ -10757,12 +10709,8 @@ scheduled_jobs:
         with tempfile.TemporaryDirectory() as tmp:
             signal = FakeSignal()
             profile = FakeProfile()
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=DedupeStore(),
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile)
+            router = harness.router
 
             for timestamp in range(1, 6):
                 await router.handle_event(make_event(timestamp=timestamp))
@@ -11022,12 +10970,8 @@ scheduled_jobs:
             dedupe = DedupeStore()
             signal = FakeSignal()
             profile = FakeProfile()
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=dedupe,
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile, dedupe=dedupe)
+            router = harness.router
             source_uuid = "synthetic-sender-uuid"
             event = NormalizedEvent(
                 platform="signal",
@@ -11926,12 +11870,8 @@ scheduled_jobs:
             signal = FakeSignal()
             profile = FakeProfile()
             profile.reply_text = "x" * 4000
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=DedupeStore(),
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile)
+            router = harness.router
             await router.handle_event(make_event())
             self.assertEqual(len(signal.sends), 3)
             for i, (group, body) in enumerate(signal.sends, 1):
@@ -12011,12 +11951,8 @@ scheduled_jobs:
             signal = FailingOnSecondSignal()
             profile = FakeProfile()
             profile.reply_text = "x" * 4000
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=DedupeStore(),
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile)
+            router = harness.router
             with self.assertLogs("signal_hermes_router.router", level="ERROR") as logs:
                 await router.handle_event(make_event())
             self.assertEqual(len(signal.sends), 2)
@@ -12027,12 +11963,8 @@ scheduled_jobs:
             signal = FakeSignal()
             profile = FakeProfile()
             profile.reply_text = "x" * 4000
-            router = SignalHermesRouter(
-                make_app(tmp, RouteState.ACTIVE),
-                signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(profile),  # type: ignore[arg-type]
-                dedupe=DedupeStore(),
-            )
+            harness = make_router_harness(tmp, signal=signal, profile=profile)
+            router = harness.router
             with self.assertLogs("signal_hermes_router.router", level="INFO") as logs:
                 await router.handle_event(make_event())
             joined = "\n".join(logs.output)
