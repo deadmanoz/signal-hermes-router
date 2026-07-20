@@ -63,138 +63,27 @@ from tests.support import (
     FakeSupervisor,
     make_app,
     make_event,
+    make_group_raw,
+    make_direct_route,
+    make_direct_raw,
     make_route,
     make_router_harness,
+    make_synthetic_app,
+    record_dedupe_call_threads,
+    write_test_file,
+    wait_until,
+    write_config_pair,
+    make_reload_harness,
+    RouterTestCase,
+    ToolSurfaceProfile,
+    BlockingSurfaceProfile,
+    ClosedAwareSignal,
+    FailBeforeSendSignal,
+    MutableFailSignal,
+    ToggleFailSignal,
+    ReadingSignal,
 )
 
-
-def make_direct_route(
-    *,
-    sender_id: str = "sender-uuid",
-    sender_number: str | None = "+00000000000",
-    state: RouteState = RouteState.ACTIVE,
-    session_policy: SessionPolicy = SessionPolicy.PERSISTENT_SENDER,
-) -> Route:
-    return Route(
-        platform="signal",
-        chat_type=ChatType.DIRECT,
-        sender_id=sender_id,
-        sender_number=sender_number,
-        profile="profile",
-        session_policy=session_policy,
-        state=state,
-        route_context={"purpose": "synthetic", "route_alias": "direct-test"},
-    )
-
-
-def make_direct_raw(
-    *,
-    source_uuid: str | None = "sender-uuid",
-    source_number: str | None = "+00000000000",
-    timestamp: int = 1,
-    text: str = "hello direct",
-    attachments: list[dict] | None = None,
-) -> dict:
-    envelope: dict = {
-        "timestamp": timestamp,
-        "dataMessage": {
-            "timestamp": timestamp,
-            "message": text,
-            "attachments": attachments or [],
-        },
-    }
-    if source_uuid is not None:
-        envelope["sourceUuid"] = source_uuid
-    if source_number is not None:
-        envelope["sourceNumber"] = source_number
-        envelope["source"] = source_number
-    return {"envelope": envelope, "account": "synthetic-account-number"}
-
-
-def make_group_raw(
-    *,
-    group_id: str = "group",
-    source_uuid: str = "sender-uuid",
-    timestamp: int = 1,
-    text: str | None = "hello",
-    attachments: list[dict] | None = None,
-) -> dict:
-    data_message: dict = {
-        "timestamp": timestamp,
-        "groupInfo": {"groupId": group_id},
-        "attachments": attachments or [],
-    }
-    if text is not None:
-        data_message["message"] = text
-    return {
-        "jsonrpc": "2.0",
-        "method": "receive",
-        "params": {
-            "envelope": {
-                "sourceUuid": source_uuid,
-                "timestamp": timestamp,
-                "dataMessage": data_message,
-            }
-        },
-    }
-
-
-def make_synthetic_app(
-    tmp: str | Path,
-    route: Route,
-    job: SyntheticRouteJob | None = None,
-    *,
-    control: RouterControlConfig | None = None,
-    notifications: tuple[SyntheticRouteNotification, ...] = (),
-    **router_overrides,
-) -> AppConfig:
-    return AppConfig(
-        router=RouterConfig(
-            state_db=Path(tmp) / "state.db",
-            media_root=Path(tmp) / "media",
-            signal_attachment_root=Path(tmp) / "signal-attachments",
-            work_root=Path(tmp) / "work",
-            control=control or RouterControlConfig(),
-            **router_overrides,
-        ),
-        routes=(route,),
-        scheduled_jobs=(
-            job
-            or SyntheticRouteJob(
-                id="daily-agenda",
-                route_name=route.name or "agenda-route",
-                prompt="Prepare the synthetic daily agenda.",
-            ),
-        ),
-        notifications=notifications,
-    )
-
-
-def record_dedupe_call_threads(store: DedupeStore) -> list[tuple[str, int]]:
-    """Wrap the store's statement methods with executing-thread recorders."""
-    calls: list[tuple[str, int]] = []
-    for name in ("claim", "status", "is_handled", "mark_handled", "release"):
-        original = getattr(store, name)
-
-        def recorder(*args: Any, _name: str = name, _original: Any = original) -> Any:
-            calls.append((_name, threading.get_ident()))
-            return _original(*args)
-
-        setattr(store, name, recorder)
-    return calls
-
-
-def write_png(path: Path, body: bytes = b"png") -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    parts = path.parts
-    if "media" in parts:
-        index = len(parts) - 1 - list(reversed(parts)).index("media")
-        root = Path(*parts[: index + 1])
-    else:
-        root = path.parent
-    ensure_private_dir_tree(root, path.parent)
-    write_private_bytes(path, body)
-    return path
 
 
 class RouterTests(unittest.IsolatedAsyncioTestCase):
@@ -1243,7 +1132,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
             )
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png")
             attachments = validate_outbound_attachments(
                 [str(image)],
                 media_root=app.router.media_root,
@@ -1277,11 +1166,11 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 session_policy=SessionPolicy.PERSISTENT_ROUTE,
                 state=RouteState.ACTIVE,
             )
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png", b"old")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png", b"old")
 
             class MutatingProfile(FakeProfile):
                 async def prompt(self, session_id: str, blocks: list[dict]) -> TurnResult:
-                    write_png(image, b"new")
+                    write_test_file(image, b"new")
                     return await super().prompt(session_id, blocks)
 
             class ReadingSignal(FakeSignal):
@@ -1347,8 +1236,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 state=RouteState.ACTIVE,
             )
             app = make_synthetic_app(tmp, route)
-            source = write_png(Path(tmp) / "media" / "camera" / "source.png")
-            frozen_path = write_png(
+            source = write_test_file(Path(tmp) / "media" / "camera" / "source.png")
+            frozen_path = write_test_file(
                 Path(tmp) / "media" / ".outbound" / "existing" / "attachment.png"
             )
             source_attachment = OutboundAttachment(
@@ -1391,8 +1280,8 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 state=RouteState.ACTIVE,
             )
             app = make_synthetic_app(tmp, route, max_attachment_bytes=3)
-            first = write_png(Path(tmp) / "media" / "camera" / "first.png", b"ok")
-            second = write_png(Path(tmp) / "media" / "camera" / "second.png", b"abcd")
+            first = write_test_file(Path(tmp) / "media" / "camera" / "first.png", b"ok")
+            second = write_test_file(Path(tmp) / "media" / "camera" / "second.png", b"abcd")
             first_attachment = validate_outbound_attachments(
                 [str(first)],
                 media_root=app.router.media_root,
@@ -1447,7 +1336,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 state=RouteState.ACTIVE,
             )
             app = make_synthetic_app(tmp, route)
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png.gz")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png.gz")
             attachment = validate_outbound_attachments(
                 [str(image)],
                 media_root=app.router.media_root,
@@ -1477,7 +1366,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 state=RouteState.ACTIVE,
             )
             app = make_synthetic_app(tmp, route)
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png")
             attachment = validate_outbound_attachments(
                 [str(image)],
                 media_root=app.router.media_root,
@@ -1533,7 +1422,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 state=RouteState.ACTIVE,
             )
             app = make_synthetic_app(tmp, route)
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png")
             attachment = validate_outbound_attachments(
                 [str(image)],
                 media_root=app.router.media_root,
@@ -1585,7 +1474,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
             )
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png")
             attachments = validate_outbound_attachments(
                 [str(image)],
                 media_root=app.router.media_root,
@@ -1636,7 +1525,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
             )
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png")
             attachments = validate_outbound_attachments(
                 [str(image)],
                 media_root=app.router.media_root,
@@ -1687,7 +1576,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
             )
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png")
             attachments = validate_outbound_attachments(
                 [str(image)],
                 media_root=app.router.media_root,
@@ -1738,7 +1627,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
             )
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png")
             attachments = validate_outbound_attachments(
                 [str(image)],
                 media_root=app.router.media_root,
@@ -1886,7 +1775,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
             )
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png")
             router = SignalHermesRouter(
                 app,
                 signal_client=signal,  # type: ignore[arg-type]
@@ -1949,7 +1838,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
             )
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png", b"first")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png", b"first")
             router = SignalHermesRouter(
                 app,
                 signal_client=signal,  # type: ignore[arg-type]
@@ -1978,7 +1867,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                         break
                     await asyncio.sleep(0.001)
                 self.assertTrue(outbound_root.exists())
-                write_png(image, b"second")
+                write_test_file(image, b"second")
             finally:
                 lock.release()
             response = await task
@@ -2116,7 +2005,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 signal_base_url="http://signal.example:8080",
                 allow_remote_signal_base_url=True,
             )
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png")
             router = SignalHermesRouter(
                 app,
                 signal_client=signal,  # type: ignore[arg-type]
@@ -2174,7 +2063,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
             )
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png")
             router = SignalHermesRouter(
                 app,
                 signal_client=signal,  # type: ignore[arg-type]
@@ -2264,7 +2153,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
             )
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png")
             dedupe = DedupeStore()
             router = SignalHermesRouter(
                 app,
@@ -2498,7 +2387,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
                 route,
                 notifications=(notification,),
             )
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png")
             router = SignalHermesRouter(
                 app,
                 signal_client=signal,  # type: ignore[arg-type]
@@ -10486,7 +10375,7 @@ scheduled_jobs:
                     ),
                 ),
             )
-            image = write_png(Path(tmp) / "media" / "camera" / "person.png")
+            image = write_test_file(Path(tmp) / "media" / "camera" / "person.png")
             attachments = validate_outbound_attachments(
                 [str(image)],
                 media_root=app.router.media_root,
