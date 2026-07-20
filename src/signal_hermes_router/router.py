@@ -1373,11 +1373,13 @@ class SignalHermesRouter:
         profile_lock.locked() stays synonymous with "a turn is executing on
         this profile" and a same-profile synthetic never sees a spurious BUSY
         from an inbound that is merely queued for capacity). When the capacity
-        wait ends the permit is KEPT while looping back to the profile-lock
-        re-entry: releasing it would let another waiter take the permit and
-        immediately re-release it, causing livelock with two or more waiters.
-        A barging synthetic simply delays the queued inbound's next loop
-        iteration, which is the intended priority for operator-driven turns.
+        wait ends the permit is released again if the profile lock is not
+        immediately free — a synthetic may have barged in during the wait, and
+        holding the permit across that re-entry would park global capacity
+        behind the synthetic's whole turn. Releasing the permit is safe here
+        because the check uses profile_lock.locked() (not semaphore.locked()),
+        so a waiter that sees the profile lock busy never misidentifies itself
+        as the holder and livelock is avoided.
         """
         profile_lock = self._profile_lock(route.profile)
         semaphore = self._turn_execution_semaphore
@@ -1400,10 +1402,12 @@ class SignalHermesRouter:
                     lock_held = False
                     await semaphore.acquire()
                     permit_held = True
-                    # Loop back to re-acquire the profile lock while holding
-                    # the permit.  Releasing the permit here would livelock
-                    # with multiple waiters (each wakes, releases, and
-                    # re-queues indefinitely).
+                    # Always loop back to re-acquire the profile lock.  If the
+                    # lock is held by a synthetic, the acquire blocks and the
+                    # permit is released first so global capacity is not parked.
+                    if profile_lock.locked():
+                        semaphore.release()
+                        permit_held = False
                     continue
                 break
             # Freshness re-check at the point the turn actually runs: an event

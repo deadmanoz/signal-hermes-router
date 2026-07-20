@@ -669,11 +669,12 @@ class RouterConcurrencyTests(RouterTestCase):
             await self._shutdown(router, run_task)
 
     async def test_capacity_reentry_behind_barging_synthetic_holds_no_permit(self) -> None:
-        # With the livelock fix, an inbound that has won the execution permit
-        # keeps it while re-acquiring the profile lock.  When a synthetic has
-        # barged in on the same profile, the inbound queues behind the
-        # synthetic holding the permit, so an idle profile's turn must wait
-        # until the synthetic AND the inbound have both finished.
+        # GitHub-round regression: when an inbound's capacity wait ends while a
+        # same-profile synthetic has barged in, the inbound must NOT hold its
+        # freshly-won permit across the profile re-entry wait — with a single
+        # global slot that would park all capacity behind the synthetic's whole
+        # turn. The inbound releases the permit and queues on the profile lock
+        # holding nothing, so an idle profile's turn still runs.
         started_a = asyncio.Event()
         gate_a = asyncio.Event()
         started_y = asyncio.Event()
@@ -746,16 +747,15 @@ class RouterConcurrencyTests(RouterTestCase):
             await asyncio.wait_for(started_y.wait(), timeout=1)
 
             # Free A: X's capacity wait ends while the synthetic holds
-            # profile-p.  X keeps the permit and queues on the profile lock,
-            # so the idle profile-f turn cannot run until both the synthetic
-            # and X have finished.
+            # profile-p. X must release the permit and queue on the profile
+            # lock holding nothing, so the idle profile-f turn still runs even
+            # though the synthetic has not finished.
             gate_a.set()
             await self._await_condition(lambda: ("group-a", "reply") in signal.sends)
             await self._settle()
             signal.release_f.set()
-            # profile-f is still blocked because X holds the permit.
+            await self._await_condition(lambda: ("group-f", "reply") in signal.sends)
             self.assertFalse(gate_y.is_set())
-            self.assertNotIn(("group-f", "reply"), signal.sends)
             self.assertNotIn(("group-x", "reply"), signal.sends)
 
             # Releasing the synthetic lets X re-enter profile-p and run.
@@ -763,8 +763,6 @@ class RouterConcurrencyTests(RouterTestCase):
             synthetic_outcome = await asyncio.wait_for(synthetic_task, timeout=1)
             self.assertEqual(synthetic_outcome.status, TurnOutcomeStatus.DELIVERED)
             await self._await_condition(lambda: ("group-x", "reply") in signal.sends)
-            # Only now can profile-f run.
-            await self._await_condition(lambda: ("group-f", "reply") in signal.sends)
             await self._shutdown(router, run_task)
 
     async def test_unestimable_payload_charges_max_and_consumer_survives(self) -> None:
