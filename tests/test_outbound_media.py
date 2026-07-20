@@ -9,20 +9,7 @@ from signal_hermes_router.outbound_media import (
     signal_base_url_supports_local_attachment_paths,
     validate_outbound_attachments,
 )
-from signal_hermes_router.private_fs import ensure_private_dir_tree, write_private_bytes
-
-
-def write_file(path: Path, body: bytes = b"body") -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    parts = path.parts
-    if "media" in parts:
-        index = len(parts) - 1 - list(reversed(parts)).index("media")
-        root = Path(*parts[: index + 1])
-    else:
-        root = path.parent
-    ensure_private_dir_tree(root, path.parent)
-    write_private_bytes(path, body)
-    return path
+from tests.support import write_test_file
 
 
 class OutboundMediaTests(unittest.TestCase):
@@ -49,7 +36,7 @@ class OutboundMediaTests(unittest.TestCase):
     def test_validate_outbound_attachment_accepts_one_image_under_media_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             media_root = Path(tmp) / "media"
-            image = write_file(media_root / "alerts" / "person.png")
+            image = write_test_file(media_root / "alerts" / "person.png")
 
             attachments = validate_outbound_attachments(
                 [str(image)],
@@ -90,7 +77,7 @@ class OutboundMediaTests(unittest.TestCase):
 
     def test_validate_outbound_attachment_rejects_path_escape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            outside = write_file(Path(tmp) / "outside.png")
+            outside = write_test_file(Path(tmp) / "outside.png")
             with self.assertRaises(OutboundAttachmentError) as raised:
                 validate_outbound_attachments(
                     [str(outside)],
@@ -129,7 +116,7 @@ class OutboundMediaTests(unittest.TestCase):
     def test_validate_outbound_attachment_rejects_oversized_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             media_root = Path(tmp) / "media"
-            image = write_file(media_root / "large.png", b"too-large")
+            image = write_test_file(media_root / "large.png", b"too-large")
             with self.assertRaises(OutboundAttachmentError) as raised:
                 validate_outbound_attachments([str(image)], media_root=media_root, max_bytes=3)
 
@@ -138,7 +125,7 @@ class OutboundMediaTests(unittest.TestCase):
     def test_validate_outbound_attachment_rejects_non_image_extension(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             media_root = Path(tmp) / "media"
-            text = write_file(media_root / "note.txt")
+            text = write_test_file(media_root / "note.txt")
             with self.assertRaises(OutboundAttachmentError) as raised:
                 validate_outbound_attachments([str(text)], media_root=media_root, max_bytes=1024)
 
@@ -147,7 +134,7 @@ class OutboundMediaTests(unittest.TestCase):
     def test_validate_outbound_attachment_rejects_public_file_or_parent_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             media_root = Path(tmp) / "media"
-            image = write_file(media_root / "alerts" / "person.png")
+            image = write_test_file(media_root / "alerts" / "person.png")
             image.chmod(0o644)
             with self.assertRaises(OutboundAttachmentError) as raised:
                 validate_outbound_attachments([str(image)], media_root=media_root, max_bytes=1024)
@@ -162,7 +149,7 @@ class OutboundMediaTests(unittest.TestCase):
     def test_validate_outbound_attachment_rejects_svg(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             media_root = Path(tmp) / "media"
-            svg = write_file(media_root / "image.svg", b"<svg></svg>")
+            svg = write_test_file(media_root / "image.svg", b"<svg></svg>")
             with self.assertRaises(OutboundAttachmentError) as raised:
                 validate_outbound_attachments([str(svg)], media_root=media_root, max_bytes=1024)
 
@@ -171,7 +158,7 @@ class OutboundMediaTests(unittest.TestCase):
     def test_validate_outbound_attachment_accepts_webp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             media_root = Path(tmp) / "media"
-            image = write_file(media_root / "image.webp", b"webp")
+            image = write_test_file(media_root / "image.webp", b"webp")
 
             attachments = validate_outbound_attachments(
                 [str(image)],
