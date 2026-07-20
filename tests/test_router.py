@@ -12086,31 +12086,6 @@ class ClosedAwareSignal(FakeSignal):
         return await super().send_group(group_id, message, attachments=attachments)
 
 
-class GatedProfile(FakeProfile):
-    def __init__(self, started: asyncio.Event, gate: asyncio.Event) -> None:
-        super().__init__()
-        self._started = started
-        self._gate = gate
-
-    async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
-        self._started.set()
-        await self._gate.wait()
-        return await super().prompt(session_id, blocks)
-
-
-class FirstGatedProfile(FakeProfile):
-    def __init__(self, started: asyncio.Event, gate: asyncio.Event) -> None:
-        super().__init__()
-        self._started = started
-        self._gate = gate
-        self._first = True
-
-    async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
-        if self._first:
-            self._first = False
-            self._started.set()
-            await self._gate.wait()
-        return await super().prompt(session_id, blocks)
 
 
 def _shutdown_route() -> Route:
@@ -12153,7 +12128,7 @@ class ShutdownTests(unittest.IsolatedAsyncioTestCase):
             router = SignalHermesRouter(
                 _notification_app(tmp),
                 signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(GatedProfile(started, gate)),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile(gate_started=started, gate_wait=gate)),  # type: ignore[arg-type]
                 dedupe=DedupeStore(),
             )
             payload = canonicalize_notification_payload({"status": "ok"}, max_bytes=1024)
@@ -12189,7 +12164,7 @@ class ShutdownTests(unittest.IsolatedAsyncioTestCase):
             router = SignalHermesRouter(
                 make_app(tmp, RouteState.ACTIVE),
                 signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(GatedProfile(started, gate)),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile(gate_started=started, gate_wait=gate)),  # type: ignore[arg-type]
                 dedupe=DedupeStore(),
             )
             run_task = asyncio.create_task(router.run_forever())
@@ -12223,7 +12198,7 @@ class ShutdownTests(unittest.IsolatedAsyncioTestCase):
             router = SignalHermesRouter(
                 make_app(tmp, RouteState.ACTIVE),
                 signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(GatedProfile(started, gate)),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile(gate_started=started, gate_wait=gate)),  # type: ignore[arg-type]
                 dedupe=DedupeStore(),
             )
             run_task = asyncio.create_task(router.run_forever())
@@ -12249,7 +12224,7 @@ class ShutdownTests(unittest.IsolatedAsyncioTestCase):
             router = SignalHermesRouter(
                 _notification_app(tmp),
                 signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(FirstGatedProfile(started, gate)),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile(gate_started=started, gate_wait=gate, gate_first_only=True)),  # type: ignore[arg-type]
                 dedupe=DedupeStore(),
             )
             payload = canonicalize_notification_payload({"status": "ok"}, max_bytes=1024)
@@ -12300,7 +12275,7 @@ class ShutdownTests(unittest.IsolatedAsyncioTestCase):
                     control=RouterControlConfig(enabled=True, socket_path=socket_path),
                 ),
                 signal_client=ClosedAwareSignal(),  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(GatedProfile(started, gate)),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile(gate_started=started, gate_wait=gate)),  # type: ignore[arg-type]
                 dedupe=DedupeStore(),
             )
             server_task = asyncio.create_task(router._run_control_server())
@@ -12379,7 +12354,7 @@ class ShutdownTests(unittest.IsolatedAsyncioTestCase):
                     control=RouterControlConfig(enabled=True, socket_path=socket_path),
                 ),
                 signal_client=ClosedAwareSignal(),  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(GatedProfile(started, gate)),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(FakeProfile(gate_started=started, gate_wait=gate)),  # type: ignore[arg-type]
                 dedupe=DedupeStore(dedupe_path),
             )
             server_task = asyncio.create_task(router._run_control_server())
