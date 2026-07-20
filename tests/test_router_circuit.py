@@ -565,4 +565,3 @@ routes:
             self.assertEqual(
                 signal.sends[-1][1], "I hit an internal router error handling that message."
             )
-

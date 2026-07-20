@@ -50,6 +50,7 @@ class RouterSweepTests(RouterTestCase):
         }
         values.update(overrides)
         return RetentionConfig(**values)
+
     def _retention_config(self, **overrides: Any) -> RetentionConfig:
         values: dict[str, Any] = {
             "sweep_interval_seconds": 3600.0,
@@ -436,4 +437,3 @@ class RouterSweepTests(RouterTestCase):
             async with asyncio.timeout(5):
                 while not router.dedupe.close():
                     await asyncio.sleep(0.01)
-

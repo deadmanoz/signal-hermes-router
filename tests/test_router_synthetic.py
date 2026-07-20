@@ -983,4 +983,3 @@ class RouterSyntheticTests(RouterTestCase):
                 router._route_status_response({})["routes"][0]["last_failure"]["code"],
                 "acp_empty_response",
             )
-

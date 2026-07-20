@@ -64,7 +64,6 @@ from tests.support import (
 
 
 class RouterBasicTests(RouterTestCase):
-
     async def _check_discard_event(self, raw: dict[str, Any], expected: str) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             router = SignalHermesRouter(
@@ -1677,7 +1676,9 @@ routes:
             # completion before this task resumes, and completed tasks are
             # settled out of the tracked set, so poll the OUTCOME against a
             # deadline instead of inspecting the task set.
-            await wait_until(lambda: harness.supervisor.retired == ["p1"], timeout=5.0, interval=0.01)
+            await wait_until(
+                lambda: harness.supervisor.retired == ["p1"], timeout=5.0, interval=0.01
+            )
             self.assertNotIn("p1", harness.supervisor.cached)
             # Drain whatever the deferred reap left in flight (it may already
             # have settled out of the tracked set, hence no done() filter).
@@ -1713,7 +1714,9 @@ routes:
             # The turn's completion scheduled a cleanup reap; poll the
             # OUTCOME against a deadline (completed reaps settle out of the
             # tracked set, so the task set is not a stable witness).
-            await wait_until(lambda: harness.supervisor.retired == ["profile"], timeout=5.0, interval=0.01)
+            await wait_until(
+                lambda: harness.supervisor.retired == ["profile"], timeout=5.0, interval=0.01
+            )
             self.assertEqual(set(harness.router.sessions._sessions), set())
 
     async def test_turn_on_now_disabled_route_schedules_cleanup_reap(self) -> None:
@@ -1738,7 +1741,9 @@ routes:
             outcome = await harness.router.handle_event(make_event(), config=old_config)
             assert outcome is not None
             self.assertEqual(outcome.text, "reply")
-            await wait_until(lambda: harness.supervisor.retired == ["profile"], timeout=5.0, interval=0.01)
+            await wait_until(
+                lambda: harness.supervisor.retired == ["profile"], timeout=5.0, interval=0.01
+            )
             self.assertEqual(set(harness.router.sessions._sessions), set())
 
     async def test_turn_with_failed_session_acquisition_schedules_cleanup_reap(self) -> None:
@@ -1768,7 +1773,9 @@ routes:
             self.assertEqual(harness.profile.new_sessions, 0)
             # ...and the finally-block self-heal still reaps the cached
             # profile the failed acquisition left behind.
-            await wait_until(lambda: harness.supervisor.retired == ["profile"], timeout=5.0, interval=0.01)
+            await wait_until(
+                lambda: harness.supervisor.retired == ["profile"], timeout=5.0, interval=0.01
+            )
             self.assertEqual(set(harness.router.sessions._sessions), set())
 
     async def test_turn_outliving_policy_reload_schedules_policy_reap(self) -> None:
@@ -1797,7 +1804,9 @@ routes:
             outcome = await harness.router.handle_event(make_event(), config=old_config)
             assert outcome is not None
             self.assertEqual(outcome.text, "reply")
-            await wait_until(lambda: not set(harness.router.sessions._sessions), timeout=5.0, interval=0.01)
+            await wait_until(
+                lambda: not set(harness.router.sessions._sessions), timeout=5.0, interval=0.01
+            )
             self.assertEqual(harness.supervisor.retired, [])
 
     async def test_shadow_turn_does_not_schedule_cleanup_reap(self) -> None:

@@ -369,4 +369,3 @@ class RouterBusyTests(RouterTestCase):
             await router.handle_event(make_event())
 
             self.assertEqual(signal.sends, [("group", "still working"), ("group", "reply")])
-

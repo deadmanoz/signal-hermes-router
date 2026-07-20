@@ -70,10 +70,10 @@ def _notification_app(tmp: str | Path, **kwargs: Any) -> AppConfig:
 
 
 class RouterShutdownTests(RouterTestCase):
-
     async def _settle(self, rounds: int = 10) -> None:
         for _ in range(rounds):
             await asyncio.sleep(0)
+
     async def test_close_closes_signal_supervisor_and_dedupe(self) -> None:
         class CloseSignal(FakeSignal):
             def __init__(self) -> None:
@@ -382,7 +382,9 @@ routes:
             router = SignalHermesRouter(
                 _notification_app(tmp),
                 signal_client=signal,  # type: ignore[arg-type]
-                supervisor=FakeSupervisor(FakeProfile(gate_started=started, gate_wait=gate, gate_first_only=True)),  # type: ignore[arg-type]
+                supervisor=FakeSupervisor(
+                    FakeProfile(gate_started=started, gate_wait=gate, gate_first_only=True)
+                ),  # type: ignore[arg-type]
                 dedupe=DedupeStore(),
             )
             payload = canonicalize_notification_payload({"status": "ok"}, max_bytes=1024)
@@ -925,4 +927,3 @@ routes:
                     await asyncio.wait_for(supervisor.close(), timeout=5)
             self.assertEqual(closed, ["b"])
             self.assertEqual(supervisor._profiles, {})
-

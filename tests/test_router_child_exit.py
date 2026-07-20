@@ -22,12 +22,12 @@ from tests.support import (
 
 
 class RouterChildExitTests(RouterTestCase):
-
     async def _wait_for_eviction(self, supervisor: ProfileSupervisor, profile: str) -> None:
         for _ in range(100):
             if profile not in supervisor._profiles:
                 return
             await asyncio.sleep(0.01)
+
     _FIXTURE = Path(__file__).parent / "fixtures" / "fake_acp_agent.py"
 
     async def _wait_for_eviction(self, supervisor: ProfileSupervisor, profile: str) -> None:
@@ -146,4 +146,3 @@ class RouterChildExitTests(RouterTestCase):
                 self.assertIn(stable_ref("id", "private-profile"), output)
             finally:
                 await router.close()
-

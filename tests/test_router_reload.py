@@ -1209,7 +1209,9 @@ routes:
             stuck.set()
             response = await harness.router._handle_reload_config_control({})
             self.assertEqual(response["status"], "ok")
-            await wait_until(lambda: not harness.router.sessions._sessions, timeout=5.0, interval=0.05)
+            await wait_until(
+                lambda: not harness.router.sessions._sessions, timeout=5.0, interval=0.05
+            )
             self.assertEqual(harness.router.sessions._sessions, {})
             self.assertEqual(harness.profile.released_session_ids, ["session-1"])
             # The route is live again under the same profile, so its profile
@@ -1296,7 +1298,9 @@ routes:
             followups = [t for t in harness.router._reap_tasks if not t.done()]
             self.assertTrue(followups)
             stuck.set()
-            await wait_until(lambda: not harness.router.sessions._sessions, timeout=5.0, interval=0.05)
+            await wait_until(
+                lambda: not harness.router.sessions._sessions, timeout=5.0, interval=0.05
+            )
             self.assertEqual(harness.router.sessions._sessions, {})
             self.assertEqual(harness.profile.released_session_ids, ["session-1"])
             await turn_task
@@ -3958,4 +3962,3 @@ routes:
                 self.assertTrue(all(future.done() for future in futures))
             # The cancelled reload never swapped the configuration.
             self.assertEqual(harness.router._config_generation, 0)
-

@@ -311,4 +311,3 @@ class RouterDirectTests(RouterTestCase):
                 signal.direct_sends,
                 [("sender-uuid", "still working"), ("sender-uuid", "reply")],
             )
-

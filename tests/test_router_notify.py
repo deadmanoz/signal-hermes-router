@@ -43,7 +43,6 @@ from tests.support import (
 
 
 class RouterNotifyTests(RouterTestCase):
-
     async def _check_notify_rejects_attachment(self, raw_attachments: Any) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             route = Route(
@@ -88,6 +87,7 @@ class RouterNotifyTests(RouterTestCase):
         self.assertEqual(response["error"], "invalid_attachment")
         self.assertEqual(profile.prompts, [])
         self.assertEqual(signal.sends, [])
+
     async def test_notification_retry_after_crash_mid_turn_delivers_after_restart(self) -> None:
         class CrashedBeforeCleanupDedupeStore(DedupeStore):
             # Skipping cleanup leaves the committed 'processing' claim on disk,
@@ -1093,4 +1093,3 @@ notifications:
             self.assertEqual(signal.sends, [])
             self.assertEqual(signal.send_attachments, [])
             self.assertFalse((app.router.media_root / ".outbound").exists())
-

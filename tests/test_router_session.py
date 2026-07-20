@@ -381,4 +381,3 @@ class RouterSessionTests(RouterTestCase):
 
             self.assertEqual(profile.resumes, 0)
             self.assertEqual(profile.released_session_ids, ["session-1"])
-

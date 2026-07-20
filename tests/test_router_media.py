@@ -321,4 +321,3 @@ class RouterMediaTests(RouterTestCase):
             media_files = list((Path(tmp) / "media").rglob("note.txt"))
             self.assertEqual(len(media_files), 1)
             self.assertEqual(media_files[0].read_bytes(), b"from signal store")
-

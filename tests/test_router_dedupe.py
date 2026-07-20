@@ -92,4 +92,3 @@ class RouterDedupeTests(RouterTestCase):
 
             self.assertEqual(len(profile.prompts), 2)
             self.assertEqual(signal.sends, [("group-one", "reply"), ("group-two", "reply")])
-

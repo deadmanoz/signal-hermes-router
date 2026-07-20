@@ -611,7 +611,9 @@ def make_reload_harness(
     **router_overrides: Any,
 ) -> tuple[RouterHarness, Path, Path]:
     """Create a harness with config files written and paths registered."""
-    config_path, routes_path = write_config_pair(tmp, routes_yaml=routes_yaml, router_yaml=router_yaml)
+    config_path, routes_path = write_config_pair(
+        tmp, routes_yaml=routes_yaml, router_yaml=router_yaml
+    )
     harness = make_router_harness(tmp, **router_overrides)
     harness.router.set_config_paths(config_path, routes_path)
     return harness, config_path, routes_path

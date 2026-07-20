@@ -976,4 +976,3 @@ routes:
         self.assertEqual([route["route_ref"] for route in by_profile["routes"]], ["route:beta"])
         self.assertEqual(invalid_string_list["error"], "invalid_route_status_scope")
         self.assertEqual(invalid_bool["error"], "invalid_route_status_scope")
-
