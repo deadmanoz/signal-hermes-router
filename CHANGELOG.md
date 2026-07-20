@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.34](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.33...v0.1.34) (2026-07-19)
+
+
+### Documentation
+
+* post-v0.1.33 cleanup pass for public consumption ([#76](https://github.com/deadmanoz/signal-hermes-router/issues/76)) ([56150be](https://github.com/deadmanoz/signal-hermes-router/commit/56150be3452e1e3d7f22b2ac71b59259ec815e86))
+
 ## [0.1.33](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.32...v0.1.33) (2026-07-19)
 
 
