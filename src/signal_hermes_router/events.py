@@ -32,7 +32,6 @@ class SignalEventSummary:
     message_type: str
     has_group: bool
     has_exception: bool = False
-    exception_type: str | None = None
 
     def __str__(self) -> str:
         summary = (
@@ -41,8 +40,6 @@ class SignalEventSummary:
         )
         if self.has_exception:
             summary += " has_exception=true"
-        if self.exception_type:
-            summary += f" exception_type={self.exception_type}"
         return summary
 
 
@@ -60,7 +57,6 @@ def probe_signal_route(raw: dict[str, Any]) -> SignalRouteProbe:
     params = unwrap_signal_event(raw)
     envelope = params.get("envelope") if isinstance(params, dict) else None
     has_exception = _has_exception(params)
-    exception_type = _exception_type(params)
     if not isinstance(envelope, dict):
         return SignalRouteProbe(
             group_id=None,
@@ -72,7 +68,6 @@ def probe_signal_route(raw: dict[str, Any]) -> SignalRouteProbe:
                 message_type="none",
                 has_group=False,
                 has_exception=has_exception,
-                exception_type=exception_type,
             ),
         )
     shape = "direct" if raw is params else "jsonrpc"
@@ -98,7 +93,6 @@ def probe_signal_route(raw: dict[str, Any]) -> SignalRouteProbe:
             message_type=message_type,
             has_group=has_group,
             has_exception=has_exception,
-            exception_type=exception_type,
         ),
     )
 
@@ -225,17 +219,6 @@ def _data_message_from_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
 
 def _has_exception(params: Any) -> bool:
     return isinstance(params, dict) and params.get("exception") is not None
-
-
-def _exception_type(params: Any) -> str | None:
-    if not isinstance(params, dict):
-        return None
-    exception = params.get("exception")
-    if isinstance(exception, dict):
-        exc_type = exception.get("type")
-        if isinstance(exc_type, str) and exc_type:
-            return exc_type
-    return None
 
 
 def _optional_str(value: Any) -> str | None:

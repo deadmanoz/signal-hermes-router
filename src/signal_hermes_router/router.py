@@ -3550,14 +3550,7 @@ class SignalHermesRouter:
 
 def _discard_event(summary: SignalEventSummary) -> None:
     if summary.has_exception:
-        if summary.exception_type:
-            LOGGER.warning(
-                "discarding Signal event with receive exception (%s) %s",
-                summary.exception_type,
-                summary,
-            )
-        else:
-            LOGGER.warning("discarding Signal event with receive exception %s", summary)
+        LOGGER.warning("discarding Signal event with receive exception %s", summary)
     elif summary.message_type == "unknown":
         LOGGER.info("discarding unrouted Signal event %s", summary)
     else:

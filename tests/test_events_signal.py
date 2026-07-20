@@ -343,10 +343,8 @@ class EventTests(unittest.TestCase):
         self.assertEqual(probe.summary.message_type, "unknown")
         self.assertFalse(probe.summary.has_group)
         self.assertTrue(probe.summary.has_exception)
-        self.assertEqual(probe.summary.exception_type, "RuntimeException")
         summary_str = str(probe.summary)
         self.assertIn("has_exception=true", summary_str)
-        self.assertIn("exception_type=RuntimeException", summary_str)
         self.assertNotIn("private exception detail", summary_str)
         self.assertNotIn("sender-uuid", summary_str)
 
@@ -482,6 +480,99 @@ class SignalHttpTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(events, [{"message": "valid"}])
         self.assertIn("Skipping malformed Signal SSE frame", "\n".join(logs.output))
+
+
+class MalformedFrameLimiterTests(unittest.IsolatedAsyncioTestCase):
+    def test_limiter_allows_first_n_logs(self) -> None:
+        limiter = signal_module.MalformedFrameLimiter(
+            max_logs=3, window_seconds=60.0, clock=lambda: 0.0
+        )
+        self.assertTrue(limiter.log_malformed(10))
+        self.assertTrue(limiter.log_malformed(20))
+        self.assertTrue(limiter.log_malformed(30))
+
+    def test_limiter_suppresses_beyond_max(self) -> None:
+        limiter = signal_module.MalformedFrameLimiter(
+            max_logs=2, window_seconds=60.0, clock=lambda: 0.0
+        )
+        self.assertTrue(limiter.log_malformed(10))
+        self.assertTrue(limiter.log_malformed(20))
+        self.assertFalse(limiter.log_malformed(30))
+        self.assertFalse(limiter.log_malformed(40))
+        self.assertEqual(limiter._suppressed, 2)
+
+    def test_limiter_resets_after_window(self) -> None:
+        clock = [0.0]
+        limiter = signal_module.MalformedFrameLimiter(
+            max_logs=2, window_seconds=60.0, clock=lambda: clock[0]
+        )
+        self.assertTrue(limiter.log_malformed(10))
+        self.assertTrue(limiter.log_malformed(20))
+        self.assertFalse(limiter.log_malformed(30))
+        clock[0] = 61.0
+        self.assertTrue(limiter.log_malformed(40))
+
+    def test_limiter_reports_suppression_on_window_rollover(self) -> None:
+        clock = [0.0]
+        limiter = signal_module.MalformedFrameLimiter(
+            max_logs=2, window_seconds=60.0, clock=lambda: clock[0]
+        )
+        self.assertTrue(limiter.log_malformed(10))
+        self.assertTrue(limiter.log_malformed(20))
+        self.assertFalse(limiter.log_malformed(30))
+        self.assertFalse(limiter.log_malformed(40))
+        clock[0] = 61.0
+        with self.assertLogs("signal_hermes_router.signal", level="WARNING") as logs:
+            self.assertTrue(limiter.log_malformed(50))
+        output = "\n".join(logs.output)
+        self.assertIn("2 malformed SSE frames suppressed", output)
+
+    def test_limiter_no_suppression_report_when_none_suppressed(self) -> None:
+        clock = [0.0]
+        limiter = signal_module.MalformedFrameLimiter(
+            max_logs=2, window_seconds=60.0, clock=lambda: clock[0]
+        )
+        self.assertTrue(limiter.log_malformed(10))
+        clock[0] = 61.0
+        # No suppression to report, so no warning should be emitted.
+        # Use assertLogs with a dummy log to satisfy the context manager,
+        # then verify the suppression message is absent.
+        import logging
+
+        logger = logging.getLogger("signal_hermes_router.signal")
+        with self.assertLogs("signal_hermes_router.signal", level="WARNING") as logs:
+            logger.warning("dummy")
+            self.assertTrue(limiter.log_malformed(20))
+        output = "\n".join(logs.output)
+        self.assertNotIn("suppressed", output)
+
+    async def test_iter_sse_json_uses_limiter(self) -> None:
+        response = FakeSseResponse(
+            [
+                'data: {"message": "valid"}',
+                "",
+                "data: not-json-1",
+                "",
+                "data: not-json-2",
+                "",
+                "data: not-json-3",
+                "",
+                "data: not-json-4",
+                "",
+            ]
+        )
+        limiter = signal_module.MalformedFrameLimiter(
+            max_logs=2, window_seconds=60.0, clock=lambda: 0.0
+        )
+        with self.assertLogs("signal_hermes_router.signal", level="WARNING") as logs:
+            events = [event async for event in _iter_sse_json(response, limiter=limiter)]  # type: ignore[arg-type]
+        self.assertEqual(events, [{"message": "valid"}])
+        output = "\n".join(logs.output)
+        self.assertEqual(len([line for line in logs.output if "Skipping malformed" in line]), 2)
+        self.assertNotIn("not-json-1", output)
+        self.assertNotIn("not-json-2", output)
+        self.assertNotIn("not-json-3", output)
+        self.assertNotIn("not-json-4", output)
 
     async def test_check_and_send_group_rpc_shape(self) -> None:
         requests: list[dict] = []
