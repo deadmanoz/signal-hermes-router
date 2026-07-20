@@ -222,6 +222,24 @@ def _estimate_raw_payload_bytes(raw: object) -> int:
     return 0
 
 
+def _try_claim_uncontended(lock: asyncio.Lock) -> bool:
+    # Synchronously claim an asyncio.Lock only when it is immediately
+    # available: unlocked AND no queued waiters. This mirrors the
+    # non-suspending fast path of Lock.acquire() — asyncio does not preempt
+    # between await points, so when both conditions hold in this task step
+    # the claim cannot race. locked() alone is insufficient: a released lock
+    # whose woken waiter has not resumed yet reads unlocked while acquire()
+    # would still queue behind that waiter, which is exactly what a caller
+    # holding another resource must never do.
+    if lock.locked():
+        return False
+    waiters = getattr(lock, "_waiters", None)
+    if waiters and any(not waiter.cancelled() for waiter in waiters):
+        return False
+    lock._locked = True
+    return True
+
+
 @dataclass(frozen=True)
 class RoutedTurnInput:
     route: Route
@@ -1373,13 +1391,15 @@ class SignalHermesRouter:
         profile_lock.locked() stays synonymous with "a turn is executing on
         this profile" and a same-profile synthetic never sees a spurious BUSY
         from an inbound that is merely queued for capacity). When the capacity
-        wait ends the permit is released again if the profile lock is not
-        immediately free — a synthetic may have barged in during the wait, and
-        holding the permit across that re-entry would park global capacity
-        behind the synthetic's whole turn. Releasing the permit is safe here
-        because the check uses profile_lock.locked() (not semaphore.locked()),
-        so a waiter that sees the profile lock busy never misidentifies itself
-        as the holder and livelock is avoided.
+        wait ends the permit is released again unless the profile lock is
+        immediately claimable — unlocked AND waiter-free: a synthetic may have
+        barged in during the wait, or a queued profile waiter may be
+        woken-but-not-resumed (a transient locked() alone misses), and holding
+        the permit across that re-entry would park global capacity behind
+        another turn's whole execution. The capacity re-check reads the permit
+        count directly (not semaphore.locked(), which also reports queued
+        waiters), so a released permit is re-taken in the same task step when
+        the profile is free and the loop cannot livelock.
         """
         profile_lock = self._profile_lock(route.profile)
         semaphore = self._turn_execution_semaphore
@@ -1389,27 +1409,29 @@ class SignalHermesRouter:
             while True:
                 await profile_lock.acquire()
                 lock_held = True
-                if not permit_held:
-                    # Fast path: try to take a permit without waiting.
-                    # The check-and-decrement is synchronous (no await), so
-                    # no other task can interleave and steal the permit.
-                    if semaphore._value > 0:
-                        semaphore._value -= 1
-                        permit_held = True
-                        break
-                    # Capacity wait: hold NOTHING while parked (see docstring).
-                    profile_lock.release()
-                    lock_held = False
-                    await semaphore.acquire()
+                # Fast path: take a permit without waiting. The
+                # check-and-decrement is synchronous (no await), so no other
+                # task can interleave and steal the permit.
+                if semaphore._value > 0:
+                    semaphore._value -= 1
                     permit_held = True
-                    # Always loop back to re-acquire the profile lock.  If the
-                    # lock is held by a synthetic, the acquire blocks and the
-                    # permit is released first so global capacity is not parked.
-                    if profile_lock.locked():
-                        semaphore.release()
-                        permit_held = False
-                    continue
-                break
+                    break
+                # Capacity wait: hold NOTHING while parked (see docstring).
+                profile_lock.release()
+                lock_held = False
+                await semaphore.acquire()
+                permit_held = True
+                # Profile re-entry: claim the profile lock only when it is
+                # immediately ours — unlocked AND waiter-free. locked() alone
+                # misses the wake-transient, where a woken waiter has not
+                # resumed yet and acquire() would park the permit behind that
+                # waiter. When the claim is not immediate, release the permit
+                # and queue on the profile lock holding nothing.
+                if _try_claim_uncontended(profile_lock):
+                    lock_held = True
+                    break
+                semaphore.release()
+                permit_held = False
             # Freshness re-check at the point the turn actually runs: an event
             # fresh at route-lock acquisition can age past max_event_age_seconds
             # while parked on the profile lock, the capacity wait, or the

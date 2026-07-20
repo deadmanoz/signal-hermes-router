@@ -876,3 +876,34 @@ class RouterConcurrencyTests(RouterTestCase):
                 )
             )
             await self._shutdown(router, run_task)
+
+    async def test_try_claim_uncontended_refuses_woken_waiter_transient(self) -> None:
+        # GitHub-round regression: a released lock whose woken waiter has not
+        # resumed yet reads locked() == False, but acquire() would still queue
+        # behind that waiter. The gate's re-entry claim must refuse in that
+        # transient so the execution permit is never parked behind it.
+        lock = asyncio.Lock()
+        # Free and waiter-free: the claim succeeds synchronously.
+        self.assertTrue(router_module._try_claim_uncontended(lock))
+        self.assertTrue(lock.locked())
+        # Held: the claim refuses.
+        self.assertFalse(router_module._try_claim_uncontended(lock))
+
+        waiter_parked = asyncio.Event()
+
+        async def _waiter() -> None:
+            waiter_parked.set()
+            await lock.acquire()
+            lock.release()
+
+        task = asyncio.create_task(_waiter())
+        await waiter_parked.wait()
+        await asyncio.sleep(0)  # let the waiter park on the held lock
+        lock.release()
+        # Wake-transient: unlocked with the woken waiter still queued.
+        self.assertFalse(lock.locked())
+        self.assertFalse(router_module._try_claim_uncontended(lock))
+        await asyncio.wait_for(task, timeout=1)
+        # Waiter consumed and released: immediately claimable again.
+        self.assertTrue(router_module._try_claim_uncontended(lock))
+        lock.release()
