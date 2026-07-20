@@ -666,3 +666,100 @@ class RouterConcurrencyTests(RouterTestCase):
             gate_s1.set()
             await self._await_condition(lambda: ("group-s2", "reply") in signal.sends)
             await self._shutdown(router, run_task)
+
+    async def test_capacity_reentry_behind_barging_synthetic_holds_no_permit(self) -> None:
+        # GitHub-round regression: when an inbound's capacity wait ends while a
+        # same-profile synthetic has barged in, the inbound must NOT hold its
+        # freshly-won permit across the profile re-entry wait — with a single
+        # global slot that would park all capacity behind the synthetic's whole
+        # turn. The inbound releases the permit and queues on the profile lock
+        # holding nothing, so an idle profile's turn still runs.
+        started_a = asyncio.Event()
+        gate_a = asyncio.Event()
+        started_y = asyncio.Event()
+        gate_y = asyncio.Event()
+        profile_a = FakeProfile(gate_started=started_a, gate_wait=gate_a)
+        profile_p = FakeProfile(gate_started=started_y, gate_wait=gate_y)
+        profile_f = FakeProfile()
+
+        class StagedSignal(ClosedAwareSignal):
+            def __init__(self) -> None:
+                super().__init__()
+                self.release_x = asyncio.Event()
+                self.release_f = asyncio.Event()
+
+            async def events(self):
+                yield make_group_raw(group_id="group-a", timestamp=1)
+                await self.release_x.wait()
+                yield make_group_raw(group_id="group-x", timestamp=2)
+                await self.release_f.wait()
+                yield make_group_raw(group_id="group-f", timestamp=3)
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = StagedSignal()
+            app = AppConfig(
+                router=router_config_for_tmp(tmp, max_concurrent_turns=1),
+                routes=(
+                    _concurrent_route("route-a", "group-a", "profile-a"),
+                    _concurrent_route("route-x", "group-x", "profile-p"),
+                    _concurrent_route("route-y", "group-y", "profile-p"),
+                    _concurrent_route("route-f", "group-f", "profile-f"),
+                ),
+                notifications=(
+                    SyntheticRouteNotification(
+                        id="ping-y",
+                        route_name="route-y",
+                        prompt="Ping route y.",
+                    ),
+                ),
+            )
+            router = SignalHermesRouter(
+                app,
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=MultiProfileSupervisor(  # type: ignore[arg-type]
+                    {
+                        "profile-a": profile_a,
+                        "profile-p": profile_p,
+                        "profile-f": profile_f,
+                    }
+                ),
+                dedupe=DedupeStore(),
+            )
+            run_task = asyncio.create_task(router.run_forever())
+            # A holds the only execution permit; X is then dispatched and parks
+            # on the capacity wait holding no profile lock.
+            await asyncio.wait_for(started_a.wait(), timeout=1)
+            signal.release_x.set()
+            await self._settle()
+            self.assertEqual(profile_p.prompts, [])
+
+            # A zero-timeout synthetic on another route sharing profile-p
+            # barges in and runs (gated so it stays in flight).
+            synthetic_task = asyncio.create_task(
+                router.handle_notification(
+                    "ping-y",
+                    canonicalize_notification_payload({"ping": "y"}, max_bytes=1024),
+                    route_lock_timeout=0,
+                )
+            )
+            await asyncio.wait_for(started_y.wait(), timeout=1)
+
+            # Free A: X's capacity wait ends while the synthetic holds
+            # profile-p. X must release the permit and queue on the profile
+            # lock holding nothing, so the idle profile-f turn still runs even
+            # though the synthetic has not finished.
+            gate_a.set()
+            await self._await_condition(lambda: ("group-a", "reply") in signal.sends)
+            await self._settle()
+            signal.release_f.set()
+            await self._await_condition(lambda: ("group-f", "reply") in signal.sends)
+            self.assertFalse(gate_y.is_set())
+            self.assertNotIn(("group-x", "reply"), signal.sends)
+
+            # Releasing the synthetic lets X re-enter profile-p and run.
+            gate_y.set()
+            synthetic_outcome = await asyncio.wait_for(synthetic_task, timeout=1)
+            self.assertEqual(synthetic_outcome.status, TurnOutcomeStatus.DELIVERED)
+            await self._await_condition(lambda: ("group-x", "reply") in signal.sends)
+            await self._shutdown(router, run_task)

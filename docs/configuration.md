@@ -728,7 +728,10 @@ queued behind its route or profile lock spends no global capacity and a slow
 shared-profile backlog cannot starve turns on idle profiles. While a turn waits
 for global capacity it holds no profile lock, so a synthetic turn on another
 route sharing that profile is admitted normally (no spurious `BUSY`) and runs
-ahead of the capacity-queued inbound turn.
+ahead of the capacity-queued inbound turn. If such a synthetic is running when
+capacity frees, the inbound releases the permit it just won and queues behind
+the synthetic holding no slot, so global capacity is never parked behind an
+operator-driven turn.
 
 Known limitation: concurrent dispatch widens the crash-loss window compared with
 the old strictly serial consumer. Several accepted events can be in memory at
