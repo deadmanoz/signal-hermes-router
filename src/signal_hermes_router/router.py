@@ -630,6 +630,16 @@ class SignalHermesRouter:
                     self._inflight_dispatch_semaphore.release()
                     raise
                 try:
+                    size = _estimate_raw_payload_bytes(raw)
+                except Exception:
+                    # A pathological payload (e.g. nested past the recursion
+                    # limit) must not crash the consumer — above all not after
+                    # create_task, where the untracked task would leak its
+                    # dispatch permit. Charge the full byte budget instead: the
+                    # most conservative bound, self-correcting when the task
+                    # settles.
+                    size = self._inflight_dispatch_bytes_limit
+                try:
                     # The config is pinned at acceptance: the task may not run
                     # until after a reload swapped self.config, and an admitted
                     # event must still resolve its route against the config it
@@ -651,7 +661,6 @@ class SignalHermesRouter:
                     # keep acquire/release balanced. No bytes were charged yet.
                     self._inflight_dispatch_semaphore.release()
                     raise
-                size = _estimate_raw_payload_bytes(raw)
                 self._inflight_dispatch_bytes += size
                 self._signal_turn_task_bytes[task] = size
                 self._signal_turn_tasks.add(task)

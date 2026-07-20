@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import tempfile
 from contextlib import suppress
 from typing import Any
@@ -762,4 +763,45 @@ class RouterConcurrencyTests(RouterTestCase):
             synthetic_outcome = await asyncio.wait_for(synthetic_task, timeout=1)
             self.assertEqual(synthetic_outcome.status, TurnOutcomeStatus.DELIVERED)
             await self._await_condition(lambda: ("group-x", "reply") in signal.sends)
+            await self._shutdown(router, run_task)
+
+    async def test_unestimable_payload_charges_max_and_consumer_survives(self) -> None:
+        # GitHub-round regression: a raw payload nested past the recursion
+        # limit makes _estimate_raw_payload_bytes raise; the consumer must not
+        # crash (above all not after create_task, which would leak the
+        # dispatch permit). It charges the full byte budget for that one
+        # event, the event's task still runs and settles, and later events
+        # keep flowing.
+        depth = sys.getrecursionlimit() * 2
+        nested: dict[str, Any] = {}
+        cursor = nested
+        for _ in range(depth):
+            cursor["x"] = {}
+            cursor = cursor["x"]
+
+        class NestedThenGoodSignal(ClosedAwareSignal):
+            async def events(self):
+                yield nested
+                yield make_group_raw(group_id="group-a", timestamp=1)
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = NestedThenGoodSignal()
+            router = SignalHermesRouter(
+                _concurrent_app(
+                    tmp,
+                    (_concurrent_route("route-a", "group-a", "profile-a"),),
+                ),
+                signal_client=signal,  # type: ignore[arg-type]
+                supervisor=MultiProfileSupervisor(  # type: ignore[arg-type]
+                    {"profile-a": FakeProfile()}
+                ),
+                dedupe=DedupeStore(),
+            )
+            run_task = asyncio.create_task(router.run_forever())
+            # The pathological event does not match any envelope shape and is
+            # dropped, but the consumer survives it and the next event turns.
+            await self._await_condition(lambda: ("group-a", "reply") in signal.sends)
+            # Byte bookkeeping settled back to zero once both tasks finished.
+            await self._await_condition(lambda: router._inflight_dispatch_bytes == 0)
             await self._shutdown(router, run_task)
