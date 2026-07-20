@@ -5217,10 +5217,7 @@ routes:
                     # The second reload is now a live request task parked inside
                     # its bounded parse; only then does the reaper pass start, so
                     # an unattributed reload task is deterministically in scope.
-                    deadline = time.monotonic() + 5
-                    while not parse_entered.is_set():
-                        self.assertLess(time.monotonic(), deadline)
-                        await asyncio.sleep(0.01)
+                    await wait_until(lambda: parse_entered.is_set(), timeout=5.0, interval=0.01)
                     parked = [
                         task for task in harness.router._control_request_tasks if not task.done()
                     ]
@@ -5387,10 +5384,7 @@ routes:
             try:
                 # The request is now parked inside the dedupe worker read,
                 # before handle_notification could attribute the turn.
-                deadline = time.monotonic() + 5
-                while not entered.is_set():
-                    self.assertLess(time.monotonic(), deadline)
-                    await asyncio.sleep(0.01)
+                await wait_until(lambda: entered.is_set(), timeout=5.0, interval=0.01)
                 parked = [t for t in harness.router._control_request_tasks if not t.done()]
                 self.assertEqual(len(parked), 1)
                 self.assertEqual(harness.router._turn_task_route_key(parked[0]), route.key)
@@ -5561,10 +5555,7 @@ routes:
             # completion before this task resumes, and completed tasks are
             # settled out of the tracked set, so poll the OUTCOME against a
             # deadline instead of inspecting the task set.
-            deadline = time.monotonic() + 5
-            while harness.supervisor.retired != ["p1"]:
-                self.assertLess(time.monotonic(), deadline)
-                await asyncio.sleep(0.01)
+            await wait_until(lambda: harness.supervisor.retired == ["p1"], timeout=5.0, interval=0.01)
             self.assertNotIn("p1", harness.supervisor.cached)
             # Drain whatever the deferred reap left in flight (it may already
             # have settled out of the tracked set, hence no done() filter).
@@ -5600,10 +5591,7 @@ routes:
             # The turn's completion scheduled a cleanup reap; poll the
             # OUTCOME against a deadline (completed reaps settle out of the
             # tracked set, so the task set is not a stable witness).
-            deadline = time.monotonic() + 5
-            while harness.supervisor.retired != ["profile"]:
-                self.assertLess(time.monotonic(), deadline)
-                await asyncio.sleep(0.01)
+            await wait_until(lambda: harness.supervisor.retired == ["profile"], timeout=5.0, interval=0.01)
             self.assertEqual(set(harness.router.sessions._sessions), set())
 
     async def test_turn_on_now_disabled_route_schedules_cleanup_reap(self) -> None:
@@ -5628,10 +5616,7 @@ routes:
             outcome = await harness.router.handle_event(make_event(), config=old_config)
             assert outcome is not None
             self.assertEqual(outcome.text, "reply")
-            deadline = time.monotonic() + 5
-            while harness.supervisor.retired != ["profile"]:
-                self.assertLess(time.monotonic(), deadline)
-                await asyncio.sleep(0.01)
+            await wait_until(lambda: harness.supervisor.retired == ["profile"], timeout=5.0, interval=0.01)
             self.assertEqual(set(harness.router.sessions._sessions), set())
 
     async def test_turn_with_failed_session_acquisition_schedules_cleanup_reap(self) -> None:
@@ -5661,10 +5646,7 @@ routes:
             self.assertEqual(harness.profile.new_sessions, 0)
             # ...and the finally-block self-heal still reaps the cached
             # profile the failed acquisition left behind.
-            deadline = time.monotonic() + 5
-            while harness.supervisor.retired != ["profile"]:
-                self.assertLess(time.monotonic(), deadline)
-                await asyncio.sleep(0.01)
+            await wait_until(lambda: harness.supervisor.retired == ["profile"], timeout=5.0, interval=0.01)
             self.assertEqual(set(harness.router.sessions._sessions), set())
 
     async def test_turn_outliving_policy_reload_schedules_policy_reap(self) -> None:
@@ -5693,10 +5675,7 @@ routes:
             outcome = await harness.router.handle_event(make_event(), config=old_config)
             assert outcome is not None
             self.assertEqual(outcome.text, "reply")
-            deadline = time.monotonic() + 5
-            while set(harness.router.sessions._sessions):
-                self.assertLess(time.monotonic(), deadline)
-                await asyncio.sleep(0.01)
+            await wait_until(lambda: not set(harness.router.sessions._sessions), timeout=5.0, interval=0.01)
             self.assertEqual(harness.supervisor.retired, [])
 
     async def test_shadow_turn_does_not_schedule_cleanup_reap(self) -> None:
@@ -6283,9 +6262,7 @@ routes:
             stuck.set()
             response = await harness.router._handle_reload_config_control({})
             self.assertEqual(response["status"], "ok")
-            deadline = time.monotonic() + 5
-            while harness.router.sessions._sessions and time.monotonic() < deadline:
-                await asyncio.sleep(0.05)
+            await wait_until(lambda: not harness.router.sessions._sessions, timeout=5.0, interval=0.05)
             self.assertEqual(harness.router.sessions._sessions, {})
             self.assertEqual(harness.profile.released_session_ids, ["session-1"])
             # The route is live again under the same profile, so its profile
@@ -6372,9 +6349,7 @@ routes:
             followups = [t for t in harness.router._reap_tasks if not t.done()]
             self.assertTrue(followups)
             stuck.set()
-            deadline = time.monotonic() + 5
-            while harness.router.sessions._sessions and time.monotonic() < deadline:
-                await asyncio.sleep(0.05)
+            await wait_until(lambda: not harness.router.sessions._sessions, timeout=5.0, interval=0.05)
             self.assertEqual(harness.router.sessions._sessions, {})
             self.assertEqual(harness.profile.released_session_ids, ["session-1"])
             await turn_task
