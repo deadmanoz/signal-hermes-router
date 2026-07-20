@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from signal_hermes_router.acp import ACPProfile, JsonRpcError
+from signal_hermes_router.acp import ACPProfile
 from signal_hermes_router.config import (
     AppConfig,
     CircuitBreakerConfig,
