@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import stat
 import sys
+import tempfile
+import threading
+import time
+import unittest
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from signal_hermes_router.acp import ACPProfile
+from signal_hermes_router.acp import ACPProfile, JsonRpcError
 from signal_hermes_router.config import (
     AppConfig,
     CircuitBreakerConfig,
     InboundRateLimitConfig,
     Route,
     RouterConfig,
+    RouterControlConfig,
     SyntheticRouteNotification,
     SyntheticRouteJob,
 )
@@ -28,6 +34,8 @@ from signal_hermes_router.models import (
     TurnResult,
 )
 from signal_hermes_router.permissions import StaticPermissionPolicy
+from signal_hermes_router.preflight import ToolSurface
+from signal_hermes_router.private_fs import ensure_private_dir_tree, write_private_bytes
 from signal_hermes_router.router import SignalHermesRouter
 
 
@@ -163,13 +171,27 @@ def make_app(
 
 
 class FakeSignal:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        events_to_yield: list[dict[str, Any]] | None = None,
+        fail_send_after_n: int | None = None,
+        closed: bool = False,
+    ) -> None:
         self.sends: list[tuple[str, str]] = []
         self.direct_sends: list[tuple[str, str]] = []
         self.send_attachments: list[tuple[str, tuple[str, ...]]] = []
         self.direct_send_attachments: list[tuple[str, tuple[str, ...]]] = []
         self.typing: list[tuple[str, bool]] = []
         self.direct_typing: list[tuple[str, bool]] = []
+        self._events_to_yield = events_to_yield or []
+        self._fail_send_after_n = fail_send_after_n
+        self._closed = closed
+
+    async def events(self) -> AsyncIterator[dict[str, Any]]:
+        for ev in self._events_to_yield:
+            yield ev
+        await asyncio.Event().wait()
 
     async def send_group(
         self,
@@ -178,8 +200,12 @@ class FakeSignal:
         *,
         attachments: Sequence[str] = (),
     ) -> dict[str, int]:
+        if self._closed:
+            raise RuntimeError("signal client closed")
         self.sends.append((group_id, message))
         self.send_attachments.append((group_id, tuple(attachments)))
+        if self._fail_send_after_n is not None and len(self.sends) == self._fail_send_after_n:
+            raise RuntimeError("synthetic send failure")
         return {"timestamp": 1}
 
     async def send_direct(
@@ -206,7 +232,20 @@ class FakeSignal:
 
 
 class FakeProfile:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        resume_available: bool = True,
+        reply_text: str = "reply",
+        prompt_delay: float = 0.0,
+        prompt_exception: Exception | None = None,
+        new_session_exception: Exception | None = None,
+        resume_exception: Exception | None = None,
+        gate_started: asyncio.Event | None = None,
+        gate_wait: asyncio.Event | None = None,
+        gate_first_only: bool = False,
+    ) -> None:
         self.profile = "profile"
         self.prompts: list[list[dict[str, Any]]] = []
         self.resumes = 0
@@ -214,21 +253,34 @@ class FakeProfile:
         self.new_session_cwds: list[Path] = []
         self.prompt_session_ids: list[str] = []
         self.released_session_ids: list[str] = []
-        self.resume_available = True
-        self.fail = False
-        self.reply_text = "reply"
-        self.prompt_delay = 0.0
         self.policies: list[tuple[str, StaticPermissionPolicy]] = []
+        self.resume_available = resume_available
+        self.fail = fail
+        self.reply_text = reply_text
+        self.prompt_delay = prompt_delay
+        self._prompt_exception = prompt_exception
+        self._new_session_exception = new_session_exception
+        self._resume_exception = resume_exception
+        self._gate_started = gate_started
+        self._gate_wait = gate_wait
+        self._gate_first_only = gate_first_only
+        self._gated_once = False
 
     async def new_session(self, cwd: Path) -> str:
         cwd.mkdir(parents=True, exist_ok=True)
         self.new_sessions += 1
         self.new_session_cwds.append(cwd)
+        if self._new_session_exception is not None:
+            raise self._new_session_exception
         return f"session-{self.new_sessions}"
 
     async def resume_session(self, session_id: str, cwd: Path) -> bool:
         self.resumes += 1
-        return self.resume_available
+        if self._resume_exception is not None:
+            raise self._resume_exception
+        if not self.resume_available:
+            return False
+        return True
 
     def set_permission_policy(self, session_id: str, policy: StaticPermissionPolicy) -> None:
         self.policies.append((session_id, policy))
@@ -240,27 +292,168 @@ class FakeProfile:
     async def prompt(self, session_id: str, blocks: list[dict[str, Any]]) -> TurnResult:
         self.prompt_session_ids.append(session_id)
         self.prompts.append(blocks)
+        if self._gate_started is not None:
+            self._gate_started.set()
+        if self._gate_wait is not None:
+            if self._gate_first_only:
+                if not self._gated_once:
+                    self._gated_once = True
+                    await self._gate_wait.wait()
+            else:
+                await self._gate_wait.wait()
         if self.prompt_delay:
-            import asyncio
-
             await asyncio.sleep(self.prompt_delay)
         if self.fail:
             raise RuntimeError("boom")
+        if self._prompt_exception is not None:
+            raise self._prompt_exception
         return TurnResult(self.reply_text)
 
 
+class ToolSurfaceProfile(FakeProfile):
+    def __init__(self, surface: ToolSurface) -> None:
+        super().__init__()
+        self._surface = surface
+
+    async def tool_surface(self) -> ToolSurface:
+        return self._surface
+
+
+class BlockingSurfaceProfile(FakeProfile):
+    def __init__(
+        self,
+        surface: ToolSurface,
+        *,
+        entered: asyncio.Event | None = None,
+        release: asyncio.Event | None = None,
+    ) -> None:
+        super().__init__()
+        self._surface = surface
+        self._entered = entered
+        self._release = release
+
+    async def tool_surface(self) -> ToolSurface:
+        if self._entered is not None:
+            self._entered.set()
+        if self._release is not None:
+            await self._release.wait()
+        return self._surface
+
+
+class ClosedAwareSignal(FakeSignal):
+    """Fake Signal client whose send path fails once the client is closed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+    async def send_group(
+        self,
+        group_id: str,
+        message: str,
+        *,
+        attachments: Sequence[str] = (),
+    ) -> dict[str, int]:
+        if self.closed:
+            raise RuntimeError("signal client closed")
+        return await super().send_group(group_id, message, attachments=attachments)
+
+
+class FailBeforeSendSignal(FakeSignal):
+    """Fake Signal that fails on send without recording."""
+
+    async def send_group(
+        self,
+        group_id: str,
+        message: str,
+        *,
+        attachments: Sequence[str] = (),
+    ) -> dict[str, int]:
+        raise RuntimeError("fail before send")
+
+
+class MutableFailSignal(FakeSignal):
+    """Fake Signal whose send can be toggled off; when off it fails without recording."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_send = False
+
+    async def send_group(
+        self,
+        group_id: str,
+        message: str,
+        *,
+        attachments: Sequence[str] = (),
+    ) -> dict[str, int]:
+        if self.fail_send:
+            raise RuntimeError("mutable fail")
+        return await super().send_group(group_id, message, attachments=attachments)
+
+
+class ToggleFailSignal(FakeSignal):
+    """Fake Signal whose send can be toggled on/off dynamically."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = False
+
+    async def send_group(
+        self,
+        group_id: str,
+        message: str,
+        *,
+        attachments: Sequence[str] = (),
+    ) -> dict[str, int]:
+        if self.fail:
+            raise RuntimeError("toggle fail")
+        return await super().send_group(group_id, message, attachments=attachments)
+
+
+class ReadingSignal(FakeSignal):
+    """Fake Signal that captures attachment body bytes for inspection."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_bodies: list[bytes] = []
+
+    async def send_group(
+        self,
+        group_id: str,
+        message: str,
+        *,
+        attachments: Sequence[str] = (),
+    ) -> dict[str, int]:
+        for path in attachments:
+            self.read_bodies.append(Path(path).read_bytes())
+        return await super().send_group(group_id, message, attachments=attachments)
+
+
 class FakeSupervisor:
-    def __init__(self, profile: FakeProfile) -> None:
+    def __init__(
+        self,
+        profile: FakeProfile,
+        *,
+        restart_exception: Exception | None = None,
+        retire_should_return: bool | None = None,
+    ) -> None:
         self.profile = profile
         self.restarts = 0
         self.cached: list[str] = []
         self.retired: list[str] = []
+        self._restart_exception = restart_exception
+        self._retire_should_return = retire_should_return
 
     async def get_profile(self, route: Route) -> FakeProfile:
         return self.profile
 
     async def restart_profile(self, profile_name: str) -> None:
         self.restarts += 1
+        if self._restart_exception is not None:
+            raise self._restart_exception
 
     def cached_profile_names(self) -> list[str]:
         return list(self.cached)
@@ -273,6 +466,8 @@ class FakeSupervisor:
     ) -> bool:
         if should_retire is not None and not should_retire():
             return False
+        if self._retire_should_return is not None:
+            return self._retire_should_return
         if profile_name not in self.cached:
             return False
         self.cached.remove(profile_name)
@@ -329,6 +524,213 @@ def make_router_harness(
         supervisor=supervisor,
         dedupe=dedupe,
     )
+
+
+class RouterTestCase(unittest.IsolatedAsyncioTestCase):
+    """Base test case providing self.tmp via addCleanup and shared assertion helpers."""
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def assertFrozenAttachmentPath(self, raw_path: str, media_root: Path) -> None:
+        path = Path(raw_path)
+        self.assertEqual(path.name, "attachment.png")
+        path.relative_to((media_root / ".outbound").resolve())
+        self.assertFalse(path.exists())
+
+
+def write_test_file(path: Path, body: bytes = b"body") -> Path:
+    """Write bytes under a private dir tree, inferring media_root from the path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parts = path.parts
+    if "media" in parts:
+        index = len(parts) - 1 - list(reversed(parts)).index("media")
+        root = Path(*parts[: index + 1])
+    else:
+        root = path.parent
+    ensure_private_dir_tree(root, path.parent)
+    write_private_bytes(path, body)
+    return path
+
+
+async def wait_until(
+    predicate: Callable[[], bool],
+    *,
+    timeout: float = 5.0,
+    interval: float = 0.05,
+) -> None:
+    """Poll until predicate is true or raise AssertionError on timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(interval)
+    raise AssertionError(f"wait_until timed out after {timeout}s")
+
+
+def write_config_pair(
+    tmp: str | Path,
+    *,
+    routes_yaml: str = "routes:\n  - name: default\n    platform: signal\n    group_id: group\n    profile: profile\n    state: active\n",
+    router_yaml: str | None = None,
+) -> tuple[Path, Path]:
+    """Write config.yaml and routes.yaml under tmp, returning both paths.
+
+    The default router YAML uses standard test defaults. For reload tests that
+    need custom router fields, pass a complete `router_yaml` string; the
+    helper will not attempt to merge overrides into the default.
+    """
+    tmp_path = Path(tmp)
+    config_path = tmp_path / "config.yaml"
+    routes_path = tmp_path / "routes.yaml"
+    if router_yaml is None:
+        router_yaml = (
+            "router:\n"
+            "  work_root: " + str(tmp_path / "work") + "\n"
+            "  state_db: " + str(tmp_path / "state.db") + "\n"
+            "  media_root: " + str(tmp_path / "media") + "\n"
+            "  signal_attachment_root: " + str(tmp_path / "signal-attachments") + "\n"
+            "  signal_base_url: http://127.0.0.1:8080\n"
+            "  allow_remote_signal_base_url: false\n"
+            "  circuit_breaker:\n"
+            "    failures: 3\n"
+            "    window_seconds: 60\n"
+        )
+    config_path.write_text(router_yaml, encoding="utf-8")
+    routes_path.write_text(routes_yaml, encoding="utf-8")
+    return config_path, routes_path
+
+
+def make_reload_harness(
+    tmp: str | Path,
+    *,
+    routes_yaml: str = "routes:\n  - name: default\n    platform: signal\n    group_id: group\n    profile: profile\n    state: active\n",
+    router_yaml: str | None = None,
+    **router_overrides: Any,
+) -> tuple[RouterHarness, Path, Path]:
+    """Create a harness with config files written and paths registered."""
+    config_path, routes_path = write_config_pair(tmp, routes_yaml=routes_yaml, router_yaml=router_yaml)
+    harness = make_router_harness(tmp, **router_overrides)
+    harness.router.set_config_paths(config_path, routes_path)
+    return harness, config_path, routes_path
+
+
+def make_direct_route(
+    *,
+    sender_id: str = "sender-uuid",
+    sender_number: str | None = "+00000000000",
+    state: RouteState = RouteState.ACTIVE,
+    session_policy: SessionPolicy = SessionPolicy.PERSISTENT_SENDER,
+) -> Route:
+    return Route(
+        platform="signal",
+        chat_type=ChatType.DIRECT,
+        sender_id=sender_id,
+        sender_number=sender_number,
+        profile="profile",
+        session_policy=session_policy,
+        state=state,
+        route_context={"purpose": "synthetic", "route_alias": "direct-test"},
+    )
+
+
+def make_direct_raw(
+    *,
+    source_uuid: str | None = "sender-uuid",
+    source_number: str | None = "+00000000000",
+    timestamp: int = 1,
+    text: str = "hello direct",
+    attachments: list[dict] | None = None,
+) -> dict:
+    envelope: dict = {
+        "timestamp": timestamp,
+        "dataMessage": {
+            "timestamp": timestamp,
+            "message": text,
+            "attachments": attachments or [],
+        },
+    }
+    if source_uuid is not None:
+        envelope["sourceUuid"] = source_uuid
+    if source_number is not None:
+        envelope["sourceNumber"] = source_number
+        envelope["source"] = source_number
+    return {"envelope": envelope, "account": "synthetic-account-number"}
+
+
+def make_group_raw(
+    *,
+    group_id: str = "group",
+    source_uuid: str = "sender-uuid",
+    timestamp: int = 1,
+    text: str | None = "hello",
+    attachments: list[dict] | None = None,
+) -> dict:
+    data_message: dict = {
+        "timestamp": timestamp,
+        "groupInfo": {"groupId": group_id},
+        "attachments": attachments or [],
+    }
+    if text is not None:
+        data_message["message"] = text
+    return {
+        "jsonrpc": "2.0",
+        "method": "receive",
+        "params": {
+            "envelope": {
+                "sourceUuid": source_uuid,
+                "timestamp": timestamp,
+                "dataMessage": data_message,
+            }
+        },
+    }
+
+
+def make_synthetic_app(
+    tmp: str | Path,
+    route: Route,
+    job: SyntheticRouteJob | None = None,
+    *,
+    control: RouterControlConfig | None = None,
+    notifications: tuple[SyntheticRouteNotification, ...] = (),
+    **router_overrides,
+) -> AppConfig:
+    return AppConfig(
+        router=RouterConfig(
+            state_db=Path(tmp) / "state.db",
+            media_root=Path(tmp) / "media",
+            signal_attachment_root=Path(tmp) / "signal-attachments",
+            work_root=Path(tmp) / "work",
+            control=control or RouterControlConfig(),
+            **router_overrides,
+        ),
+        routes=(route,),
+        scheduled_jobs=(
+            job
+            or SyntheticRouteJob(
+                id="daily-agenda",
+                route_name=route.name or "agenda-route",
+                prompt="Prepare the synthetic daily agenda.",
+            ),
+        ),
+        notifications=notifications,
+    )
+
+
+def record_dedupe_call_threads(store: DedupeStore) -> list[tuple[str, int]]:
+    """Wrap the store's statement methods with executing-thread recorders."""
+    calls: list[tuple[str, int]] = []
+    for name in ("claim", "status", "is_handled", "mark_handled", "release"):
+        original = getattr(store, name)
+
+        def recorder(*args: Any, _name: str = name, _original: Any = original) -> Any:
+            calls.append((_name, threading.get_ident()))
+            return _original(*args)
+
+        setattr(store, name, recorder)
+    return calls
 
 
 def read_file_allow_policy(
