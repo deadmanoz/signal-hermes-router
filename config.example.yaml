@@ -20,6 +20,13 @@ router:
   busy_notice_cooldown_seconds: 0
   acp_prompt_timeout_seconds: 300
   acp_initialize_timeout_seconds: 30
+  # Max inbound Signal turns that may run concurrently. Inbound events are
+  # dispatched per route so a slow turn on one route no longer stalls the others;
+  # this bounds how many turns execute at once. A single route consumes at most one
+  # slot (its route lock serializes same-route turns), and same-profile turns still
+  # serialize via the profile lock, so raise this for deployments with many distinct
+  # active profiles. Must be an integer >= 1. Default: 8.
+  max_concurrent_turns: 8
   circuit_breaker:
     failures: 3
     window_seconds: 300

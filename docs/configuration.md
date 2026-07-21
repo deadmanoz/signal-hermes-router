@@ -697,6 +697,54 @@ deliberately declines the turn and records it as handled. Operators who need
 delivery of every message under sustained overload should leave the rate cap
 off and scale the profile instead.
 
+## Concurrent inbound dispatch
+
+`router.max_concurrent_turns` (default `8`, integer >= 1) bounds how many inbound
+Signal turns may execute at once. Inbound events are dispatched as independent
+tasks rather than processed strictly one at a time, so a single slow turn (up to
+`acp_prompt_timeout_seconds`) on one route no longer stalls delivery to every other
+route. Same-route events are still serialized and delivered in arrival order by the
+route lock, and same-profile turns are still serialized by the profile lock, so a
+route consumes at most one of these slots at a time. Raise the value for
+deployments with many distinct active profiles that should progress in parallel;
+lower it to cap concurrent load on the host or on shared model capacity.
+
+The bound applies to turn execution: the permit is held only while a turn actually
+runs, so a same-route event queued behind a slow turn holds no slot and cannot
+starve other routes. Separately, an internal in-flight buffer bounds the number of
+dispatched-but-not-yet-finished turn tasks so a burst cannot grow an unbounded task
+set; when that buffer fills (a sustained flood from one route while its turn is
+slow), the router applies backpressure to the Signal read until capacity frees.
+This buffer is global rather than per-route, so a single route flooding faster than
+it can be processed can delay other routes once the buffer is full; that is strictly
+better than the pre-dispatch behaviour (where any slow turn stalled every route) but
+is not full per-route flood fairness. The bound applies only to inbound Signal
+turns; synthetic turns (`trigger-job`, `notify-route`) keep their own
+`route_lock_timeout_seconds` admission control.
+
+The execution permit is the last resource an inbound turn takes: it is acquired
+inside the profile lock and released only when the turn finishes, so a turn
+queued behind its route or profile lock spends no global capacity and a slow
+shared-profile backlog cannot starve turns on idle profiles. While a turn waits
+for global capacity it holds no profile lock, so a synthetic turn on another
+route sharing that profile is admitted normally (no spurious `BUSY`) and runs
+ahead of the capacity-queued inbound turn. If such a synthetic is running when
+capacity frees, the inbound releases the permit it just won and queues behind
+the synthetic holding no slot, so global capacity is never parked behind an
+operator-driven turn.
+
+Known limitation: concurrent dispatch widens the crash-loss window compared with
+the old strictly serial consumer. Several accepted events can be in memory at
+once — dispatched but still queued behind route, profile, or execution capacity
+before their turn creates a dedupe claim — and signal-cli's event stream has no
+replay or acknowledgement, so a hard crash (or a shutdown drain timeout) loses
+those consumed-but-unclaimed events; previously at most one in-flight event was
+exposed. Accepted events are bounded by the in-flight buffer above, and a
+graceful shutdown drains them to completion, so the residual exposure is forced
+termination. Durable inbound admission (persisting accepted events before their
+turn runs) is deliberately out of scope for this change and may be addressed as
+a follow-up.
+
 ## Retention sweeps
 
 `router.retention` bounds the two router-owned stores that otherwise grow

@@ -182,8 +182,62 @@ def _is_non_turn_control_command(line: bytes) -> bool:
 # yield in between; this bounds each uninterrupted loop slice. A code
 # constant by design, not configuration.
 RETENTION_EXECUTE_BATCH_ITEMS = 200
+# Floor for the in-flight inbound-dispatch buffer: the consumer holds one of these
+# permits per dispatched Signal turn task so a burst cannot grow an unbounded task
+# set. It is deliberately much larger than the execution bound (max_concurrent_turns)
+# so that a same-route backlog queued on one route lock (each task holds a buffer
+# permit but no execution permit) cannot exhaust the pool and stall other routes for
+# ordinary bursts. The effective bound is max(floor, max_concurrent_turns * 2), so it
+# is never <= the execution bound. A code constant by design, not configuration.
+# Note: this buffer is global; a sustained single-route flood that fills it applies
+# global backpressure. Full per-route flood fairness is tracked separately.
+MAX_INFLIGHT_SIGNAL_DISPATCH_FLOOR = 256
+# Byte ceiling for the in-flight dispatch buffer. The count floor above keeps the
+# task set high for throughput on ordinary small events, but on its own a burst of
+# large inline-attachment events could retain many gigabytes of raw payloads in
+# queued task frames (each dispatched task holds its raw payload until it settles).
+# This caps total in-flight raw-payload bytes independently of the count; the
+# effective limit is raised to one max-size event when that is larger, so a lone
+# oversized event is never wedged. A code constant by design, not configuration.
+MAX_INFLIGHT_SIGNAL_DISPATCH_BYTES_CEILING = 256 * 1024 * 1024
 _MISSING = object()
 _T = TypeVar("_T")
+
+
+def _estimate_raw_payload_bytes(raw: object) -> int:
+    # Cheap approximate size of a raw SSE payload, dominated by base64 inline
+    # attachment strings. Used only to bound in-flight buffer bytes, so an
+    # approximation (sum of str/bytes lengths across the parsed structure) is fine.
+    if isinstance(raw, str):
+        return len(raw)
+    if isinstance(raw, (bytes, bytearray)):
+        return len(raw)
+    if isinstance(raw, dict):
+        return sum(
+            _estimate_raw_payload_bytes(key) + _estimate_raw_payload_bytes(value)
+            for key, value in raw.items()
+        )
+    if isinstance(raw, (list, tuple)):
+        return sum(_estimate_raw_payload_bytes(item) for item in raw)
+    return 0
+
+
+def _try_claim_uncontended(lock: asyncio.Lock) -> bool:
+    # Synchronously claim an asyncio.Lock only when it is immediately
+    # available: unlocked AND no queued waiters. This mirrors the
+    # non-suspending fast path of Lock.acquire() — asyncio does not preempt
+    # between await points, so when both conditions hold in this task step
+    # the claim cannot race. locked() alone is insufficient: a released lock
+    # whose woken waiter has not resumed yet reads unlocked while acquire()
+    # would still queue behind that waiter, which is exactly what a caller
+    # holding another resource must never do.
+    if lock.locked():
+        return False
+    waiters = getattr(lock, "_waiters", None)
+    if waiters and any(not waiter.cancelled() for waiter in waiters):
+        return False
+    lock._locked = True
+    return True
 
 
 @dataclass(frozen=True)
@@ -407,6 +461,44 @@ class SignalHermesRouter:
         self._control_socket_path: Path | None = None
         self._closing = False
         self._shutdown_event = asyncio.Event()
+        # Global execution bound (the max_concurrent_turns knob): the LAST
+        # resource an inbound turn takes, acquired inside the profile lock
+        # (itself inside the route lock) so capacity is only ever spent on a
+        # turn that can enter its profile. A turn queued behind its profile
+        # lock holds no permit, so a slow shared-profile backlog cannot starve
+        # turns on idle profiles; a same-route turn queued on its route lock
+        # holds no permit either, and the route lock caps a route at one
+        # running turn, so a route holds at most one permit. When no permit is
+        # immediately available the profile lock is released for the capacity
+        # wait and re-acquired afterwards, so profile_lock.locked() stays
+        # synonymous with "a turn is executing on this profile" and a
+        # same-profile synthetic turn never sees a spurious BUSY from an
+        # inbound turn that is merely queued for global capacity. The permit
+        # won by a capacity wait is itself released before the profile
+        # re-entry, so a permit is never held across ANY wait: a barging
+        # synthetic can never park a permit-holding inbound behind its turn
+        # (see _run_signal_turn_gated).
+        self._turn_execution_semaphore = asyncio.Semaphore(config.router.max_concurrent_turns)
+        # In-flight dispatch buffer: the consumer holds one permit per dispatched
+        # Signal turn task so a burst cannot grow an unbounded task set. Sized well
+        # above the execution bound so a same-route backlog cannot exhaust it for
+        # ordinary bursts (see MAX_INFLIGHT_SIGNAL_DISPATCH_FLOOR).
+        self._inflight_dispatch_semaphore = asyncio.Semaphore(
+            max(MAX_INFLIGHT_SIGNAL_DISPATCH_FLOOR, config.router.max_concurrent_turns * 2)
+        )
+        # Byte budget layered on top of the count bound above: the consumer parks
+        # before reading the next frame while total in-flight raw-payload bytes are
+        # at or above this limit, so a burst of large events cannot retain unbounded
+        # bytes even though the count bound is intentionally high for small-event
+        # throughput. Raised to one max-size event so a lone oversized event fits.
+        self._inflight_dispatch_bytes_limit = max(
+            config.router.max_signal_event_bytes,
+            MAX_INFLIGHT_SIGNAL_DISPATCH_BYTES_CEILING,
+        )
+        self._inflight_dispatch_bytes = 0
+        self._inflight_dispatch_bytes_freed = asyncio.Event()
+        self._inflight_dispatch_bytes_freed.set()
+        self._signal_turn_task_bytes: dict[asyncio.Task[Any], int] = {}
         self._signal_turn_tasks: set[asyncio.Task[Any]] = set()
         self._control_client_tasks: set[asyncio.Task[None]] = set()
         # Per-request control tasks, tracked separately from the connection
@@ -511,33 +603,133 @@ class SignalHermesRouter:
                     task.cancel()
 
     async def _run_signal_events(self) -> None:
-        async for raw in self.signal.events():
-            # Each accepted event runs as a tracked task awaited through
-            # shield: cancelling this consumer (SIGTERM/SIGINT teardown or
-            # begin_shutdown) does not abort the accepted turn, which close()
-            # then drains to normal delivery. The config is pinned at
-            # acceptance: the task may not run until after a reload swapped
-            # self.config, and an admitted event must still resolve its route
-            # against the config it was admitted under. The breaker override
-            # map and config generation are pinned for the same reason: a
-            # reload can clear a MAINTENANCE override before the task runs,
-            # and a turn accepted under an open breaker must keep its
-            # admission-time maintenance gate.
-            task = asyncio.create_task(
-                self.handle_raw_event(
-                    raw,
-                    config=self.config,
-                    admission_overrides=dict(self.route_state_overrides),
-                    admission_generation=self._config_generation,
-                )
+        # Each event is dispatched as an independent tracked task rather than
+        # awaited inline, so a slow turn on one route/profile no longer stalls
+        # delivery to every other route. Same-route ordering is preserved by the
+        # route lock: create_task schedules first-step callbacks FIFO, the path
+        # from _dispatch_signal_turn entry to the route-lock acquire is await-free
+        # (handle_raw_event/handle_event do only synchronous routing before
+        # `async with route_lock`), and asyncio.Lock serves waiters FIFO, so the
+        # first-created same-route task acquires or FIFO-enqueues on the route lock
+        # before the next same-route task runs its first step.
+        #
+        # Both bounds are acquired BEFORE the next frame is read, not after: the
+        # byte budget parks the consumer while total in-flight raw-payload bytes are
+        # exhausted, and the count permit bounds the tracked task set. Acquiring
+        # before the read means a consumer cancelled while parked (SIGTERM/SIGINT
+        # teardown or begin_shutdown) has not pulled a frame it then fails to
+        # dispatch, so no already-consumed Signal event is lost and close() has the
+        # full accepted set to drain. Once a frame is read it is dispatched
+        # unconditionally, so a read event is never dropped. create_task and the
+        # set.add below are synchronous, so a task is never missing from
+        # _signal_turn_tasks when close() snapshots it; the count permit and byte
+        # budget are released by the task's done callback.
+        events = self.signal.events()
+        try:
+            while True:
+                # Byte-aware backpressure before reading the next frame. The clear
+                # then re-check guards the wake: a settle that frees bytes between
+                # the loop check and clear() is not lost because we re-check after
+                # clearing and before parking.
+                while self._inflight_dispatch_bytes >= self._inflight_dispatch_bytes_limit:
+                    self._inflight_dispatch_bytes_freed.clear()
+                    if self._inflight_dispatch_bytes < self._inflight_dispatch_bytes_limit:
+                        break
+                    await self._inflight_dispatch_bytes_freed.wait()
+                await self._inflight_dispatch_semaphore.acquire()
+                try:
+                    raw = await events.__anext__()
+                except StopAsyncIteration:
+                    # The event source ended on its own; release the unused permit
+                    # and stop reading.
+                    self._inflight_dispatch_semaphore.release()
+                    break
+                except BaseException:
+                    self._inflight_dispatch_semaphore.release()
+                    raise
+                try:
+                    size = _estimate_raw_payload_bytes(raw)
+                except Exception:
+                    # A pathological payload (e.g. nested past the recursion
+                    # limit) must not crash the consumer — above all not after
+                    # create_task, where the untracked task would leak its
+                    # dispatch permit. Charge the full byte budget instead: the
+                    # most conservative bound, self-correcting when the task
+                    # settles.
+                    size = self._inflight_dispatch_bytes_limit
+                try:
+                    # The config is pinned at acceptance: the task may not run
+                    # until after a reload swapped self.config, and an admitted
+                    # event must still resolve its route against the config it
+                    # was admitted under. The breaker override map and config
+                    # generation are pinned for the same reason: a reload can
+                    # clear a MAINTENANCE override before the task runs, and a
+                    # turn accepted under an open breaker must keep its
+                    # admission-time maintenance gate.
+                    task = asyncio.create_task(
+                        self._dispatch_signal_turn(
+                            raw,
+                            config=self.config,
+                            admission_overrides=dict(self.route_state_overrides),
+                            admission_generation=self._config_generation,
+                        )
+                    )
+                except BaseException:
+                    # No task will run its done callback; release the permit here to
+                    # keep acquire/release balanced. No bytes were charged yet.
+                    self._inflight_dispatch_semaphore.release()
+                    raise
+                self._inflight_dispatch_bytes += size
+                self._signal_turn_task_bytes[task] = size
+                self._signal_turn_tasks.add(task)
+                task.add_done_callback(self._settle_signal_turn_task)
+        finally:
+            aclose = getattr(events, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        # The event source ended on its own (a finite or disconnecting stream,
+        # not a shutdown cancellation): let already-dispatched turns finish before
+        # returning, so run_forever() does not resolve with turns still in flight
+        # for a caller that does not immediately call close(). A shutdown cancels
+        # this consumer while it is parked above, so this drain is skipped on that
+        # path and close() owns the drain instead.
+        await self._await_outstanding_signal_turns()
+
+    async def _await_outstanding_signal_turns(self) -> None:
+        pending = {task for task in self._signal_turn_tasks if not task.done()}
+        if pending:
+            # asyncio.wait (unlike gather) does not cancel the awaited tasks if
+            # this await is itself cancelled, so a shutdown arriving mid-drain
+            # leaves the in-flight turns for close() to drain rather than
+            # cancelling them early.
+            await asyncio.wait(pending)
+
+    async def _dispatch_signal_turn(
+        self,
+        raw: dict,
+        *,
+        config: AppConfig,
+        admission_overrides: dict[str, RouteState],
+        admission_generation: int,
+    ) -> None:
+        # The per-event dispatched turn. Ordinary handler exceptions are isolated
+        # here (logged redaction-safe) so a crashing turn cannot kill the consumer;
+        # CancelledError propagates so the shutdown drain can cancel in-flight turns.
+        # The in-flight buffer permit is released by _settle_signal_turn_task (the
+        # done callback), not here, so the release happens only after the task has
+        # left _signal_turn_tasks.
+        try:
+            await self.handle_raw_event(
+                raw,
+                config=config,
+                admission_overrides=admission_overrides,
+                admission_generation=admission_generation,
             )
-            self._signal_turn_tasks.add(task)
-            task.add_done_callback(self._settle_tracked_task)
-            try:
-                await asyncio.shield(task)
-            except Exception as exc:
-                LOGGER.error("event handler crashed; continuing: %s", exc.__class__.__name__)
-                LOGGER.debug("event handler crash details", exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOGGER.error("event handler crashed; continuing: %s", exc.__class__.__name__)
+            LOGGER.debug("event handler crash details", exc_info=True)
 
     def begin_shutdown(self) -> None:
         """Synchronously fence new work: gate control lines, stop the control
@@ -754,6 +946,39 @@ class SignalHermesRouter:
             self.redactor.redact(exc.__class__.__name__),
         )
         LOGGER.debug("tracked task failure details", exc_info=exc)
+
+    def _settle_signal_turn_task(self, task: asyncio.Task[Any]) -> None:
+        # Done callback for dispatched Signal turns. It discards the task from the
+        # tracking set FIRST and releases the in-flight dispatch buffer permit LAST.
+        # Releasing here (not in the turn's finally, which runs before the task is
+        # done and before it leaves the set) is what makes the buffer a hard bound:
+        # semaphore.release() only schedules the parked consumer, so the discard is
+        # always complete before the consumer wakes and adds a replacement task,
+        # keeping len(_signal_turn_tasks) <= the buffer size. A dedicated Signal-turn
+        # callback is used because _settle_tracked_task also settles control-client
+        # tasks, which must not touch the dispatch buffer.
+        self._signal_turn_tasks.discard(task)
+        # Free this task's charged bytes and wake a consumer parked on the byte
+        # budget. Popping the exact value charged at dispatch keeps the counter
+        # balanced regardless of the size estimate.
+        size = self._signal_turn_task_bytes.pop(task, 0)
+        if size:
+            self._inflight_dispatch_bytes -= size
+            self._inflight_dispatch_bytes_freed.set()
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                # _dispatch_signal_turn swallows ordinary handler exceptions, so this
+                # only fires for unexpected escapes; retrieving it silences the
+                # unretrieved-exception warning for an abandoned straggler.
+                level = logging.WARNING if self._closing else logging.DEBUG
+                LOGGER.log(
+                    level,
+                    "signal turn task failed while unobserved: %s",
+                    self.redactor.redact(exc.__class__.__name__),
+                )
+                LOGGER.debug("signal turn task failure details", exc_info=exc)
+        self._inflight_dispatch_semaphore.release()
 
     async def _drain_route_locks(self, deadline: float) -> None:
         for key, lock in list(self._route_locks.items()):
@@ -1142,16 +1367,85 @@ class SignalHermesRouter:
             if self._is_stale_signal_event(route, event):
                 await self._mark_signal_turn_skipped(turn, reason="stale")
                 return None
-            profile_lock = self._profile_lock(route.profile)
-            async with profile_lock:
-                # Re-check freshness at the real admission point: routes can
-                # share a profile, so an event fresh at route-lock acquisition
-                # can age out waiting behind another route's turn.
-                if self._is_stale_signal_event(route, event):
-                    await self._mark_signal_turn_skipped(turn, reason="stale")
-                    return None
-                outcome = await self._run_turn(turn)
-        return outcome.result if outcome.status == TurnOutcomeStatus.DELIVERED else None
+            outcome = await self._run_signal_turn_gated(route, event, turn)
+        return (
+            outcome.result
+            if outcome is not None and outcome.status == TurnOutcomeStatus.DELIVERED
+            else None
+        )
+
+    async def _run_signal_turn_gated(
+        self,
+        route: Route,
+        event: NormalizedEvent,
+        turn: RoutedTurnInput,
+    ) -> TurnOutcome | None:
+        """Run one inbound Signal turn under the profile lock and the global
+        execution permit, returning None when the turn is skipped as stale.
+
+        The gate loops until the turn holds BOTH the profile lock and a
+        permit, and it never holds one resource while WAITING for the other:
+        a turn queued behind its profile lock holds no global capacity (so a
+        slow shared-profile backlog cannot starve turns on idle profiles),
+        and the profile lock is RELEASED for the capacity wait (so
+        profile_lock.locked() stays synonymous with "a turn is executing on
+        this profile" and a same-profile synthetic never sees a spurious BUSY
+        from an inbound that is merely queued for capacity). When the capacity
+        wait ends the permit is released again unless the profile lock is
+        immediately claimable — unlocked AND waiter-free: a synthetic may have
+        barged in during the wait, or a queued profile waiter may be
+        woken-but-not-resumed (a transient locked() alone misses), and holding
+        the permit across that re-entry would park global capacity behind
+        another turn's whole execution. The capacity re-check reads the permit
+        count directly (not semaphore.locked(), which also reports queued
+        waiters), so a released permit is re-taken in the same task step when
+        the profile is free and the loop cannot livelock.
+        """
+        profile_lock = self._profile_lock(route.profile)
+        semaphore = self._turn_execution_semaphore
+        lock_held = False
+        permit_held = False
+        try:
+            while True:
+                await profile_lock.acquire()
+                lock_held = True
+                # Fast path: take a permit without waiting. The
+                # check-and-decrement is synchronous (no await), so no other
+                # task can interleave and steal the permit.
+                if semaphore._value > 0:
+                    semaphore._value -= 1
+                    permit_held = True
+                    break
+                # Capacity wait: hold NOTHING while parked (see docstring).
+                profile_lock.release()
+                lock_held = False
+                await semaphore.acquire()
+                permit_held = True
+                # Profile re-entry: claim the profile lock only when it is
+                # immediately ours — unlocked AND waiter-free. locked() alone
+                # misses the wake-transient, where a woken waiter has not
+                # resumed yet and acquire() would park the permit behind that
+                # waiter. When the claim is not immediate, release the permit
+                # and queue on the profile lock holding nothing.
+                if _try_claim_uncontended(profile_lock):
+                    lock_held = True
+                    break
+                semaphore.release()
+                permit_held = False
+            # Freshness re-check at the point the turn actually runs: an event
+            # fresh at route-lock acquisition can age past max_event_age_seconds
+            # while parked on the profile lock, the capacity wait, or the
+            # profile re-entry, and the contract is that a stale event is
+            # skipped at the moment its turn would actually run.
+            if self._is_stale_signal_event(route, event):
+                await self._mark_signal_turn_skipped(turn, reason="stale")
+                return None
+            return await self._run_turn(turn)
+        finally:
+            if permit_held:
+                self._turn_execution_semaphore.release()
+            if lock_held:
+                profile_lock.release()
 
     async def handle_synthetic_job(
         self,

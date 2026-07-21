@@ -333,6 +333,21 @@ router:
         self.assertFalse(router.control.enabled)
         self.assertEqual(router.control_socket_path, Path("./private/work") / "control.sock")
 
+    def test_parse_router_config_defaults_max_concurrent_turns(self) -> None:
+        self.assertEqual(parse_router_config({}).max_concurrent_turns, 8)
+
+    def test_parse_router_config_reads_max_concurrent_turns(self) -> None:
+        self.assertEqual(parse_router_config({"max_concurrent_turns": "4"}).max_concurrent_turns, 4)
+
+    def test_parse_router_config_rejects_invalid_max_concurrent_turns(self) -> None:
+        # Strict integer contract: no coercion of booleans or fractional values.
+        for value in (0, -1, True, False, 2.9, "4.5"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "router.max_concurrent_turns must be a positive integer"
+                ):
+                    parse_router_config({"max_concurrent_turns": value})
+
     def test_parse_router_config_rejects_non_positive_or_non_finite_initialize_timeout(
         self,
     ) -> None:
