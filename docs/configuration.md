@@ -281,10 +281,16 @@ stateDiagram-v2
     [*] --> maintenance
     [*] --> disabled
     active --> maintenance: circuit breaker trip - runtime override
-    maintenance --> active: breaker cooldown elapsed - probe in configured state
+    maintenance --> active: override only - cooldown clears the breaker
     note right of shadow
         Configured state is read at config load;
         reload-config re-reads it.
+    end note
+    note right of maintenance
+        Cooldown and probe apply only to breaker-imposed
+        maintenance. A route configured as maintenance
+        stays parked until routes.yaml is edited
+        and reloaded.
     end note
 ```
 
