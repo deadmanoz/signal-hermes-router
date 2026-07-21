@@ -1,5 +1,32 @@
 # Media handling
 
+Two lifecycles share `media_root`: inbound attachments archived for ACP prompts, and outbound notification images frozen for a single send.
+
+```mermaid
+flowchart TB
+    subgraph inbound["Inbound attachment"]
+        ev["Signal event attachment<br/>inline base64 or attachment ID"]
+        gate["size gate<br/>router.max_attachment_bytes<br/>before base64 decode or file read"]
+        fetch["read bytes<br/>IDs resolved under signal_attachment_root"]
+        store["media.py write_attachment<br/>media_root/platform/YYYY/MM/sha256_prefix/safe_filename<br/>plus .manifest.json sidecar"]
+        manifest["MediaManifest"]
+        blocks["ACP content blocks<br/>image/*: resource_link file:// URI<br/>everything else: text manifest block"]
+        sweep["retention sweep<br/>plan_media_sweep by age and size<br/>archive layout only, skips staging dirs<br/>live paths excluded at execution"]
+        ev --> gate --> fetch --> store --> manifest --> blocks
+        store -.-> sweep
+    end
+    subgraph outbound["Outbound notification image"]
+        nr["notify-route --attachment PATH"]
+        loop["loopback signal_base_url gate<br/>separate pre-validation check"]
+        val["outbound_media.validate_outbound_attachments<br/>absolute, under media_root, 0700/0600 private,<br/>image gif/jpeg/png/webp only"]
+        freeze["freeze copy to router-owned<br/>media_root/.outbound artifact"]
+        turn["ACP turn"]
+        send["first reply chunk carries frozen path<br/>signal-cli JSON-RPC send<br/>empty text falls back to Image attached."]
+        cleanup["frozen artifact removed<br/>on every turn outcome"]
+        nr --> loop --> val --> freeze --> turn --> send --> cleanup
+    end
+```
+
 ## Storage layout
 
 ```
@@ -56,12 +83,13 @@ the canonical notification payload JSON sent to Hermes.
 
 The path must be absolute after `~` expansion, must resolve under
 `router.media_root`, must be a regular readable private file, must fit within
-`router.max_attachment_bytes`, and must infer an `image/*` content type from
-its filename. The image gate is extension-based through Python's `mimetypes`;
-stage PNG, JPEG, GIF, or WebP images for predictable behavior. This spike does
-not sniff file magic bytes and does not guarantee HEIC recognition on every
-platform. The router rejects staged images when the file or any parent
-directory under `media_root` has group/world permission bits.
+`router.max_attachment_bytes`, and must map to one of four allowed content
+types: `image/gif`, `image/jpeg`, `image/png`, or `image/webp`. The image
+gate is extension-based through Python's `mimetypes` and does not sniff file
+magic bytes; every other image type (including HEIC) and every non-image
+type is rejected as `attachment_not_image`. The router rejects staged images
+when the file or any parent directory under `media_root` has group/world
+permission bits.
 
 Because signal-cli reads the attachment path from its daemon process, the
 producer that stages the file, the router, and the signal-cli daemon must run
@@ -74,7 +102,8 @@ notifications, but attachment-bearing notifications are rejected.
 After validation, the router copies the image to a private router-owned
 `.outbound` artifact under `media_root` before waiting on route locks or ACP.
 Signal-cli receives that frozen path, not the producer's original path, and the
-router removes the frozen artifact after the send attempt.
+router removes the frozen artifact on every turn outcome, not only after a
+send attempt.
 
 Outbound notification images are sent with the first Signal reply chunk only.
 Later chunks remain text-only. If Hermes returns empty text for an

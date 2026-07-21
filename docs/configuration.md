@@ -36,9 +36,11 @@ The router writes private state under a handful of paths. All defaults are
 relative to the working directory of the running process; in production
 deployments these are typically absolute paths under the service's private
 data root. The router-managed roots (`media_root` and `work_root`) are
-created with `0700` permissions, and files written beneath them - including
-the dedupe sqlite DB at `state_db` - are written with `0600` (see
-`signal_hermes_router.private_fs`). `signal_attachment_root` is read-only
+created with `0700` permissions, and files written beneath them are written
+with `0600` (see `signal_hermes_router.private_fs`). The dedupe sqlite DB at
+`router.state_db` sits outside these roots by default and gets its own
+`0700`/`0600` enforcement from the dedupe layer (see the `router.state_db`
+bullet below). `signal_attachment_root` is read-only
 from the router's perspective and is not created or chmodded by the router.
 
 - `router.state_db` (default `./private/state/router.db`) - sqlite database
@@ -237,7 +239,11 @@ prevalidation; the other commands never touch that notify-only value.
 ### Deployment sequence
 
 1. Validate the candidate `routes.yaml` locally (e.g. with a test instance or
-   by running `signal-hermes-router` in a temporary environment).
+   by running `signal-hermes-router` in a temporary environment). For a quick
+   secret-safe check, `scripts/check-private-config.py CONFIG ROUTES` parses
+   both files and prints only the route count, a per-state summary, and the
+   `allow_remote_signal_base_url` flag - no secrets, Signal identifiers, or
+   route keys.
 2. Atomically replace the routes file on disk (e.g. `mv routes.yaml.new routes.yaml`).
 3. Run `signal-hermes-router reload-config`.
 4. Inspect the response `generation` to confirm the reload took effect.
@@ -266,6 +272,22 @@ Defined in `signal_hermes_router.models.RouteState`:
 
 A route's state is read at config load time. A circuit-breaker trip can override a route to `maintenance` at runtime (`signal_hermes_router.circuit`).
 
+Configured states come from `routes.yaml`; the circuit breaker can override at runtime:
+
+```mermaid
+stateDiagram-v2
+    [*] --> shadow
+    [*] --> active
+    [*] --> maintenance
+    [*] --> disabled
+    active --> maintenance: circuit breaker trip - runtime override
+    maintenance --> active: breaker cooldown elapsed - probe in configured state
+    note right of shadow
+        Configured state is read at config load;
+        reload-config re-reads it.
+    end note
+```
+
 ## Session policies
 
 Defined in `signal_hermes_router.models.SessionPolicy`:
@@ -292,6 +314,36 @@ line carrying the hashed route reference. For `persistent_sender` routes the
 limits apply per cached `(route, sender)` session. A session that survives a
 subprocess restart through `session/resume` keeps its accumulated context, so
 its rotation budget carries over; a recreated session starts a new budget.
+
+How `SessionRegistry.get` picks between reusing, resuming, and creating a session:
+
+```mermaid
+flowchart TB
+    turn["turn for route"]
+    key{"session policy"}
+    pr["key: route<br/>persistent_route"]
+    ps["key: route + sender<br/>persistent_sender<br/>synthetic senders: scheduled:job-id /<br/>synthetic:notification:id"]
+    ep["no cache<br/>ephemeral"]
+    cached{"cached session<br/>for key?"}
+    rotate{"rotation budget spent<br/>session_max_turns /<br/>session_max_age_seconds?"}
+    restarted{"same hermes<br/>subprocess?"}
+    resume{"advertises<br/>sessionCapabilities.resume?"}
+    reuse["reuse cached session"]
+    new["session/new"]
+    resumecall["session/resume<br/>on error: fresh session only with<br/>recreate_session_on_resume_failure"]
+    turn --> key
+    key --> pr --> cached
+    key --> ps --> cached
+    key --> ep --> new
+    cached -- yes --> rotate
+    cached -- no --> new
+    rotate -- yes --> new
+    rotate -- no --> restarted
+    restarted -- yes --> reuse
+    restarted -- no --> resume
+    resume -- yes --> resumecall
+    resume -- no --> new
+```
 
 ## Route schema
 
@@ -460,6 +512,10 @@ file at the configured path, or a live socket already accepting connections
 there. A stale socket is removed only after the router proves no listener is
 accepting connections there.
 
+All control subcommands (`trigger-job`, `notify-route`, `route-status`,
+`reload-config`, and `preflight-permissions`) accept `--control-socket` to
+override the socket path discovered from the config.
+
 Use `trigger-job` from a host scheduler:
 
 ```bash
@@ -493,11 +549,14 @@ signal-hermes-router --config /path/to/private/config.yaml preflight-permissions
 ```
 
 Use `route-status` to inspect route health, circuit state, cached-session
-state, and the most recent success/failure metadata from the running router:
+state, and the most recent success/failure metadata from the running router.
+It accepts the same selector families as `preflight-permissions`: `--route`,
+`--route-index`, and `--profile`, each repeatable:
 
 ```bash
 signal-hermes-router --config /path/to/private/config.yaml route-status --json
 signal-hermes-router --config /path/to/private/config.yaml route-status --route agenda-route --profile example-hermes-profile
+signal-hermes-router --config /path/to/private/config.yaml route-status --route-index 2 --json
 ```
 
 `--scheduled-at` accepts either an epoch millisecond integer or a timezone-aware
@@ -558,6 +617,10 @@ For `preflight-permissions`, exit status is zero only when the report status is
 `ok`. For `route-status`, exit status is zero when the control response status
 is `ok`.
 
+The global `--log-level` flag (default `INFO`) applies to every subcommand,
+including `serve`, and is placed before the subcommand name, e.g.
+`signal-hermes-router --config /path/to/private/config.yaml --log-level DEBUG serve`.
+
 ## Runtime size limits
 
 `router.max_attachment_bytes` bounds inline Signal attachment decoding and
@@ -582,7 +645,8 @@ kept alive. The same byte cap is applied to the Hermes stderr stream so an
 oversized stderr line cannot back-pressure the subprocess into deadlock.
 
 `router.max_reply_chars` bounds each outbound Signal reply after any route
-canary prefix is applied. The default is `12000` characters. Oversize replies
+`canary_reply_prefix` value is applied. The default is `12000` characters.
+Oversize replies
 are truncated and marked before they are sent; this is an operational
 spam/resource guardrail, not a Signal protocol limit.
 
@@ -617,8 +681,11 @@ runs while the route and profile locks are held, so a hung Hermes startup
 would otherwise block the route for the full 5-minute request default. When
 the timeout is exceeded the turn fails with `acp_session_failed` (the failure
 detail names the ACP initialize timeout), a circuit-breaker failure is
-recorded, and the supervisor's restart cooldown makes immediately-following
-turns refuse fast instead of re-spawning a doomed subprocess. The setting
+recorded, and the supervisor's restart cooldown - a fixed 5-second code
+constant (`DEFAULT_RESTART_COOLDOWN_SECONDS` in
+[src/signal_hermes_router/sessions.py](../src/signal_hermes_router/sessions.py)),
+not configurable - makes immediately-following turns refuse fast instead of
+re-spawning a doomed subprocess. The setting
 bounds the request wait itself; the failure propagates after subprocess
 cleanup, which can add up to a few more seconds of SIGTERM grace before the
 process is killed.
@@ -715,6 +782,12 @@ starve other routes. Separately, an internal in-flight buffer bounds the number 
 dispatched-but-not-yet-finished turn tasks so a burst cannot grow an unbounded task
 set; when that buffer fills (a sustained flood from one route while its turn is
 slow), the router applies backpressure to the Signal read until capacity frees.
+A second, independent ceiling bounds the same buffer by total in-flight
+raw-payload bytes (256 MiB, raised to one maximum-size event when a single
+event exceeds it, so a lone oversized event is never wedged) and triggers the
+same Signal-read backpressure alongside the count bound; without it a burst of
+large inline-attachment events could retain many gigabytes in queued task
+frames. Both bounds are code constants, not configuration.
 This buffer is global rather than per-route, so a single route flooding faster than
 it can be processed can delay other routes once the buffer is full; that is strictly
 better than the pre-dispatch behaviour (where any slow turn stalled every route) but
@@ -854,13 +927,20 @@ routes:
 
 Operational replies (`maintenance_reply`, `failure_reply`,
 `model_failure_reply`, `busy_notice`, and assistant replies from Hermes) flow
-through the same canary prefix and chunking pipeline as ordinary assistant
-text. See [Runtime size limits](#runtime-size-limits) above.
+through the same `canary_reply_prefix` and chunking pipeline as ordinary
+assistant text. See [Runtime size limits](#runtime-size-limits) above.
 
 Notification image attachments are attached only to the first Signal reply
 chunk. If Hermes returns empty text for an attachment-bearing notification, the
 router sends `Image attached.` through the same canary prefix and chunking
 pipeline.
+
+Signal sends are retried exactly once, after a 0.5 second delay, and only on
+pre-send connect-class errors (`ConnectError`, `ConnectTimeout`,
+`PoolTimeout`), where signal-cli could not have begun processing the request.
+Read- and write-class errors are deliberately never retried: signal-cli's
+`send` is not idempotent, so retrying after a lost response could
+double-deliver a message.
 
 ## Inbound discard and observability
 

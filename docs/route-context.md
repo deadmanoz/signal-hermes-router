@@ -28,8 +28,18 @@ of `PROMPT_SAFE_CONTEXT_KEYS`.
   opt in. Do not add this key to `PROMPT_SAFE_CONTEXT_KEYS`; it is router-consumed,
   not prompt-emitted, and the key name itself never appears in the preamble.
 
+- `canary_reply_prefix` (string): when set to a non-empty string, the router
+  prepends the value to every outbound Signal message for the route - assistant
+  replies from Hermes and operational replies alike (`maintenance_reply`,
+  `failure_reply`, `model_failure_reply`, `busy_notice`). The exact output is
+  `f"{prefix} {stripped}"`: the prefix, one space, then the reply with leading
+  whitespace stripped. If the stripped reply already starts with the prefix, it
+  is not doubled. The prefix is applied before `max_reply_chars` truncation and
+  message chunking. Do not add this key to `PROMPT_SAFE_CONTEXT_KEYS`; it is
+  router-consumed, not prompt-emitted.
+
 ## Nonce and escaping
 
 The nonce changes per turn (`signal_hermes_router.context.new_context_nonce`). User text is sent as a separate ACP content block, and route-context delimiter lookalikes in user text are escaped (`signal_hermes_router.context.escape_prompt_text`) before delivery.
 
-Profiles should treat prompt-visible route context as trusted deployment context, not as user text. Keep raw Signal route target identifiers, friendly names, imported source labels, canary reply prefixes, and other private metadata in `routes.yaml`; they are not prompt-visible unless the public code allowlist is expanded.
+Profiles should treat prompt-visible route context as trusted deployment context, not as user text. Keep raw Signal route target identifiers, friendly names, imported source labels, `canary_reply_prefix` values, and other private metadata in `routes.yaml`; they are not prompt-visible unless the public code allowlist is expanded.
