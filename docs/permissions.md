@@ -77,7 +77,11 @@ Denylists (`deny:` or `denylist:` in config) are rejected at parse time. Permiss
 When a tool call matches the allowlist, the router selects only ACP `allow_once`
 options. It deliberately does not select `allow_always`, so Hermes cannot turn a
 route-scoped static answer into a persistent permission grant. Denied tool calls
-prefer `reject_once` and may fall back to `reject_always`.
+prefer `reject_once` and may fall back to `reject_always`. If the agent's
+request offers no matching option kind at all - no `allow_once` on the allow
+path, and neither `reject_once` nor `reject_always` on the deny path - the
+router answers `session/request_permission` with a `cancelled` outcome instead
+of selecting an option.
 
 ## Permission preflight
 
