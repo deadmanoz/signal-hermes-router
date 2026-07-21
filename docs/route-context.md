@@ -31,9 +31,10 @@ of `PROMPT_SAFE_CONTEXT_KEYS`.
 - `canary_reply_prefix` (string): when set to a non-empty string, the router
   prepends the value to every outbound Signal message for the route - assistant
   replies from Hermes and operational replies alike (`maintenance_reply`,
-  `failure_reply`, `model_failure_reply`, `busy_notice`). If the reply already
-  starts with the prefix after leading whitespace is stripped, it is not
-  doubled. The prefix is applied before `max_reply_chars` truncation and
+  `failure_reply`, `model_failure_reply`, `busy_notice`). The exact output is
+  `f"{prefix} {stripped}"`: the prefix, one space, then the reply with leading
+  whitespace stripped. If the stripped reply already starts with the prefix, it
+  is not doubled. The prefix is applied before `max_reply_chars` truncation and
   message chunking. Do not add this key to `PROMPT_SAFE_CONTEXT_KEYS`; it is
   router-consumed, not prompt-emitted.
 
