@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.37](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.36...v0.1.37) (2026-07-21)
+
+
+### Documentation
+
+* acknowledge multiplex gateway, add architecture diagrams, final accuracy pass ([cae5c27](https://github.com/deadmanoz/signal-hermes-router/commit/cae5c27ef5d83cf2e169aea1db3775943ade4d42))
+
 ## [0.1.36](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.35...v0.1.36) (2026-07-21)
 
 
