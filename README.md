@@ -19,7 +19,8 @@ flowchart LR
     subgraph local["Local automation"]
         sched["host scheduler<br/>trigger-job"]
         script["local script<br/>notify-route"]
-        ops["operator CLI<br/>route-status / reload-config<br/>/ preflight-permissions"]
+        ops["operator CLI<br/>route-status / reload-config"]
+        probe["operator CLI<br/>preflight-permissions<br/>(socket or offline probe)"]
     end
 
     subgraph router["signal-hermes-router"]
@@ -44,6 +45,7 @@ flowchart LR
     sched --> sock
     script --> sock
     ops --> sock
+    probe -.-> sock
     acp --> pa
     acp --> pb
     acp --> pc
@@ -63,7 +65,7 @@ The design constraint this repo was built against:
 - Hermes profiles are gateway-scoped: the profile docs say "Each profile runs its own gateway as a separate process", and the token-lock section lists Signal among the protected platforms ([Hermes profiles docs](https://hermes-agent.nousresearch.com/docs/user-guide/profiles/)).
 - In the default (non-multiplexed) mode, the Signal gateway is configured around one account, plus group allowlisting, not group-to-profile routing ([Hermes Signal docs](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/signal/)).
 - The Signal adapter source requires one configured account and acquires a `signal-phone` lock for it; the same adapter subscribes to `signal-cli` events using that account ([signal.py](https://raw.githubusercontent.com/NousResearch/hermes-agent/main/gateway/platforms/signal.py)).
-- Hermes scoped locks are explicitly for preventing multiple gateways from using the same external identity at once ([status.py](https://github.com/NousResearch/hermes-agent/blob/main/gateway/status.py#L578-L583)).
+- Hermes scoped locks are explicitly for preventing multiple gateways from using the same external identity at once ([status.py](https://github.com/NousResearch/hermes-agent/blob/main/gateway/status.py)).
 - Since Hermes `v2026.6.19`, the "one gateway, multi-profile" shape is a shipped opt-in mode, not just a design discussion: `gateway.multiplex_profiles: true` serves every profile from one gateway process, and `gateway.profile_routes` routes shared-credential chats (Signal groups included) to named profiles ([Hermes multi-profile gateway docs](https://hermes-agent.nousresearch.com/docs/user-guide/multi-profile-gateways), [NousResearch/hermes-agent#23735](https://github.com/NousResearch/hermes-agent/issues/23735)).
 
 That shipped mode covers this router's original routing premise natively. What it does not provide is the router's execution boundary: the multiplexer co-resides all profiles in one OS process (the upstream docs recommend one-process-per-profile for hard crash isolation, which the `signal-phone` lock then forbids on a shared Signal account), and it is Hermes-only and in-process. This router keeps the narrower maintenance boundary: consume Signal once, keep routing policy here, and treat each profile as a black-box ACP subprocess with its own crash domain. If a shared process and Hermes-only profiles are acceptable, prefer the native multiplexing gateway.
