@@ -18,6 +18,28 @@ these route-owned messages. Those paths bypass the router's route policy and
 can create a separate ACP session, a second Signal sender, or unredacted
 delivery behavior.
 
+Both synthetic origins enter through the control socket and merge into the same turn path as an inbound Signal event:
+
+```mermaid
+flowchart TB
+    sched["host scheduler<br/>signal-hermes-router trigger-job"]
+    script["local script<br/>signal-hermes-router notify-route<br/>bounded JSON payload, optional validated image"]
+    sig["signal-cli event stream<br/>GET /api/v1/events"]
+    sock["private control socket<br/>control.sock under router.work_root"]
+    defn["look up configured definition<br/>scheduled_jobs / notifications"]
+    dedupe["dedupe claim<br/>idempotency-key / scheduled-at"]
+    gate["route-state gate<br/>shadow / active / maintenance / disabled"]
+    sess["session policy<br/>persistent_route / persistent_sender / ephemeral"]
+    perm["permission allowlist<br/>definition override or route policy"]
+    acp["ACP supervisor<br/>session/prompt"]
+    reply["outbound chunking and Signal send<br/>POST /api/v1/rpc"]
+    sched --> sock
+    script --> sock
+    sock --> defn --> dedupe
+    sig --> dedupe
+    dedupe --> gate --> sess --> perm --> acp --> reply
+```
+
 ## Scheduled Job Setup
 
 1. Give the target route a stable private `name` in `routes.yaml`.
