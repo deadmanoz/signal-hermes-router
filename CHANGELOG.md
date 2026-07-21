@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.36](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.35...v0.1.36) (2026-07-21)
+
+
+### Features
+
+* **router:** concurrent per-route dispatch with bounded in-flight buffer ([ed62bc1](https://github.com/deadmanoz/signal-hermes-router/commit/ed62bc153d4eb4d15a03b3e8163af56fe545bcd7))
+
 ## [0.1.35](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.34...v0.1.35) (2026-07-20)
 
 
