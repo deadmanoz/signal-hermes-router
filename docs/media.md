@@ -1,5 +1,31 @@
 # Media handling
 
+Two lifecycles share `media_root`: inbound attachments archived for ACP prompts, and outbound notification images frozen for a single send.
+
+```mermaid
+flowchart TB
+    subgraph inbound["Inbound attachment"]
+        ev["Signal event attachment<br/>inline base64 or attachment ID"]
+        fetch["read bytes<br/>IDs resolved under signal_attachment_root"]
+        gate["size gate<br/>router.max_attachment_bytes"]
+        store["media.py write_attachment<br/>media_root/platform/YYYY/MM/sha256_prefix/safe_filename<br/>plus .manifest.json sidecar"]
+        manifest["MediaManifest"]
+        blocks["ACP content blocks<br/>image/*: resource_link file:// URI<br/>everything else: text manifest block"]
+        sweep["retention sweep<br/>plan_media_sweep by age and size<br/>skips live paths and staging dirs"]
+        ev --> fetch --> gate --> store --> manifest --> blocks
+        store -.-> sweep
+    end
+    subgraph outbound["Outbound notification image"]
+        nr["notify-route --attachment PATH"]
+        val["outbound_media.validate_outbound_attachments<br/>absolute, under media_root, 0700/0600 private,<br/>image/* content type, loopback signal_base_url"]
+        freeze["freeze copy to router-owned<br/>media_root/.outbound artifact"]
+        turn["ACP turn"]
+        send["first reply chunk carries frozen path<br/>signal-cli JSON-RPC send<br/>empty text falls back to Image attached."]
+        cleanup["frozen artifact removed<br/>after the send attempt"]
+        nr --> val --> freeze --> turn --> send --> cleanup
+    end
+```
+
 ## Storage layout
 
 ```

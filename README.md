@@ -8,17 +8,46 @@ The router sits upstream of Hermes and dispatches each group to its own profile 
 
 Hermes profiles own behaviour, skills, app access, and media interpretation. The router is the message-bus glue - nothing more.
 
-```text
-signal-cli events  ------> signal-hermes-router -----> hermes -p A acp
-local scheduler    --+             |            \-----> hermes -p B acp
-  trigger-job        |             |             \-----> hermes -p C acp
-local script       --+             |
-  notify-route       |             |
-operator CLI      --+              |
-  route-status       |             |
-  reload-config      |             |
-  control.sock       |             |
-                     \-------- Signal replies --------> signal-cli
+The four runtime jobs, end to end:
+
+```mermaid
+flowchart LR
+    subgraph upstream["Signal"]
+        cli["signal-cli daemon"]
+    end
+
+    subgraph local["Local automation"]
+        sched["host scheduler<br/>trigger-job"]
+        script["local script<br/>notify-route"]
+        ops["operator CLI<br/>route-status / reload-config<br/>/ preflight-permissions"]
+    end
+
+    subgraph router["signal-hermes-router"]
+        direction TB
+        ev["events.py<br/>normalise"]
+        dd["dedupe.py<br/>sqlite claims"]
+        med["media.py<br/>attachment store"]
+        rt["router.py<br/>route gate + prompt + reply"]
+        acp["acp.py<br/>JSON-RPC stdio"]
+        sock["private control socket"]
+        sock --> rt
+        ev --> dd --> med --> rt --> acp
+    end
+
+    subgraph profiles["Hermes profiles"]
+        pa["hermes -p A acp"]
+        pb["hermes -p B acp"]
+        pc["hermes -p C acp"]
+    end
+
+    cli -- "GET /api/v1/events (SSE)" --> ev
+    sched --> sock
+    script --> sock
+    ops --> sock
+    acp --> pa
+    acp --> pb
+    acp --> pc
+    rt -- "POST /api/v1/rpc<br/>chunked replies" --> cli
 ```
 
 This public tree is intentionally generic. Keep real Signal group IDs, phone numbers, hostnames, profile-private identifiers, route context, state DBs, secrets, and audit checklists in a private deployment repo.

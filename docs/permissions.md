@@ -8,6 +8,42 @@ The router's permission handler exists **only to satisfy that contract**. It is 
 
 Profile safety is owned by the Hermes profile config and the [pre-activation audit checklist](profile-audit-checklist.md). The router's allowlist is a deployment-side gate that runs on top of that, not a replacement for it.
 
+The two permission paths: the runtime answer and the preflight comparison.
+
+```mermaid
+flowchart TB
+    subgraph runtime["Runtime: answering the agent"]
+        agent["hermes -p profile acp"]
+        req["session/request_permission"]
+        policy["StaticPermissionPolicy<br/>static per-route allowlist<br/>deny by default, no operator prompt"]
+        mcp{"mcp_only route and<br/>local-tool name?"}
+        match{"tool and argument<br/>predicates match?"}
+        allow["select allow_once option<br/>never allow_always"]
+        deny["select reject_once<br/>fall back to reject_always"]
+        agent --> req --> policy --> mcp
+        mcp -- yes --> deny
+        mcp -- no --> match
+        match -- yes --> allow
+        match -- no --> deny
+        allow --> agent
+        deny --> agent
+    end
+    subgraph preflight["Preflight: wiring check before activation"]
+        route["route permissions allowlist<br/>routes.yaml and synthetic definitions"]
+        surface["profile tool surface<br/>offline: recorded contract file<br/>live: agentCapabilities._meta envelope"]
+        exc["one exception: _tool_surface/list<br/>Hermes-native tools array normalized<br/>into the v1 full_callable envelope"]
+        v1{"schema_version 1 and<br/>scope full_callable?"}
+        compare["compare allowlist tool names<br/>against the profile surface"]
+        report["report with safe route refs<br/>missing tools or probe_contract_* errors"]
+        route --> compare
+        surface --> v1
+        exc -- normalized --> compare
+        v1 -- yes --> compare
+        v1 -- no --> report
+        compare --> report
+    end
+```
+
 ## Static allowlist shape
 
 The router denies by default. A route may allow only explicit `(tool, argument predicate)` shapes:
