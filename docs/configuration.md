@@ -681,8 +681,11 @@ runs while the route and profile locks are held, so a hung Hermes startup
 would otherwise block the route for the full 5-minute request default. When
 the timeout is exceeded the turn fails with `acp_session_failed` (the failure
 detail names the ACP initialize timeout), a circuit-breaker failure is
-recorded, and the supervisor's restart cooldown makes immediately-following
-turns refuse fast instead of re-spawning a doomed subprocess. The setting
+recorded, and the supervisor's restart cooldown - a fixed 5-second code
+constant (`DEFAULT_RESTART_COOLDOWN_SECONDS` in
+[src/signal_hermes_router/sessions.py](../src/signal_hermes_router/sessions.py)),
+not configurable - makes immediately-following turns refuse fast instead of
+re-spawning a doomed subprocess. The setting
 bounds the request wait itself; the failure propagates after subprocess
 cleanup, which can add up to a few more seconds of SIGTERM grace before the
 process is killed.
