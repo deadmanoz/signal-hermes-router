@@ -27,12 +27,17 @@ flowchart LR
         direction TB
         ev["events.py<br/>normalise"]
         dd["dedupe.py<br/>sqlite claims"]
+        gate["router.py<br/>route-state gate"]
         med["media.py<br/>attachment store"]
-        rt["router.py<br/>route gate + prompt + reply"]
+        rt["router.py<br/>prompt + reply"]
         acp["acp.py<br/>JSON-RPC stdio"]
         sock["private control socket"]
-        sock --> rt
-        ev --> dd --> med --> rt --> acp
+        drop["no media, no Hermes<br/>disabled: log only<br/>maintenance: bounded reply"]
+        sock --> gate
+        ev --> dd --> gate
+        gate -- "active / shadow" --> med
+        med -- "active" --> rt --> acp
+        gate -- "disabled / maintenance" --> drop
     end
 
     subgraph profiles["Hermes profiles"]
