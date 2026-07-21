@@ -2,9 +2,9 @@
 
 `signal-hermes-router` is a transport router. It owns one Signal account, consumes allowlisted Signal events from upstream `signal-cli`, maps each route to an independent Hermes profile over ACP, and sends Hermes's replies back to Signal. Routes can target Signal groups, or one explicitly configured direct-message sender. There is no wildcard DM fallback.
 
-It exists because the built-in Hermes Signal gateway is profile-scoped. Hermes can allowlist multiple Signal groups for one configured Signal account, but those groups all feed the same profile. Running several independent Hermes profiles behind one Signal number is not a native gateway configuration: each profile runs its own gateway process, and Hermes's Signal adapter takes a `signal-phone` scoped lock on the configured account so two profile gateways cannot share that Signal identity at the same time.
+It exists to run several independent Hermes profiles behind one Signal number while keeping each profile in its own OS process. Hermes's built-in Signal gateway is profile-scoped by default: each profile runs its own gateway process, and Hermes's Signal adapter takes a `signal-phone` scoped lock on the configured account so two profile gateways cannot share that Signal identity at the same time. Since Hermes `v2026.6.19`, the opt-in multiplexing gateway (`gateway.multiplex_profiles` + `gateway.profile_routes`) can route one shared Signal account's groups to multiple profiles natively - but it runs all of those profiles inside a single gateway process. See [docs/hermes-gateway-tradeoffs.md](docs/hermes-gateway-tradeoffs.md) for the full, current comparison.
 
-The router sits upstream of Hermes and dispatches each group to its own profile, preserving the one-number, many-agents shape (the same arrangement OpenClaw provided via its own gateway) without modifying Hermes gateway internals.
+The router sits upstream of Hermes and dispatches each group to its own profile as a supervised `hermes -p <profile> acp` subprocess, preserving the one-number, many-agents shape (the same arrangement OpenClaw provided via its own gateway) with per-profile process isolation, and without modifying Hermes gateway internals.
 
 Hermes profiles own behaviour, skills, app access, and media interpretation. The router is the message-bus glue - nothing more.
 
@@ -29,15 +29,15 @@ Synthetic route events let trusted local automation trigger a configured route t
 
 ## Why a router
 
-The upstream evidence for the design constraint is:
+The design constraint this repo was built against:
 
 - Hermes profiles are gateway-scoped: the profile docs say "Each profile runs its own gateway as a separate process", and the token-lock section lists Signal among the protected platforms ([Hermes profiles docs](https://hermes-agent.nousresearch.com/docs/user-guide/profiles/)).
-- The Signal gateway is configured around one account, plus group allowlisting, not group-to-profile routing ([Hermes Signal docs](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/signal/)).
+- In the default (non-multiplexed) mode, the Signal gateway is configured around one account, plus group allowlisting, not group-to-profile routing ([Hermes Signal docs](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/signal/)).
 - The Signal adapter source requires one configured account and acquires a `signal-phone` lock for it; the same adapter subscribes to `signal-cli` events using that account ([signal.py](https://raw.githubusercontent.com/NousResearch/hermes-agent/main/gateway/platforms/signal.py)).
 - Hermes scoped locks are explicitly for preventing multiple gateways from using the same external identity at once ([status.py](https://github.com/NousResearch/hermes-agent/blob/main/gateway/status.py#L578-L583)).
-- The broader "one gateway, multi-profile" shape is still an upstream design discussion rather than a shipped gateway mode ([NousResearch/hermes-agent#23735](https://github.com/NousResearch/hermes-agent/issues/23735)).
+- Since Hermes `v2026.6.19`, the "one gateway, multi-profile" shape is a shipped opt-in mode, not just a design discussion: `gateway.multiplex_profiles: true` serves every profile from one gateway process, and `gateway.profile_routes` routes shared-credential chats (Signal groups included) to named profiles ([Hermes multi-profile gateway docs](https://hermes-agent.nousresearch.com/docs/user-guide/multi-profile-gateways), [NousResearch/hermes-agent#23735](https://github.com/NousResearch/hermes-agent/issues/23735)).
 
-The other plausible approach is to modify the Hermes gateway itself so one Signal adapter can select among many loaded profiles. That would put profile loading, profile-aware session stores, memory, skills, permissions, lifecycle, observability, and platform routing inside Hermes's gateway surface. This router chooses the narrower maintenance boundary: consume Signal once, keep routing policy here, and treat each Hermes profile as a black-box ACP subprocess.
+That shipped mode covers this router's original routing premise natively. What it does not provide is the router's execution boundary: the multiplexer co-resides all profiles in one OS process (the upstream docs recommend one-process-per-profile for hard crash isolation, which the `signal-phone` lock then forbids on a shared Signal account), and it is Hermes-only and in-process. This router keeps the narrower maintenance boundary: consume Signal once, keep routing policy here, and treat each profile as a black-box ACP subprocess with its own crash domain. If a shared process and Hermes-only profiles are acceptable, prefer the native multiplexing gateway.
 
 ## Runtime shape
 
