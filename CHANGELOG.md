@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.38](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.37...v0.1.38) (2026-07-21)
+
+
+### Documentation
+
+* address codex review findings from [#82](https://github.com/deadmanoz/signal-hermes-router/issues/82) ([b0e9331](https://github.com/deadmanoz/signal-hermes-router/commit/b0e9331f7d893a77dec5b9e205961f5379ec17a1))
+
 ## [0.1.37](https://github.com/deadmanoz/signal-hermes-router/compare/v0.1.36...v0.1.37) (2026-07-21)
 
 
